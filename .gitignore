@@ -13,13 +13,12 @@
 /build/
 bin/
 dist/
-/spacetime/server/spacetimedb/target/
-/spacetime/config
-/spacetime/data
+/server/spacetimedb/target/
 
 # spacetimedb data
-/spacetime-data/*
-/spacetime-keys/*
+/config
+/data/*
+/keys/*
 
 # Exported games
 *.pck

@@ -1,0 +1,45 @@
+[
+  {
+    "card_types": [ 1, 2, 3, 4, 5 ]
+    "status_flags": [
+      {
+        "flag": 0,
+        "name": "ready",
+        "default": false,
+        "show": false
+      },
+      {
+        "flag": 1,
+        "name": "progress_visible",
+        "default": false,
+        "show": false
+      },
+      {
+        "flag": 2,
+        "name": "position_lock",
+        "default": false,
+        "show": false
+      },
+      {
+        "flag": 3,
+        "name": "position_hold",
+        "default": false,
+        "show": false
+      },
+      {
+        "flag": 4,
+        "name": "hidden",
+        "default": false,
+        "show": false
+      },
+      {
+        "flag": 5,
+        "name": "visible",
+        "default": true,
+        "show": false
+      },
+      
+      
+    ]
+  }
+]

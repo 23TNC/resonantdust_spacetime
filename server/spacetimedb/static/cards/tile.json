@@ -1,0 +1,32 @@
+[
+  {
+    "id": 6001,
+    "name": "Forest",
+    "card_type": 6,
+    "style": {
+      "color": [ "#4d7b4d", "#7fb377", "#0b160b" ]
+    }, 
+    "vars": {
+      "cost": 2
+    },
+    "flags": [
+      {
+        "flag": 0,
+        "name": "blocks_sight",
+        "default": true
+      },
+      {
+        "flag": 1,
+        "name": "trees",
+        "default": false,
+        "show": true
+      },
+      {
+        "flag": 2,
+        "name": "food",
+        "default": false,
+        "show": true
+      }
+    ]
+  }
+]
