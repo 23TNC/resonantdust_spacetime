@@ -16,6 +16,8 @@ pub struct Action {
   pub end: u32,
   pub flags: u8,
   #[index(btree)]
+  pub soul_id: u32,
+  #[index(btree)]
   pub zone: u32,
   pub position: u8,
 }
@@ -34,6 +36,7 @@ fn current_seconds(ctx: &ReducerContext) -> Result<u32, String> {
 pub fn queue_action(
   ctx: &ReducerContext,
   card_id: u32,
+  soul_id: u32,
   recipe: u16,
   q: i32,
   r: i32,
@@ -56,6 +59,7 @@ pub fn queue_action(
     start: now,
     end: 0,
     flags: 0,
+    soul_id,
     zone,
     position,
   });

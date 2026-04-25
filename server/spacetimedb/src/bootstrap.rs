@@ -93,6 +93,12 @@ struct ActionSeed {
   #[serde(default)]
   flags: u8,
 
+  #[serde(default, alias = "soul_id_card_id")]
+  soul_id: Option<u32>,
+
+  #[serde(default)]
+  player: Option<String>,
+
   #[serde(default)]
   q: Option<i32>,
   #[serde(default)]
@@ -229,7 +235,7 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
     if let Some(existing) = ctx.db.players().name().find(&row.name) {
       if let Some(mut card) = ctx.db.cards().card_id().find(&existing.soul_id) {
         card.definition = definition;
-        card.soul_id = 0;
+        card.soul_id = existing.soul_id;
         card.link_id = 0;
         card.flags = row.flags;
         card.zone = zone;
@@ -241,6 +247,8 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
         player_id: existing.player_id,
         name: existing.name,
         soul_id: existing.soul_id,
+        zone,
+        position,
       });
     } else {
       let inserted = ctx.db.cards().insert(Card {
@@ -253,10 +261,17 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
         position,
       });
 
+      let soul_id = inserted.card_id;
+      let mut soul_card = inserted;
+      soul_card.soul_id = soul_id;
+      ctx.db.cards().card_id().update(soul_card);
+
       ctx.db.players().insert(Player {
         player_id: 0,
         name: row.name,
-        soul_id: inserted.card_id,
+        soul_id,
+        zone,
+        position,
       });
     }
   }
@@ -366,6 +381,21 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
       &format!("action {}", row.card_id),
     )?;
 
+    let resolved_soul_id = match (row.soul_id, row.player.as_deref()) {
+      (Some(_), Some(_)) => {
+        return Err("action cannot specify both soul_id and player".to_string());
+      }
+      (Some(soul_id), None) => soul_id,
+      (None, Some(player_name)) => {
+        if let Some(player) = ctx.db.players().name().find(&player_name.to_string()) {
+          player.soul_id
+        } else {
+          return Err(format!("player '{}' not found", player_name));
+        }
+      }
+      (None, None) => 0,
+    };
+
     if ctx.db.actions().card_id().find(&row.card_id).is_some() {
       ctx.db.actions().card_id().update(Action {
         card_id: row.card_id,
@@ -373,6 +403,7 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
         start: row.start,
         end: row.end,
         flags: row.flags,
+        soul_id: resolved_soul_id,
         zone,
         position,
       });
@@ -383,6 +414,7 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
         start: row.start,
         end: row.end,
         flags: row.flags,
+        soul_id: resolved_soul_id,
         zone,
         position,
       });

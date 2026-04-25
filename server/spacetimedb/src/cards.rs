@@ -1,5 +1,6 @@
 use spacetimedb::{ReducerContext, Table};
 use crate::packing::{pack_position, pack_zone, world_to_position, world_to_zone};
+use crate::players::players;
 
 #[spacetimedb::table(accessor = cards, public)]
 #[derive(Debug, Clone)]
@@ -27,6 +28,25 @@ fn pack_definition(card_type: u8, definition_id: u16) -> Result<u16, String> {
   }
 
   Ok(((card_type as u16) << 12) | definition_id)
+}
+
+fn card_type_from_definition(definition: u16) -> u8 {
+  ((definition >> 12) & 0x0f) as u8
+}
+
+fn sync_player_location_for_soul_card(
+  ctx: &ReducerContext,
+  card: &Card,
+) {
+  if card_type_from_definition(card.definition) != 5 {
+    return;
+  }
+
+  for mut player in ctx.db.players().soul_id().filter(&card.card_id) {
+    player.zone = card.zone;
+    player.position = card.position;
+    ctx.db.players().player_id().update(player);
+  }
 }
 
 pub fn insert_card_row(
@@ -138,7 +158,8 @@ pub fn update_card_location(
   if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
     row.zone = zone;
     row.position = position;
-    ctx.db.cards().card_id().update(row);
+    ctx.db.cards().card_id().update(row.clone());
+    sync_player_location_for_soul_card(ctx, &row);
     Ok(())
   } else {
     Err(format!("card {card_id} not found"))
