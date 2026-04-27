@@ -1,5 +1,9 @@
 use spacetimedb::{ReducerContext, Table};
-use crate::packing::{pack_position, pack_zone, world_to_position, world_to_zone};
+use crate::packing::{
+  pack_definition, pack_macro_world, pack_macro_panel, pack_micro_hex, pack_micro_stacked,
+  card_type_from_definition, world_to_zone, world_to_position,
+  CARD_FLAG_STACKED_UP, CARD_FLAG_STACKED_DOWN, CARD_FLAG_STACKABLE,
+};
 use crate::players::players;
 
 #[spacetimedb::table(accessor = cards, public)]
@@ -8,43 +12,29 @@ pub struct Card {
   #[primary_key]
   #[auto_inc]
   pub card_id: u32,
-  pub definition: u16,
+  // [ zone_q: i16 ][ zone_r: i16 ][ reserved: u16 ][ layer: u8 ][ surface: u8 ]
   #[index(btree)]
-  pub soul_id: u32,
+  pub macro_location: u64,
+  // stacked: stacked_id (u32) | hex: [ local_q: u4 ][ local_r: u4 ][ reserved: u24 ] | pixel: [ x: i16 ][ y: i16 ]
+  pub micro_location: u32,
   #[index(btree)]
-  pub link_id: u32,
-  pub flags: u64,
-  #[index(btree)]
-  pub zone: u32,
-  pub position: u8,
+  pub owner_id: u32,
+  // [ stacked: u1 ][ stackable: u1 ][ position_locked: u1 ][ position_hold: u1 ][ reserved: u12 ]
+  pub flags: u16,
+  // [ card_type: u4 ][ category: u4 ][ definition_id: u8 ]
+  pub packed_definition: u16,
+  // Card-type-specific payload — 64 bits, interpretation defined per card_type.
+  // Known usage: type 5 category 0 stores the world soul card_id in bits [31:0].
+  pub data: u64,
 }
 
-fn pack_definition(card_type: u8, definition_id: u16) -> Result<u16, String> {
-  if card_type > 0x0F {
-    return Err(format!("card_type {} exceeds 4 bits", card_type));
-  }
-  if definition_id > 0x0FFF {
-    return Err(format!("definition_id {} exceeds 12 bits", definition_id));
-  }
-
-  Ok(((card_type as u16) << 12) | definition_id)
-}
-
-fn card_type_from_definition(definition: u16) -> u8 {
-  ((definition >> 12) & 0x0f) as u8
-}
-
-fn sync_player_location_for_soul_card(
-  ctx: &ReducerContext,
-  card: &Card,
-) {
-  if card_type_from_definition(card.definition) != 5 {
+fn sync_player_location_for_soul_card(ctx: &ReducerContext, card: &Card) {
+  if card_type_from_definition(card.packed_definition) != 5 {
     return;
   }
-
   for mut player in ctx.db.players().soul_id().filter(&card.card_id) {
-    player.zone = card.zone;
-    player.position = card.position;
+    player.macro_location = card.macro_location;
+    player.micro_location = card.micro_location;
     ctx.db.players().player_id().update(player);
   }
 }
@@ -52,58 +42,53 @@ fn sync_player_location_for_soul_card(
 pub fn insert_card_row(
   ctx: &ReducerContext,
   card_type: u8,
-  definition_id: u16,
-  soul_id: u32,
-  link_id: u32,
-  flags: u64,
+  category: u8,
+  definition_id: u8,
+  owner_id: u32,
+  flags: u16,
   q: i32,
   r: i32,
-  z: u16,
+  layer: u8,
 ) -> Result<u32, String> {
-  let definition = pack_definition(card_type, definition_id)?;
-
   let (zone_q, zone_r) = world_to_zone(q, r);
-  let (pos_q, pos_r) = world_to_position(q, r);
-
-  let zone = pack_zone(zone_q, zone_r, z);
-  let position = pack_position(pos_q, pos_r);
+  let (local_q, local_r) = world_to_position(q, r);
 
   let inserted = ctx.db.cards().insert(Card {
     card_id: 0,
-    definition,
-    soul_id,
-    link_id,
+    macro_location: pack_macro_world(zone_q, zone_r, layer),
+    micro_location: pack_micro_hex(local_q, local_r),
+    owner_id,
     flags,
-    zone,
-    position,
+    packed_definition: pack_definition(card_type, category, definition_id),
+    data: 0,
   });
+
+  // A type-5 card with category > 0 is an instance of a soul archetype.
+  // Create a companion inventory card (category 0) placed in the soul's panel (surface=2).
+  // data[31:0] holds the world soul card_id for back-reference.
+  if card_type == 5 && category > 0 {
+    ctx.db.cards().insert(Card {
+      card_id: 0,
+      macro_location: pack_macro_panel(inserted.card_id, 1),
+      micro_location: 0,
+      owner_id,
+      flags: CARD_FLAG_STACKABLE,
+      packed_definition: pack_definition(5, 0, definition_id),
+      data: inserted.card_id as u64,
+    });
+  }
 
   Ok(inserted.card_id)
 }
 
-pub fn insert_card(
-  ctx: &ReducerContext,
-  card_type: u8,
-  definition_id: u16,
-  soul_id: u32,
-  link_id: u32,
-  flags: u64,
-  q: i32,
-  r: i32,
-  z: u16,
-) -> Result<(), String> {
-  insert_card_row(ctx, card_type, definition_id, soul_id, link_id, flags, q, r, z)?;
-  Ok(())
-}
-
 #[spacetimedb::reducer]
-pub fn update_card_soul_id(
+pub fn update_card_owner_id(
   ctx: &ReducerContext,
   card_id: u32,
-  soul_id: u32,
+  owner_id: u32,
 ) -> Result<(), String> {
   if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
-    row.soul_id = soul_id;
+    row.owner_id = owner_id;
     ctx.db.cards().card_id().update(row);
     Ok(())
   } else {
@@ -112,28 +97,28 @@ pub fn update_card_soul_id(
 }
 
 #[spacetimedb::reducer]
-pub fn update_card_link_id(
+pub fn update_card_flags(
   ctx: &ReducerContext,
   card_id: u32,
-  link_id: u32,
-) -> Result<(), String> {
-  if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
-    row.link_id = link_id;
-    ctx.db.cards().card_id().update(row);
-    Ok(())
-  } else {
-    Err(format!("card {card_id} not found"))
-  }
-}
-
-#[spacetimedb::reducer]
-pub fn set_card_flags(
-  ctx: &ReducerContext,
-  card_id: u32,
-  flags: u64,
+  flags: u16,
 ) -> Result<(), String> {
   if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
     row.flags = flags;
+    ctx.db.cards().card_id().update(row);
+    Ok(())
+  } else {
+    Err(format!("card {card_id} not found"))
+  }
+}
+
+#[spacetimedb::reducer]
+pub fn update_card_data(
+  ctx: &ReducerContext,
+  card_id: u32,
+  data: u64,
+) -> Result<(), String> {
+  if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
+    row.data = data;
     ctx.db.cards().card_id().update(row);
     Ok(())
   } else {
@@ -147,19 +132,105 @@ pub fn update_card_location(
   card_id: u32,
   q: i32,
   r: i32,
-  z: u16,
+  layer: u8,
 ) -> Result<(), String> {
   let (zone_q, zone_r) = world_to_zone(q, r);
-  let (pos_q, pos_r) = world_to_position(q, r);
-
-  let zone = pack_zone(zone_q, zone_r, z);
-  let position = pack_position(pos_q, pos_r);
+  let (local_q, local_r) = world_to_position(q, r);
+  let macro_location = pack_macro_world(zone_q, zone_r, layer);
+  let micro_location = pack_micro_hex(local_q, local_r);
 
   if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
-    row.zone = zone;
-    row.position = position;
+    row.macro_location = macro_location;
+    row.micro_location = micro_location;
     ctx.db.cards().card_id().update(row.clone());
     sync_player_location_for_soul_card(ctx, &row);
+    Ok(())
+  } else {
+    Err(format!("card {card_id} not found"))
+  }
+}
+
+#[spacetimedb::reducer]
+pub fn update_card_micro_location(
+  ctx: &ReducerContext,
+  card_id: u32,
+  micro_location: u32,
+) -> Result<(), String> {
+  if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
+    row.micro_location = micro_location;
+    ctx.db.cards().card_id().update(row);
+    Ok(())
+  } else {
+    Err(format!("card {card_id} not found"))
+  }
+}
+
+#[spacetimedb::reducer]
+pub fn stack_card_up(
+  ctx: &ReducerContext,
+  card_id: u32,
+  onto_id: u32,
+) -> Result<(), String> {
+  let onto = ctx.db.cards().card_id().find(&onto_id)
+    .ok_or_else(|| format!("card {onto_id} not found"))?;
+
+  if onto.flags & CARD_FLAG_STACKED_DOWN != 0 {
+    return Err(format!("cannot stack_up onto card {onto_id}: it has STACKED_DOWN set"));
+  }
+
+  if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
+    row.macro_location = onto.macro_location;
+    row.micro_location = pack_micro_stacked(onto_id);
+    row.flags &= !(CARD_FLAG_STACKED_UP | CARD_FLAG_STACKED_DOWN);
+    row.flags |= CARD_FLAG_STACKED_UP;
+    ctx.db.cards().card_id().update(row);
+    Ok(())
+  } else {
+    Err(format!("card {card_id} not found"))
+  }
+}
+
+#[spacetimedb::reducer]
+pub fn stack_card_down(
+  ctx: &ReducerContext,
+  card_id: u32,
+  onto_id: u32,
+) -> Result<(), String> {
+  let onto = ctx.db.cards().card_id().find(&onto_id)
+    .ok_or_else(|| format!("card {onto_id} not found"))?;
+
+  if onto.flags & CARD_FLAG_STACKED_UP != 0 {
+    return Err(format!("cannot stack_down onto card {onto_id}: it has STACKED_UP set"));
+  }
+
+  if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
+    row.macro_location = onto.macro_location;
+    row.micro_location = pack_micro_stacked(onto_id);
+    row.flags &= !(CARD_FLAG_STACKED_UP | CARD_FLAG_STACKED_DOWN);
+    row.flags |= CARD_FLAG_STACKED_DOWN;
+    ctx.db.cards().card_id().update(row);
+    Ok(())
+  } else {
+    Err(format!("card {card_id} not found"))
+  }
+}
+
+#[spacetimedb::reducer]
+pub fn unstack_card(
+  ctx: &ReducerContext,
+  card_id: u32,
+  q: i32,
+  r: i32,
+  layer: u8,
+) -> Result<(), String> {
+  let (zone_q, zone_r) = world_to_zone(q, r);
+  let (local_q, local_r) = world_to_position(q, r);
+
+  if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
+    row.macro_location = pack_macro_world(zone_q, zone_r, layer);
+    row.micro_location = pack_micro_hex(local_q, local_r);
+    row.flags &= !(CARD_FLAG_STACKED_UP | CARD_FLAG_STACKED_DOWN);
+    ctx.db.cards().card_id().update(row);
     Ok(())
   } else {
     Err(format!("card {card_id} not found"))

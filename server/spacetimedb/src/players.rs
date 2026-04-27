@@ -1,5 +1,6 @@
 use spacetimedb::{reducer, ReducerContext, Table};
 use crate::cards::{cards, insert_card_row};
+use crate::packing::{pack_macro_world, pack_micro_hex, world_to_zone, world_to_position};
 
 #[spacetimedb::table(accessor = players, public)]
 #[derive(Debug, Clone)]
@@ -12,8 +13,8 @@ pub struct Player {
   #[index(btree)]
   pub soul_id: u32,
   #[index(btree)]
-  pub zone: u32,
-  pub position: u8,
+  pub macro_location: u64,
+  pub micro_location: u32,
 }
 
 #[reducer]
@@ -21,47 +22,35 @@ pub fn upsert_player(
   ctx: &ReducerContext,
   name: String,
   card_type: u8,
-  definition_id: u16,
-  flags: u64,
+  category: u8,
+  definition_id: u8,
+  flags: u16,
   q: i32,
   r: i32,
-  z: u16,
+  layer: u8,
 ) -> Result<(), String> {
   if ctx.db.players().name().find(&name).is_some() {
     return Ok(());
   }
 
-  let soul_card_id = insert_card_row(
-    ctx,
-    card_type,
-    definition_id,
-    0,
-    0,
-    flags,
-    q,
-    r,
-    z,
-  )?;
+  let soul_card_id = insert_card_row(ctx, card_type, category, definition_id, 0, flags, q, r, layer)?;
 
-  let (zone, position) = if let Some(mut soul_card) = ctx.db.cards().card_id().find(&soul_card_id) {
-    soul_card.soul_id = soul_card_id;
-
-    let zone = soul_card.zone;
-    let position = soul_card.position;
-
-    ctx.db.cards().card_id().update(soul_card);
-
-    (zone, position)
-  } else {
-    return Err(format!("soul card {soul_card_id} was not found after insert"));
-  };
+  let (macro_location, micro_location) =
+    if let Some(mut soul_card) = ctx.db.cards().card_id().find(&soul_card_id) {
+      soul_card.owner_id = soul_card_id;
+      let loc = (soul_card.macro_location, soul_card.micro_location);
+      ctx.db.cards().card_id().update(soul_card);
+      loc
+    } else {
+      return Err(format!("soul card {soul_card_id} was not found after insert"));
+    };
 
   ctx.db.players().try_insert(Player {
     player_id: 0,
     name,
     soul_id: soul_card_id,
-    zone,
-    position,
+    macro_location,
+    micro_location,
   })?;
 
   Ok(())
@@ -77,8 +66,8 @@ pub fn update_player_soul_id(
     row.soul_id = soul_id;
 
     if let Some(soul_card) = ctx.db.cards().card_id().find(&soul_id) {
-      row.zone = soul_card.zone;
-      row.position = soul_card.position;
+      row.macro_location = soul_card.macro_location;
+      row.micro_location = soul_card.micro_location;
     }
 
     ctx.db.players().player_id().update(row);
@@ -92,12 +81,16 @@ pub fn update_player_soul_id(
 pub fn update_player_location(
   ctx: &ReducerContext,
   player_id: u32,
-  zone: u32,
-  position: u8,
+  q: i32,
+  r: i32,
+  layer: u8,
 ) -> Result<(), String> {
+  let (zone_q, zone_r) = world_to_zone(q, r);
+  let (local_q, local_r) = world_to_position(q, r);
+
   if let Some(mut row) = ctx.db.players().player_id().find(&player_id) {
-    row.zone = zone;
-    row.position = position;
+    row.macro_location = pack_macro_world(zone_q, zone_r, layer);
+    row.micro_location = pack_micro_hex(local_q, local_r);
     ctx.db.players().player_id().update(row);
     Ok(())
   } else {

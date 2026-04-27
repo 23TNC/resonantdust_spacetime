@@ -1,6 +1,10 @@
 use crate::actions::{actions, Action};
 use crate::cards::{cards, insert_card_row, Card};
-use crate::packing::{pack_position, pack_zone, world_to_position, world_to_zone};
+use crate::packing::{
+  pack_definition, pack_macro_world, pack_micro_hex,
+  world_to_zone, world_to_position,
+  CARD_FLAG_STACKED_UP, CARD_FLAG_STACKED_DOWN,
+};
 use crate::players::{players, Player};
 use crate::zones::{zones, Zone};
 use serde::Deserialize;
@@ -30,22 +34,19 @@ struct BootstrapData {
 struct PlayerSeed {
   name: String,
   card_type: u8,
-  definition_id: u16,
+  #[serde(default)]
+  category: u8,
+  definition_id: u8,
 
   #[serde(default)]
-  flags: u64,
+  flags: u16,
 
   #[serde(default)]
   q: Option<i32>,
   #[serde(default)]
   r: Option<i32>,
-  #[serde(default)]
-  z: Option<u16>,
-
-  #[serde(default)]
-  zone: Option<u32>,
-  #[serde(default)]
-  position: Option<u8>,
+  #[serde(default, alias = "z")]
+  layer: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,31 +55,37 @@ struct CardSeed {
   card_id: Option<u32>,
 
   card_type: u8,
-  definition_id: u16,
+  #[serde(default)]
+  category: u8,
+  definition_id: u8,
 
-  #[serde(default, alias = "soul_id_card_id")]
-  soul_id: Option<u32>,
-
-  #[serde(default, alias = "link_id_card_id", alias = "linked_id", alias = "linked_id_card_id", alias = "stack_id")]
-  link_id: Option<u32>,
+  #[serde(default, alias = "soul_id")]
+  owner_id: Option<u32>,
 
   #[serde(default)]
   player: Option<String>,
 
   #[serde(default)]
-  flags: u64,
+  flags: u16,
 
   #[serde(default)]
   q: Option<i32>,
   #[serde(default)]
   r: Option<i32>,
-  #[serde(default)]
-  z: Option<u16>,
+  #[serde(default, alias = "z")]
+  layer: Option<u8>,
 
+  // When set, the card is stacked upward onto this card_id (sets CARD_FLAG_STACKED_UP).
   #[serde(default)]
-  zone: Option<u32>,
+  stacked_on: Option<u32>,
+
+  // When set, the card is stacked downward onto this card_id (sets CARD_FLAG_STACKED_DOWN).
   #[serde(default)]
-  position: Option<u8>,
+  stacked_on_down: Option<u32>,
+
+  // Raw extra bits written into data[47:0] (e.g. link_id for chain roots).
+  #[serde(default)]
+  extra: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,8 +100,8 @@ struct ActionSeed {
   #[serde(default)]
   flags: u8,
 
-  #[serde(default, alias = "soul_id_card_id")]
-  soul_id: Option<u32>,
+  #[serde(default, alias = "soul_id")]
+  owner_id: Option<u32>,
 
   #[serde(default)]
   player: Option<String>,
@@ -103,26 +110,21 @@ struct ActionSeed {
   q: Option<i32>,
   #[serde(default)]
   r: Option<i32>,
-  #[serde(default)]
-  z: Option<u16>,
-
-  #[serde(default)]
-  zone: Option<u32>,
-  #[serde(default)]
-  position: Option<u8>,
+  #[serde(default, alias = "z")]
+  layer: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ZoneSeed {
   #[serde(default)]
-  zone: Option<u32>,
+  macro_location: Option<u64>,
 
   #[serde(default)]
   zone_q: Option<i16>,
   #[serde(default)]
   zone_r: Option<i16>,
-  #[serde(default)]
-  z: Option<u16>,
+  #[serde(default, alias = "z")]
+  layer: Option<u8>,
 
   card_type: u8,
   category: u8,
@@ -137,17 +139,6 @@ struct ZoneSeed {
   t7: u64,
 }
 
-fn pack_definition(card_type: u8, definition_id: u16) -> Result<u16, String> {
-  if card_type > 0x0F {
-    return Err(format!("card_type {} exceeds 4 bits", card_type));
-  }
-  if definition_id > 0x0FFF {
-    return Err(format!("definition_id {} exceeds 12 bits", definition_id));
-  }
-
-  Ok(((card_type as u16) << 12) | definition_id)
-}
-
 fn pack_zone_definition(card_type: u8, category: u8) -> Result<u8, String> {
   if card_type > 0x0F {
     return Err(format!("zone card_type {} exceeds 4 bits", card_type));
@@ -155,36 +146,28 @@ fn pack_zone_definition(card_type: u8, category: u8) -> Result<u8, String> {
   if category > 0x0F {
     return Err(format!("zone category {} exceeds 4 bits", category));
   }
-
   Ok((card_type << 4) | category)
 }
 
-fn resolve_zone_position(
-  q: Option<i32>,
-  r: Option<i32>,
-  z: Option<u16>,
-  zone: Option<u32>,
-  position: Option<u8>,
-  label: &str,
-) -> Result<(u32, u8), String> {
-  match (q, r, z, zone, position) {
-    (Some(q), Some(r), Some(z), _, _) => {
-      let (zone_q, zone_r) = world_to_zone(q, r);
-      let (pos_q, pos_r) = world_to_position(q, r);
-      Ok((pack_zone(zone_q, zone_r, z), pack_position(pos_q, pos_r)))
-    }
-    (_, _, _, Some(zone), Some(position)) => Ok((zone, position)),
-    _ => Err(format!(
-      "{label} must provide either q/r/z or zone/position"
-    )),
-  }
+fn resolve_macro_micro(q: Option<i32>, r: Option<i32>, layer: Option<u8>) -> (u64, u32) {
+  let q = q.unwrap_or(0);
+  let r = r.unwrap_or(0);
+  let layer = layer.unwrap_or(0);
+  let (zone_q, zone_r) = world_to_zone(q, r);
+  let (local_q, local_r) = world_to_position(q, r);
+  (
+    pack_macro_world(zone_q, zone_r, layer),
+    pack_micro_hex(local_q, local_r),
+  )
 }
 
-fn resolve_zone_seed(row: &ZoneSeed) -> Result<u32, String> {
-  match (row.zone_q, row.zone_r, row.z, row.zone) {
-    (Some(zone_q), Some(zone_r), Some(z), _) => Ok(pack_zone(zone_q, zone_r, z)),
-    (_, _, _, Some(zone)) => Ok(zone),
-    _ => Err("zone entry must provide either zone_q/zone_r/z or zone".to_string()),
+fn resolve_zone_seed(row: &ZoneSeed) -> Result<u64, String> {
+  match (row.zone_q, row.zone_r, row.layer, row.macro_location) {
+    (Some(zone_q), Some(zone_r), layer, _) => {
+      Ok(pack_macro_world(zone_q, zone_r, layer.unwrap_or(0)))
+    }
+    (_, _, _, Some(macro_location)) => Ok(macro_location),
+    _ => Err("zone entry must provide zone_q/zone_r or macro_location".to_string()),
   }
 }
 
@@ -198,11 +181,11 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
   let data = parse_bootstrap()?;
 
   for row in data.zones {
-    let zone = resolve_zone_seed(&row)?;
+    let macro_location = resolve_zone_seed(&row)?;
     let definition = pack_zone_definition(row.card_type, row.category)?;
 
     let zone_row = Zone {
-      zone,
+      macro_location,
       definition,
       t0: row.t0,
       t1: row.t1,
@@ -214,32 +197,23 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
       t7: row.t7,
     };
 
-    if ctx.db.zones().zone().find(&zone).is_some() {
-      ctx.db.zones().zone().update(zone_row);
+    if ctx.db.zones().macro_location().find(&macro_location).is_some() {
+      ctx.db.zones().macro_location().update(zone_row);
     } else {
       ctx.db.zones().insert(zone_row);
     }
   }
 
   for row in data.player {
-    let (zone, position) = resolve_zone_position(
-      row.q,
-      row.r,
-      row.z,
-      row.zone,
-      row.position,
-      &format!("player {}", row.name),
-    )?;
-    let definition = pack_definition(row.card_type, row.definition_id)?;
-
+    let (macro_location, micro_location) =
+      resolve_macro_micro(row.q, row.r, row.layer);
     if let Some(existing) = ctx.db.players().name().find(&row.name) {
       if let Some(mut card) = ctx.db.cards().card_id().find(&existing.soul_id) {
-        card.definition = definition;
-        card.soul_id = existing.soul_id;
-        card.link_id = 0;
+        card.packed_definition = pack_definition(row.card_type, row.category, row.definition_id);
+        card.owner_id = existing.soul_id;
         card.flags = row.flags;
-        card.zone = zone;
-        card.position = position;
+        card.macro_location = macro_location;
+        card.micro_location = micro_location;
         ctx.db.cards().card_id().update(card);
       }
 
@@ -247,62 +221,44 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
         player_id: existing.player_id,
         name: existing.name,
         soul_id: existing.soul_id,
-        zone,
-        position,
+        macro_location,
+        micro_location,
       });
     } else {
       let inserted = ctx.db.cards().insert(Card {
         card_id: 0,
-        definition,
-        soul_id: 0,
-        link_id: 0,
+        macro_location,
+        micro_location,
+        owner_id: 0,
         flags: row.flags,
-        zone,
-        position,
+        packed_definition: pack_definition(row.card_type, row.category, row.definition_id),
+        data: 0,
       });
 
       let soul_id = inserted.card_id;
       let mut soul_card = inserted;
-      soul_card.soul_id = soul_id;
+      soul_card.owner_id = soul_id;
       ctx.db.cards().card_id().update(soul_card);
 
       ctx.db.players().insert(Player {
         player_id: 0,
         name: row.name,
         soul_id,
-        zone,
-        position,
+        macro_location,
+        micro_location,
       });
     }
   }
 
   for row in data.card {
-    let (zone, position) = match resolve_zone_position(
-      row.q,
-      row.r,
-      row.z,
-      row.zone,
-      row.position,
-      &format!("card {:?}", row.card_id),
-    ) {
-      Ok(zone_position) => zone_position,
-      Err(_) => {
-        let q = row.q.unwrap_or(0);
-        let r = row.r.unwrap_or(0);
-        let z = row.z.unwrap_or(0);
-        let (zone_q, zone_r) = world_to_zone(q, r);
-        let (pos_q, pos_r) = world_to_position(q, r);
-        (pack_zone(zone_q, zone_r, z), pack_position(pos_q, pos_r))
-      }
-    };
+    let (macro_location, micro_location) =
+      resolve_macro_micro(row.q, row.r, row.layer);
 
-    let definition = pack_definition(row.card_type, row.definition_id)?;
-
-    let resolved_soul_id = match (row.soul_id, row.player.as_deref()) {
+    let resolved_owner_id = match (row.owner_id, row.player.as_deref()) {
       (Some(_), Some(_)) => {
-        return Err("card cannot specify both soul_id and player".to_string());
+        return Err("card cannot specify both owner_id and player".to_string());
       }
-      (Some(soul_id), None) => soul_id,
+      (Some(owner_id), None) => owner_id,
       (None, Some(player_name)) => {
         if let Some(player) = ctx.db.players().name().find(&player_name.to_string()) {
           player.soul_id
@@ -313,79 +269,67 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
       (None, None) => 0,
     };
 
-    let resolved_link_id = row.link_id.unwrap_or(0);
+    let (final_micro, final_flags) = match (row.stacked_on, row.stacked_on_down) {
+      (Some(_), Some(_)) => {
+        return Err("card cannot specify both stacked_on and stacked_on_down".to_string());
+      }
+      (Some(stacked_id), None) => (stacked_id, row.flags | CARD_FLAG_STACKED_UP),
+      (None, Some(stacked_id)) => (stacked_id, row.flags | CARD_FLAG_STACKED_DOWN),
+      (None, None)             => (micro_location, row.flags),
+    };
+
+    let packed_definition = pack_definition(row.card_type, row.category, row.definition_id);
+    let data = row.extra.unwrap_or(0);
 
     match row.card_id {
       Some(card_id) => {
         if ctx.db.cards().card_id().find(&card_id).is_some() {
           ctx.db.cards().card_id().update(Card {
             card_id,
-            definition,
-            soul_id: resolved_soul_id,
-            link_id: resolved_link_id,
-            flags: row.flags,
-            zone,
-            position,
+            macro_location,
+            micro_location: final_micro,
+            owner_id: resolved_owner_id,
+            flags: final_flags,
+            packed_definition,
+            data,
           });
         } else {
           ctx.db.cards().insert(Card {
             card_id,
-            definition,
-            soul_id: resolved_soul_id,
-            link_id: resolved_link_id,
-            flags: row.flags,
-            zone,
-            position,
+            macro_location,
+            micro_location: final_micro,
+            owner_id: resolved_owner_id,
+            flags: final_flags,
+            packed_definition,
+            data,
           });
         }
       }
       None => {
-        let q = row.q.unwrap_or(0);
-        let r = row.r.unwrap_or(0);
-        let z = row.z.unwrap_or(0);
-
-        if row.zone.is_some() || row.position.is_some() {
-          ctx.db.cards().insert(Card {
-            card_id: 0,
-            definition,
-            soul_id: resolved_soul_id,
-            link_id: resolved_link_id,
-            flags: row.flags,
-            zone,
-            position,
-          });
-        } else {
-          insert_card_row(
-            ctx,
-            row.card_type,
-            row.definition_id,
-            resolved_soul_id,
-            resolved_link_id,
-            row.flags,
-            q,
-            r,
-            z,
-          )?;
-        }
+        insert_card_row(
+          ctx,
+          row.card_type,
+          row.category,
+          row.definition_id,
+          resolved_owner_id,
+          final_flags,
+          row.q.unwrap_or(0),
+          row.r.unwrap_or(0),
+          row.layer.unwrap_or(0),
+        )?;
       }
     }
   }
 
   for row in data.actions.into_iter().chain(data.action.into_iter()) {
-    let (zone, position) = resolve_zone_position(
-      row.q,
-      row.r,
-      row.z,
-      row.zone,
-      row.position,
-      &format!("action {}", row.card_id),
-    )?;
+    let (macro_location, micro_location) =
+      resolve_macro_micro(row.q, row.r, row.layer);
 
-    let resolved_soul_id = match (row.soul_id, row.player.as_deref()) {
+    let resolved_owner_id = match (row.owner_id, row.player.as_deref()) {
       (Some(_), Some(_)) => {
-        return Err("action cannot specify both soul_id and player".to_string());
+        return Err("action cannot specify both owner_id and player".to_string());
       }
-      (Some(soul_id), None) => soul_id,
+      (Some(owner_id), None) => owner_id,
       (None, Some(player_name)) => {
         if let Some(player) = ctx.db.players().name().find(&player_name.to_string()) {
           player.soul_id
@@ -396,29 +340,17 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
       (None, None) => 0,
     };
 
-    if ctx.db.actions().card_id().find(&row.card_id).is_some() {
-      ctx.db.actions().card_id().update(Action {
-        card_id: row.card_id,
-        recipe: row.recipe,
-        start: row.start,
-        end: row.end,
-        flags: row.flags,
-        soul_id: resolved_soul_id,
-        zone,
-        position,
-      });
-    } else {
-      ctx.db.actions().insert(Action {
-        card_id: row.card_id,
-        recipe: row.recipe,
-        start: row.start,
-        end: row.end,
-        flags: row.flags,
-        soul_id: resolved_soul_id,
-        zone,
-        position,
-      });
-    }
+    ctx.db.actions().insert(Action {
+      action_id: 0,
+      card_id: row.card_id,
+      recipe: row.recipe,
+      start: row.start,
+      end: row.end,
+      flags: row.flags,
+      owner_id: resolved_owner_id,
+      macro_location,
+      micro_location,
+    });
   }
 
   Ok(())
@@ -427,7 +359,7 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
 #[reducer]
 pub fn reset_and_bootstrap(ctx: &ReducerContext) -> Result<(), String> {
   for row in ctx.db.actions().iter() {
-    ctx.db.actions().card_id().delete(&row.card_id);
+    ctx.db.actions().action_id().delete(&row.action_id);
   }
 
   for row in ctx.db.players().iter() {
@@ -439,7 +371,7 @@ pub fn reset_and_bootstrap(ctx: &ReducerContext) -> Result<(), String> {
   }
 
   for row in ctx.db.zones().iter() {
-    ctx.db.zones().zone().delete(&row.zone);
+    ctx.db.zones().macro_location().delete(&row.macro_location);
   }
 
   bootstrap(ctx)
