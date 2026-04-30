@@ -8,3 +8,4 @@ pub mod actions;
 pub mod zones;
 pub mod bootstrap;
 pub mod debug;
+pub mod test;

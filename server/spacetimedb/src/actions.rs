@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use spacetimedb::{ReducerContext, Table};
 use crate::cards::{cards, Card};
-use crate::definitions::{Entity, get_recipe};
+use crate::definitions::{Entity, ProductTarget, get_recipe};
 use crate::packing::{
   pack_macro_world, pack_micro_hex,
   card_type_from_definition, definition_id_from_definition,
@@ -11,6 +11,7 @@ use crate::packing::{
 
 pub const ACTION_FLAG_STARTED:   u8 = 1 << 0;
 pub const ACTION_FLAG_COMPLETED: u8 = 1 << 1;
+pub const ACTION_FLAG_QUEUED:    u8 = 1 << 2;
 
 #[spacetimedb::table(accessor = actions, public)]
 #[derive(Debug, Clone)]
@@ -40,6 +41,29 @@ pub fn current_seconds(ctx: &ReducerContext) -> Result<u32, String> {
   u32::try_from(secs).map_err(|_| "ReducerContext timestamp exceeds u32 seconds range".to_string())
 }
 
+pub fn queue_action_inner(
+  ctx:            &ReducerContext,
+  card_id:        u32,
+  owner_id:       u32,
+  recipe:         u16,
+  macro_location: u64,
+  micro_location: u32,
+) -> Result<(), String> {
+  let now = current_seconds(ctx)?;
+  ctx.db.actions().insert(Action {
+    action_id: 0,
+    card_id,
+    recipe,
+    start: now,
+    end: 0,
+    flags: ACTION_FLAG_QUEUED,
+    owner_id,
+    macro_location,
+    micro_location,
+  });
+  Ok(())
+}
+
 #[spacetimedb::reducer]
 pub fn queue_action(
   ctx: &ReducerContext,
@@ -52,43 +76,29 @@ pub fn queue_action(
 ) -> Result<(), String> {
   let (zone_q, zone_r) = world_to_zone(q, r);
   let (local_q, local_r) = world_to_position(q, r);
-  let now = current_seconds(ctx)?;
-
-  ctx.db.actions().insert(Action {
-    action_id: 0,
-    card_id,
-    recipe,
-    start: now,
-    end: 0,
-    flags: 0,
-    owner_id,
-    macro_location: pack_macro_world(zone_q, zone_r, layer),
-    micro_location: pack_micro_hex(local_q, local_r),
-  });
-
-  Ok(())
+  queue_action_inner(
+    ctx, card_id, owner_id, recipe,
+    pack_macro_world(zone_q, zone_r, layer),
+    pack_micro_hex(local_q, local_r),
+  )
 }
 
 #[spacetimedb::reducer]
 pub fn start_action(
-  ctx:      &ReducerContext,
-  card_id:  u32,
-  recipe:   u16,
-  owner_id: u32,
+  ctx:       &ReducerContext,
+  action_id: u32,
 ) -> Result<(), String> {
+  let mut action = ctx.db.actions().action_id().find(&action_id)
+    .ok_or_else(|| format!("action {action_id} not found"))?;
+  if action.flags & ACTION_FLAG_QUEUED == 0 {
+    return Err(format!("action {action_id} is not in queued state"));
+  }
   let now      = current_seconds(ctx)?;
-  let duration = crate::definitions::recipe_duration(recipe, 0);
-  ctx.db.actions().insert(Action {
-    action_id:      0,
-    card_id,
-    recipe,
-    start:          now,
-    end:            now.saturating_add(duration),
-    flags:          ACTION_FLAG_STARTED,
-    owner_id,
-    macro_location: 0,
-    micro_location: 0,
-  });
+  let duration = crate::definitions::recipe_duration(action.recipe, 0);
+  action.start  = now;
+  action.end    = now.saturating_add(duration);
+  action.flags  = ACTION_FLAG_STARTED;
+  ctx.db.actions().action_id().update(action);
   Ok(())
 }
 
@@ -179,13 +189,12 @@ fn consume_entity(entity: &Entity, pool: &mut HashMap<String, Vec<u32>>) -> Vec<
   }
 }
 
-/// Recursively generate product cards into the owner's panel.
-/// `rng` is advanced on each OR node so successive weighted picks differ.
-fn generate_products(
-  ctx:      &ReducerContext,
-  entity:   &Entity,
-  owner_id: u32,
-  rng:      &mut u32,
+/// Recursively generate product cards for one entity into a single target panel.
+fn generate_entity_products(
+  ctx:       &ReducerContext,
+  entity:    &Entity,
+  target_id: u32,
+  rng:       &mut u32,
 ) -> Result<(), String> {
   match entity {
     Entity::Empty => {}
@@ -196,15 +205,15 @@ fn generate_products(
         None => log::warn!("complete_action: unknown product '{def_id}'"),
         Some((card_type, definition_id)) => {
           for _ in 0..*qty {
-            crate::cards::insert_panel_card_row(ctx, card_type, 0, definition_id, owner_id, CARD_FLAG_STACKABLE)?;
+            crate::cards::insert_panel_card_row(ctx, card_type, 0, definition_id, target_id, CARD_FLAG_STACKABLE)?;
           }
         }
       }
     }
 
     Entity::And { a, b } => {
-      generate_products(ctx, a, owner_id, rng)?;
-      generate_products(ctx, b, owner_id, rng)?;
+      generate_entity_products(ctx, a, target_id, rng)?;
+      generate_entity_products(ctx, b, target_id, rng)?;
     }
 
     Entity::Or { a, weights, b } => {
@@ -213,11 +222,29 @@ fn generate_products(
       let total    = wa + wb;
       let pick_a   = total == 0 || (*rng % total) < *wa;
       if pick_a {
-        generate_products(ctx, a, owner_id, rng)?;
+        generate_entity_products(ctx, a, target_id, rng)?;
       } else {
-        generate_products(ctx, b, owner_id, rng)?;
+        generate_entity_products(ctx, b, target_id, rng)?;
       }
     }
+  }
+  Ok(())
+}
+
+/// Generate all product groups for a completed action, routing each to its target.
+fn generate_products(
+  ctx:      &ReducerContext,
+  recipe:   &crate::definitions::RecipeDef,
+  owner_id: u32,
+  card_id:  u32,
+  rng:      &mut u32,
+) -> Result<(), String> {
+  for group in &recipe.products {
+    let target_id = match group.target {
+      ProductTarget::Owner => owner_id,
+      ProductTarget::Root  => card_id,
+    };
+    generate_entity_products(ctx, &group.entity, target_id, rng)?;
   }
   Ok(())
 }
@@ -252,11 +279,11 @@ pub fn complete_action(
   let up_chain   = collect_chain(&zone_cards, root_card.card_id, CARD_FLAG_STACKED_UP);
   let down_chain = collect_chain(&zone_cards, root_card.card_id, CARD_FLAG_STACKED_DOWN);
 
-  // 5. Generate products into the owner's panel BEFORE consuming reagents,
+  // 5. Generate products BEFORE consuming reagents,
   //    because the root card itself may be a reagent and could be deleted.
-  if let Some(products) = &recipe.products {
+  if !recipe.products.is_empty() {
     let mut rng = action_id;
-    generate_products(ctx, products, action.owner_id, &mut rng)?;
+    generate_products(ctx, recipe, action.owner_id, action.card_id, &mut rng)?;
   }
 
   // 6. Consume reagents — delete cards that satisfy the reagent entity.

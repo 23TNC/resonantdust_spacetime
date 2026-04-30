@@ -36,14 +36,17 @@ struct RawCardDef {
     abilities: Vec<String>,
     #[serde(default)]
     aspects: HashMap<String, u8>,
+    #[serde(default)]
+    recipe: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawRecipe {
-    id:          String,
-    stack_craft: bool,
+    id: String,
+    #[serde(rename = "type")]
+    recipe_type: Option<String>,
     #[serde(default)]
-    duration: u32,
+    duration: Value,
     tile:      Option<Value>,
     catalysts: Option<Value>,
     reagents:  Option<Value>,
@@ -56,10 +59,11 @@ struct RawRecipe {
 pub struct CardDef {
     pub id:           String,
     pub display_name: String,
-    /// Ordered list of abilities this card carries (e.g. "fleeting", "card_target").
-    pub abilities: Vec<String>,
+    pub abilities:    Vec<String>,
     /// Aspect tags with additive values 1–3 indicating strength of association.
-    pub aspects: HashMap<String, u8>,
+    pub aspects:  HashMap<String, u8>,
+    /// Recipe to queue automatically when a card of this definition is created.
+    pub recipe:   Option<String>,
 }
 
 /// Recursive recipe entity tree — mirrors the TypeScript RecipeEntity type.
@@ -71,17 +75,64 @@ pub enum Entity {
     Or   { a: Box<Entity>, weights: [u32; 2], b: Box<Entity> },
 }
 
+/// How a recipe selects which cards to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecipeType {
+    /// Acts on the top card of a stack.
+    TopStack,
+    /// Acts on the bottom card of a stack.
+    BottomStack,
+    /// Acts on both ends of a stack.
+    BothStack,
+    /// Queued automatically when a matching card is created.
+    OnCreate,
+    /// Triggered explicitly by player action.
+    Explicit,
+}
+
+/// One entry in a conditional duration list.
+#[derive(Debug, Clone)]
+pub struct DurationCondition {
+    pub duration:  u32,
+    /// `Empty` means this entry always matches (catch-all).
+    pub condition: Entity,
+}
+
+/// Recipe duration — either a fixed number of seconds or a prioritised
+/// condition list evaluated against the card pool at action start.
+#[derive(Debug, Clone)]
+pub enum RecipeDuration {
+    Fixed(u32),
+    Conditional(Vec<DurationCondition>),
+}
+
+/// Where a product group's cards are placed when a recipe completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductTarget {
+    /// Cards go into the owner's panel (owner_id from the action).
+    Owner,
+    /// Cards go into the root card's panel (card_id from the action).
+    Root,
+}
+
+/// One group of products with a shared placement target.
+#[derive(Debug, Clone)]
+pub struct ProductGroup {
+    pub target: ProductTarget,
+    pub entity: Entity,
+}
+
 #[derive(Debug, Clone)]
 pub struct RecipeDef {
     pub id:          String,
     /// 0-based wire index — the value stored in Action::recipe.
     pub index:       u16,
-    pub stack_craft: bool,
-    pub duration:    u32,
+    pub recipe_type: RecipeType,
+    pub duration:    RecipeDuration,
     pub tile:        Option<Entity>,
     pub catalysts:   Option<Entity>,
     pub reagents:    Option<Entity>,
-    pub products:    Option<Entity>,
+    pub products:    Vec<ProductGroup>,
 }
 
 // ── Entity parsing ────────────────────────────────────────────────────────────
@@ -124,6 +175,26 @@ fn parse_entity(v: &Value) -> Entity {
     Entity::And {
         a: Box::new(parse_entity(&arr[0])),
         b: Box::new(arr.get(1).map(parse_entity).unwrap_or(Entity::Empty)),
+    }
+}
+
+fn parse_duration(v: &Value) -> RecipeDuration {
+    match v {
+        Value::Number(n) => RecipeDuration::Fixed(n.as_u64().unwrap_or(0) as u32),
+        Value::Array(arr) => {
+            let conditions = arr.iter().filter_map(|entry| {
+                let row = entry.as_array()?;
+                let duration = row.first()?.as_u64()? as u32;
+                let condition = match row.get(1) {
+                    None => Entity::Empty,
+                    Some(Value::Array(a)) if a.is_empty() => Entity::Empty,
+                    Some(v) => parse_entity(v),
+                };
+                Some(DurationCondition { duration, condition })
+            }).collect();
+            RecipeDuration::Conditional(conditions)
+        }
+        _ => RecipeDuration::Fixed(0),
     }
 }
 
@@ -170,6 +241,7 @@ fn build_registry() -> Registry {
                 display_name: raw.display_name.clone(),
                 abilities:    raw.abilities.clone(),
                 aspects:      raw.aspects.clone(),
+                recipe:       raw.recipe.clone(),
             });
         }
     }
@@ -185,15 +257,43 @@ fn build_registry() -> Registry {
     for (i, raw) in raw_recipes.into_iter().enumerate() {
         let index = i as u16;
         recipe_ids.insert(raw.id.clone(), index);
+        let products = raw.products
+            .as_ref()
+            .and_then(Value::as_object)
+            .map(|obj| {
+                obj.iter().filter_map(|(key, val)| {
+                    let target = match key.as_str() {
+                        "owner" => ProductTarget::Owner,
+                        "root"  => ProductTarget::Root,
+                        _ => { log::warn!("definitions: unknown product target '{key}'"); return None; }
+                    };
+                    Some(ProductGroup { target, entity: parse_entity(val) })
+                }).collect()
+            })
+            .unwrap_or_default();
+
+        let recipe_type = match raw.recipe_type.as_deref() {
+            Some("top_stack")    => RecipeType::TopStack,
+            Some("bottom_stack") => RecipeType::BottomStack,
+            Some("both_stack")   => RecipeType::BothStack,
+            Some("on_create")    => RecipeType::OnCreate,
+            Some("explicit")     => RecipeType::Explicit,
+            Some(other) => {
+                log::warn!("definitions: unknown recipe type '{other}', defaulting to OnCreate");
+                RecipeType::OnCreate
+            }
+            None => RecipeType::OnCreate,
+        };
+
         recipes.push(RecipeDef {
             id:          raw.id,
             index,
-            stack_craft: raw.stack_craft,
-            duration:    raw.duration,
+            recipe_type,
+            duration:    parse_duration(&raw.duration),
             tile:        raw.tile.as_ref().map(parse_entity),
             catalysts:   raw.catalysts.as_ref().map(parse_entity),
             reagents:    raw.reagents.as_ref().map(parse_entity),
-            products:    raw.products.as_ref().map(parse_entity),
+            products,
         });
     }
 
@@ -224,8 +324,38 @@ pub fn get_recipe_by_id(id: &str) -> Option<&'static RecipeDef> {
 }
 
 /// Duration in seconds for the given recipe index, or `fallback` if not found.
+/// For conditional durations, returns the first unconditional catch-all entry,
+/// or `fallback` if none exists. Use `resolve_duration` for full evaluation.
 pub fn recipe_duration(index: u16, fallback: u32) -> u32 {
-    get_recipe(index).map(|r| r.duration).unwrap_or(fallback)
+    match get_recipe(index).map(|r| &r.duration) {
+        Some(RecipeDuration::Fixed(n)) => *n,
+        Some(RecipeDuration::Conditional(entries)) => entries.iter()
+            .find(|e| matches!(e.condition, Entity::Empty))
+            .map(|e| e.duration)
+            .unwrap_or(fallback),
+        None => fallback,
+    }
+}
+
+/// Evaluate a conditional duration against a card pool, returning the first
+/// matching entry's duration. Fixed durations ignore the pool entirely.
+/// The pool maps card definition id → count and is not consumed.
+pub fn resolve_duration(recipe: &RecipeDef, pool: &HashMap<String, u32>) -> u32 {
+    match &recipe.duration {
+        RecipeDuration::Fixed(n) => *n,
+        RecipeDuration::Conditional(entries) => {
+            for entry in entries {
+                if matches!(entry.condition, Entity::Empty) {
+                    return entry.duration;
+                }
+                let mut tmp = pool.clone();
+                if match_entity(&entry.condition, &mut tmp) {
+                    return entry.duration;
+                }
+            }
+            0
+        }
+    }
 }
 
 /// Number of loaded recipes.
@@ -245,11 +375,9 @@ pub fn find_def_by_str_id(id: &str) -> Option<(u8, u8)> {
     Some(((key >> 8) as u8, (key & 0xFF) as u8))
 }
 
-/// Returns true if the card definition declares the named ability.
-pub fn has_ability(card_type: u8, definition_id: u8, ability: &str) -> bool {
-    get_card_def(card_type, definition_id)
-        .map(|d| d.abilities.iter().any(|a| a == ability))
-        .unwrap_or(false)
+/// Iterate all recipes whose type is OnCreate.
+pub fn on_create_recipes() -> impl Iterator<Item = &'static RecipeDef> {
+    registry().recipes.iter().filter(|r| r.recipe_type == RecipeType::OnCreate)
 }
 
 // ── Input matching ────────────────────────────────────────────────────────────

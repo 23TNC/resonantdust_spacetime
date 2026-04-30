@@ -13,9 +13,10 @@ services:
       - ./keys:/etc/spacetimedb
       - ./config:/home/spacetime/.config/spacetime
       - ./data:/home/spacetime/.local/share/spacetime/data
+      - ../data:/workspace/server/spacetimedb/data
       - ./server:/workspace/server
       - ../pixijs:/workspace/pixijs
-      - ../simulation:/workspace/simulation
+      - ../actionmanager:/workspace/actionmanager
     working_dir: /workspace/server
     command:
       - start
@@ -29,8 +30,10 @@ services:
     image: clockworklabs/spacetime:latest
     volumes:
       - ./server:/workspace/server
+      - ./data:/workspace/server/spacetimedb/data
+      - ../data:/workspace/server/spacetimedb/data
       - ../pixijs:/workspace/pixijs
-      - ../simulation:/workspace/simulation
+      - ../actionmanager:/workspace/actionmanager
     working_dir: /workspace/server
     command:
       - build
@@ -39,8 +42,10 @@ services:
     image: clockworklabs/spacetime:latest
     volumes:
       - ./server:/workspace/server
+      - ./data:/workspace/server/spacetimedb/data
+      - ../data:/workspace/server/spacetimedb/data
       - ../pixijs:/workspace/pixijs
-      - ../simulation:/workspace/simulation
+      - ../actionmanager:/workspace/actionmanager
     working_dir: /workspace/server
     entrypoint: ["/bin/bash"]
     command:

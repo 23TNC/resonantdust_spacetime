@@ -9,7 +9,7 @@ use crate::zones::{zones, Zone};
 use serde::Deserialize;
 use spacetimedb::{reducer, ReducerContext, Table};
 
-const BOOTSTRAP_JSON: &str = include_str!("../bootstrap/bootstrap.json");
+const BOOTSTRAP_JSON: &str = include_str!("../data/bootstrap/bootstrap.json");
 
 #[derive(Debug, Deserialize)]
 struct BootstrapData {
@@ -71,18 +71,10 @@ struct CardSeed {
   #[serde(default, alias = "z")]
   layer: Option<u8>,
 
-  // Panel placement: owner's panel at pixel (x, y), layer z (default 1).
-  // Mutually exclusive with q/r world placement.
   #[serde(default)]
   pixel_x: Option<i16>,
   #[serde(default)]
   pixel_y: Option<i16>,
-
-  // Raw extra bits written into data / data2.
-  #[serde(default)]
-  extra: Option<u64>,
-  #[serde(default)]
-  extra2: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,7 +222,7 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
         flags: row.flags,
         packed_definition: pack_definition(row.card_type, row.category, row.definition_id),
         data: 0,
-        data2: 0,
+        action_id: 0,
       });
 
       let soul_id = inserted.card_id;

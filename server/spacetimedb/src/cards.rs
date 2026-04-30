@@ -1,10 +1,10 @@
 use spacetimedb::{ReducerContext, Table};
 use crate::packing::{
   pack_definition, pack_macro_world, pack_macro_panel, pack_micro_hex, pack_micro_pixel, pack_micro_stacked,
-  card_type_from_definition, world_to_zone, world_to_position,
+  card_type_from_definition, definition_id_from_definition, world_to_zone, world_to_position,
   CARD_FLAG_STACKED_UP, CARD_FLAG_STACKED_DOWN, CARD_FLAG_STACKABLE,
 };
-use crate::actions::{actions, Action, ACTION_FLAG_STARTED, current_seconds};
+use crate::actions::{actions, queue_action_inner};
 use crate::players::players;
 
 #[spacetimedb::table(accessor = cards, public)]
@@ -24,12 +24,9 @@ pub struct Card {
   pub flags: u16,
   // [ card_type: u4 ][ category: u4 ][ definition_id: u8 ]
   pub packed_definition: u16,
-  // Card-type-specific payload — 64 bits each, interpretation defined per card_type
-  // (and described per-definition by the `abilities` list in card JSON).
-  // Known usage: type 4 (Revery) category 0 definition 1 (Soul Reference)
-  // stores the world soul card_id in data bits [31:0] via the `card_target` ability.
-  pub data:  u64,
-  pub data2: u64,
+  // Card-type-specific payload. Soul Reference (type 4 / def 1): data[31:0] holds the world soul card_id.
+  pub data:      u64,
+  pub action_id: u32,
 }
 
 fn sync_player_location_for_soul_card(ctx: &ReducerContext, card: &Card) {
@@ -41,6 +38,22 @@ fn sync_player_location_for_soul_card(ctx: &ReducerContext, card: &Card) {
     player.micro_location = card.micro_location;
     ctx.db.players().player_id().update(player);
   }
+}
+
+fn queue_on_create_action(ctx: &ReducerContext, card: &Card) -> Result<(), String> {
+  let card_type     = card_type_from_definition(card.packed_definition);
+  let definition_id = definition_id_from_definition(card.packed_definition);
+  let Some(def) = crate::definitions::get_card_def(card_type, definition_id) else {
+    return Ok(());
+  };
+  let Some(recipe_id) = &def.recipe else {
+    return Ok(());
+  };
+  let Some(recipe) = crate::definitions::get_recipe_by_id(recipe_id) else {
+    log::warn!("card {}: unknown recipe '{recipe_id}'", card.card_id);
+    return Ok(());
+  };
+  queue_action_inner(ctx, card.card_id, card.owner_id, recipe.index, card.macro_location, card.micro_location)
 }
 
 pub fn insert_card_row(
@@ -65,28 +78,8 @@ pub fn insert_card_row(
     flags,
     packed_definition: pack_definition(card_type, category, definition_id),
     data: 0,
-    data2: 0,
+    action_id: 0,
   });
-
-  // If the card's definition declares the "fleeting" ability, start a fleeting
-  // expiry action immediately so the simulation knows when to delete it.
-  if crate::definitions::has_ability(card_type, definition_id, "fleeting") {
-    if let Some(recipe) = crate::definitions::get_recipe_by_id("fleeting") {
-      let now      = current_seconds(ctx).unwrap_or(0);
-      let duration = crate::definitions::recipe_duration(recipe.index, 0);
-      ctx.db.actions().insert(Action {
-        action_id:      0,
-        card_id:        inserted.card_id,
-        recipe:         recipe.index,
-        start:          now,
-        end:            now.saturating_add(duration),
-        flags:          ACTION_FLAG_STARTED,
-        owner_id,
-        macro_location: 0,
-        micro_location: 0,
-      });
-    }
-  }
 
   // A type-5 card with category > 0 is an instance of a soul archetype.
   // Create a companion Soul Reference (Revery, type 4 / category 0 / def 1)
@@ -102,10 +95,11 @@ pub fn insert_card_row(
       flags: CARD_FLAG_STACKABLE,
       packed_definition: pack_definition(4, 0, 1),
       data: inserted.card_id as u64,
-      data2: 0,
+      action_id: 0,
     });
   }
 
+  queue_on_create_action(ctx, &inserted)?;
   Ok(inserted.card_id)
 }
 
@@ -125,27 +119,10 @@ pub fn insert_panel_card_row(
     flags,
     packed_definition: pack_definition(card_type, category, definition_id),
     data:              0,
-    data2:             0,
+    action_id:         0,
   });
 
-  if crate::definitions::has_ability(card_type, definition_id, "fleeting") {
-    if let Some(recipe) = crate::definitions::get_recipe_by_id("fleeting") {
-      let now      = current_seconds(ctx).unwrap_or(0);
-      let duration = crate::definitions::recipe_duration(recipe.index, 0);
-      ctx.db.actions().insert(Action {
-        action_id:      0,
-        card_id:        inserted.card_id,
-        recipe:         recipe.index,
-        start:          now,
-        end:            now.saturating_add(duration),
-        flags:          ACTION_FLAG_STARTED,
-        owner_id,
-        macro_location: 0,
-        micro_location: 0,
-      });
-    }
-  }
-
+  queue_on_create_action(ctx, &inserted)?;
   Ok(inserted.card_id)
 }
 
@@ -195,13 +172,13 @@ pub fn update_card_data(
 }
 
 #[spacetimedb::reducer]
-pub fn update_card_data2(
+pub fn update_card_action_id(
   ctx: &ReducerContext,
   card_id: u32,
-  data2: u64,
+  action_id: u32,
 ) -> Result<(), String> {
   if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
-    row.data2 = data2;
+    row.action_id = action_id;
     ctx.db.cards().card_id().update(row);
     Ok(())
   } else {
