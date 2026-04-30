@@ -1,9 +1,10 @@
 use spacetimedb::{ReducerContext, Table};
 use crate::packing::{
-  pack_definition, pack_macro_world, pack_macro_panel, pack_micro_hex, pack_micro_stacked,
+  pack_definition, pack_macro_world, pack_macro_panel, pack_micro_hex, pack_micro_pixel, pack_micro_stacked,
   card_type_from_definition, world_to_zone, world_to_position,
   CARD_FLAG_STACKED_UP, CARD_FLAG_STACKED_DOWN, CARD_FLAG_STACKABLE,
 };
+use crate::actions::{actions, Action, ACTION_FLAG_STARTED, current_seconds};
 use crate::players::players;
 
 #[spacetimedb::table(accessor = cards, public)]
@@ -23,9 +24,12 @@ pub struct Card {
   pub flags: u16,
   // [ card_type: u4 ][ category: u4 ][ definition_id: u8 ]
   pub packed_definition: u16,
-  // Card-type-specific payload — 64 bits, interpretation defined per card_type.
-  // Known usage: type 5 category 0 stores the world soul card_id in bits [31:0].
-  pub data: u64,
+  // Card-type-specific payload — 64 bits each, interpretation defined per card_type
+  // (and described per-definition by the `abilities` list in card JSON).
+  // Known usage: type 4 (Revery) category 0 definition 1 (Soul Reference)
+  // stores the world soul card_id in data bits [31:0] via the `card_target` ability.
+  pub data:  u64,
+  pub data2: u64,
 }
 
 fn sync_player_location_for_soul_card(ctx: &ReducerContext, card: &Card) {
@@ -61,11 +65,34 @@ pub fn insert_card_row(
     flags,
     packed_definition: pack_definition(card_type, category, definition_id),
     data: 0,
+    data2: 0,
   });
 
+  // If the card's definition declares the "fleeting" ability, start a fleeting
+  // expiry action immediately so the simulation knows when to delete it.
+  if crate::definitions::has_ability(card_type, definition_id, "fleeting") {
+    if let Some(recipe) = crate::definitions::get_recipe_by_id("fleeting") {
+      let now      = current_seconds(ctx).unwrap_or(0);
+      let duration = crate::definitions::recipe_duration(recipe.index, 0);
+      ctx.db.actions().insert(Action {
+        action_id:      0,
+        card_id:        inserted.card_id,
+        recipe:         recipe.index,
+        start:          now,
+        end:            now.saturating_add(duration),
+        flags:          ACTION_FLAG_STARTED,
+        owner_id,
+        macro_location: 0,
+        micro_location: 0,
+      });
+    }
+  }
+
   // A type-5 card with category > 0 is an instance of a soul archetype.
-  // Create a companion inventory card (category 0) placed in the soul's panel (surface=2).
-  // data[31:0] holds the world soul card_id for back-reference.
+  // Create a companion Soul Reference (Revery, type 4 / category 0 / def 1)
+  // in the soul's panel (surface=2).  data[31:0] holds the world soul
+  // card_id via the card_target ability so the reference card can resolve
+  // back to its soul.
   if card_type == 5 && category > 0 {
     ctx.db.cards().insert(Card {
       card_id: 0,
@@ -73,9 +100,50 @@ pub fn insert_card_row(
       micro_location: 0,
       owner_id,
       flags: CARD_FLAG_STACKABLE,
-      packed_definition: pack_definition(5, 0, definition_id),
+      packed_definition: pack_definition(4, 0, 1),
       data: inserted.card_id as u64,
+      data2: 0,
     });
+  }
+
+  Ok(inserted.card_id)
+}
+
+pub fn insert_panel_card_row(
+  ctx: &ReducerContext,
+  card_type: u8,
+  category: u8,
+  definition_id: u8,
+  owner_id: u32,
+  flags: u16,
+) -> Result<u32, String> {
+  let inserted = ctx.db.cards().insert(Card {
+    card_id:           0,
+    macro_location:    pack_macro_panel(owner_id, 1),
+    micro_location:    pack_micro_pixel(0, 0),
+    owner_id,
+    flags,
+    packed_definition: pack_definition(card_type, category, definition_id),
+    data:              0,
+    data2:             0,
+  });
+
+  if crate::definitions::has_ability(card_type, definition_id, "fleeting") {
+    if let Some(recipe) = crate::definitions::get_recipe_by_id("fleeting") {
+      let now      = current_seconds(ctx).unwrap_or(0);
+      let duration = crate::definitions::recipe_duration(recipe.index, 0);
+      ctx.db.actions().insert(Action {
+        action_id:      0,
+        card_id:        inserted.card_id,
+        recipe:         recipe.index,
+        start:          now,
+        end:            now.saturating_add(duration),
+        flags:          ACTION_FLAG_STARTED,
+        owner_id,
+        macro_location: 0,
+        micro_location: 0,
+      });
+    }
   }
 
   Ok(inserted.card_id)
@@ -119,6 +187,21 @@ pub fn update_card_data(
 ) -> Result<(), String> {
   if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
     row.data = data;
+    ctx.db.cards().card_id().update(row);
+    Ok(())
+  } else {
+    Err(format!("card {card_id} not found"))
+  }
+}
+
+#[spacetimedb::reducer]
+pub fn update_card_data2(
+  ctx: &ReducerContext,
+  card_id: u32,
+  data2: u64,
+) -> Result<(), String> {
+  if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
+    row.data2 = data2;
     ctx.db.cards().card_id().update(row);
     Ok(())
   } else {
@@ -242,6 +325,9 @@ pub fn delete_card(
   ctx: &ReducerContext,
   card_id: u32,
 ) -> Result<(), String> {
+  for action in ctx.db.actions().card_id().filter(&card_id) {
+    ctx.db.actions().action_id().delete(&action.action_id);
+  }
   ctx.db.cards().card_id().delete(&card_id);
   Ok(())
 }

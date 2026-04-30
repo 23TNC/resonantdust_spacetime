@@ -1,9 +1,8 @@
 use crate::actions::{actions, Action};
-use crate::cards::{cards, insert_card_row, Card};
+use crate::cards::{cards, Card};
 use crate::packing::{
   pack_definition, pack_macro_world, pack_micro_hex,
   world_to_zone, world_to_position,
-  CARD_FLAG_STACKED_UP, CARD_FLAG_STACKED_DOWN,
 };
 use crate::players::{players, Player};
 use crate::zones::{zones, Zone};
@@ -51,9 +50,6 @@ struct PlayerSeed {
 
 #[derive(Debug, Deserialize)]
 struct CardSeed {
-  #[serde(default)]
-  card_id: Option<u32>,
-
   card_type: u8,
   #[serde(default)]
   category: u8,
@@ -75,17 +71,18 @@ struct CardSeed {
   #[serde(default, alias = "z")]
   layer: Option<u8>,
 
-  // When set, the card is stacked upward onto this card_id (sets CARD_FLAG_STACKED_UP).
+  // Panel placement: owner's panel at pixel (x, y), layer z (default 1).
+  // Mutually exclusive with q/r world placement.
   #[serde(default)]
-  stacked_on: Option<u32>,
-
-  // When set, the card is stacked downward onto this card_id (sets CARD_FLAG_STACKED_DOWN).
+  pixel_x: Option<i16>,
   #[serde(default)]
-  stacked_on_down: Option<u32>,
+  pixel_y: Option<i16>,
 
-  // Raw extra bits written into data[47:0] (e.g. link_id for chain roots).
+  // Raw extra bits written into data / data2.
   #[serde(default)]
   extra: Option<u64>,
+  #[serde(default)]
+  extra2: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +230,7 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
         flags: row.flags,
         packed_definition: pack_definition(row.card_type, row.category, row.definition_id),
         data: 0,
+        data2: 0,
       });
 
       let soul_id = inserted.card_id;
@@ -251,9 +249,6 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
   }
 
   for row in data.card {
-    let (macro_location, micro_location) =
-      resolve_macro_micro(row.q, row.r, row.layer);
-
     let resolved_owner_id = match (row.owner_id, row.player.as_deref()) {
       (Some(_), Some(_)) => {
         return Err("card cannot specify both owner_id and player".to_string());
@@ -269,56 +264,23 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
       (None, None) => 0,
     };
 
-    let (final_micro, final_flags) = match (row.stacked_on, row.stacked_on_down) {
+    match (row.pixel_x, row.pixel_y) {
       (Some(_), Some(_)) => {
-        return Err("card cannot specify both stacked_on and stacked_on_down".to_string());
-      }
-      (Some(stacked_id), None) => (stacked_id, row.flags | CARD_FLAG_STACKED_UP),
-      (None, Some(stacked_id)) => (stacked_id, row.flags | CARD_FLAG_STACKED_DOWN),
-      (None, None)             => (micro_location, row.flags),
-    };
-
-    let packed_definition = pack_definition(row.card_type, row.category, row.definition_id);
-    let data = row.extra.unwrap_or(0);
-
-    match row.card_id {
-      Some(card_id) => {
-        if ctx.db.cards().card_id().find(&card_id).is_some() {
-          ctx.db.cards().card_id().update(Card {
-            card_id,
-            macro_location,
-            micro_location: final_micro,
-            owner_id: resolved_owner_id,
-            flags: final_flags,
-            packed_definition,
-            data,
-          });
-        } else {
-          ctx.db.cards().insert(Card {
-            card_id,
-            macro_location,
-            micro_location: final_micro,
-            owner_id: resolved_owner_id,
-            flags: final_flags,
-            packed_definition,
-            data,
-          });
-        }
-      }
-      None => {
-        insert_card_row(
+        crate::cards::insert_panel_card_row(
           ctx,
-          row.card_type,
-          row.category,
-          row.definition_id,
-          resolved_owner_id,
-          final_flags,
-          row.q.unwrap_or(0),
-          row.r.unwrap_or(0),
-          row.layer.unwrap_or(0),
+          row.card_type, row.category, row.definition_id,
+          resolved_owner_id, row.flags,
         )?;
       }
-    }
+      _ => {
+        crate::cards::insert_card_row(
+          ctx,
+          row.card_type, row.category, row.definition_id,
+          resolved_owner_id, row.flags,
+          row.q.unwrap_or(0), row.r.unwrap_or(0), row.layer.unwrap_or(0),
+        )?;
+      }
+    };
   }
 
   for row in data.actions.into_iter().chain(data.action.into_iter()) {

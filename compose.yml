@@ -1,6 +1,12 @@
+networks:
+  resonantdust:
+    external: true
+
 services:
   start:
     image: clockworklabs/spacetime:latest
+    networks:
+      - resonantdust
     ports:
       - "3000:3000"
     volumes:
@@ -9,6 +15,7 @@ services:
       - ./data:/home/spacetime/.local/share/spacetime/data
       - ./server:/workspace/server
       - ../pixijs:/workspace/pixijs
+      - ../simulation:/workspace/simulation
     working_dir: /workspace/server
     command:
       - start
@@ -23,6 +30,7 @@ services:
     volumes:
       - ./server:/workspace/server
       - ../pixijs:/workspace/pixijs
+      - ../simulation:/workspace/simulation
     working_dir: /workspace/server
     command:
       - build
@@ -32,7 +40,9 @@ services:
     volumes:
       - ./server:/workspace/server
       - ../pixijs:/workspace/pixijs
+      - ../simulation:/workspace/simulation
     working_dir: /workspace/server
     entrypoint: ["/bin/bash"]
     command:
       - generate-bindings.sh
+

@@ -1,32 +1,47 @@
-[
-  {
-    "id": 6001,
-    "name": "Forest",
-    "card_type": 6,
-    "style": {
-      "color": [ "#4d7b4d", "#7fb377", "#0b160b" ]
-    }, 
-    "vars": {
-      "cost": 2
-    },
-    "flags": [
-      {
-        "flag": 0,
-        "name": "blocks_sight",
-        "default": true
+{
+  "card_type": 6,
+  "cards": [
+    {
+      "id": "plains",
+      "display_name": "Plains",
+      "title_on_bottom": false,
+      "style": {
+        "color": [ "#799E50", "#0b1426", "#0b1426" ]
       },
-      {
-        "flag": 1,
-        "name": "trees",
-        "default": false,
-        "show": true
+      "vars": {
+        "cost": 2
       },
-      {
-        "flag": 2,
-        "name": "food",
-        "default": false,
-        "show": true
+      "flags": [
+        [ "food", false, true, false ]
+      ],
+      "aspects": {
+        "earth": 2,
+        "food":  2,
+        "labor": 1
       }
-    ]
-  }
-]
+    },
+    {
+      "id": "forest",
+      "display_name": "Forest",
+      "title_on_bottom": false,
+      "style": {
+        "color": [ "#395C39", "#7fb377", "#0b1426" ]
+      },
+      "vars": {
+        "cost": 3,
+        "tree_regen": 20,
+        "food_regen": 60
+      },
+      "flags": [
+        [ "trees", true,  true, false ],
+        [ "food",  false, true, false ]
+      ],
+      "aspects": {
+        "wood":  3,
+        "earth": 2,
+        "food":  1,
+        "fuel":  1
+      }
+    }
+  ]
+}

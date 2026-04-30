@@ -1,0 +1,54 @@
+{
+  "_comment": "Aspect catalog — tags placed on cards to describe function. Used in recipe entity strings alongside card definition ids.",
+
+  "resources": {
+    "_comment": "Raw and processed materials",
+    "labor":  "Work or effort applied to a task",
+    "wood":   "Timber — logs, branches, raw lumber",
+    "stone":  "Rock, ore, mineral material",
+    "metal":  "Processed or smelted metallic material",
+    "food":   "Sustenance, edible produce",
+    "fuel":   "Combustible energy source (wood, coal, oil, etc.)"
+  },
+
+  "elements": {
+    "_comment": "Classical elemental forces",
+    "earth": "Stability, physicality, growth",
+    "water": "Flow, change, nourishment",
+    "fire":  "Energy, destruction, transformation",
+    "wind":  "Speed, freedom, breath",
+    "light": "Illumination, order, clarity",
+    "dark":  "Shadow, entropy, concealment"
+  },
+
+  "alignment": {
+    "_comment": "Moral or cosmic orientation",
+    "order": "Structure, law, discipline",
+    "chaos": "Randomness, freedom, disruption"
+  },
+
+  "faculties": {
+    "_comment": "The four inner faculties — mirror the faculty card ids",
+    "corpus":    "The body — physical capacity and health",
+    "sollertia": "Skill and cleverness — trained capability",
+    "anima":     "The animating soul — will and spirit",
+    "aether":    "Subtle or magical essence"
+  },
+
+  "dimensions": {
+    "_comment": "Abstract axes a card may contribute to (mind / body / skill / soul)",
+    "mind":  "Intellectual or cognitive contribution",
+    "body":  "Physical or somatic contribution",
+    "skill": "Trained or practiced contribution",
+    "soul":  "Spiritual or willful contribution"
+  },
+
+  "activities": {
+    "_comment": "Action domains and craft categories",
+    "combat":  "Fighting, violence, warfare",
+    "defence": "Protection, fortification, resilience",
+    "craft":   "Making, building, fabrication",
+    "explore": "Discovery, movement, scouting",
+    "quality": "Refinement, excellence, purity"
+  }
+}
