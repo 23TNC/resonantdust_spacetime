@@ -12,13 +12,13 @@ use serde_json::Value;
 
 // ── Embedded JSON files ───────────────────────────────────────────────────────
 
-const DISCIPLINE_JSON: &str = include_str!("../static/cards/discipline.json");
-const FACULTY_JSON:    &str = include_str!("../static/cards/faculty.json");
-const REQUISITES_JSON: &str = include_str!("../static/cards/requisites.json");
-const REVERY_JSON:     &str = include_str!("../static/cards/revery.json");
-const SOUL_JSON:       &str = include_str!("../static/cards/soul.json");
-const TILE_JSON:       &str = include_str!("../static/cards/tile.json");
-const RECIPES_JSON:    &str = include_str!("../static/recipes/basic.json");
+const DISCIPLINE_JSON: &str = include_str!("../data/cards/discipline.json");
+const FACULTY_JSON:    &str = include_str!("../data/cards/faculty.json");
+const REQUISITES_JSON: &str = include_str!("../data/cards/requisites.json");
+const REVERY_JSON:     &str = include_str!("../data/cards/revery.json");
+const SOUL_JSON:       &str = include_str!("../data/cards/soul.json");
+const TILE_JSON:       &str = include_str!("../data/cards/tile.json");
+const RECIPES_JSON:    &str = include_str!("../data/recipes/basic.json");
 
 // ── Raw deserialization shapes ────────────────────────────────────────────────
 
