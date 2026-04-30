@@ -4,7 +4,7 @@ use crate::packing::{
   card_type_from_definition, definition_id_from_definition, world_to_zone, world_to_position,
   CARD_FLAG_STACKED_UP, CARD_FLAG_STACKED_DOWN, CARD_FLAG_STACKABLE,
 };
-use crate::actions::{actions, queue_action_inner};
+use crate::actions::{actions, start_action_inner, start_action_inner_pool, delete_action_rows};
 use crate::players::players;
 
 #[spacetimedb::table(accessor = cards, public)]
@@ -26,7 +26,7 @@ pub struct Card {
   pub packed_definition: u16,
   // Card-type-specific payload. Soul Reference (type 4 / def 1): data[31:0] holds the world soul card_id.
   pub data:      u64,
-  pub action_id: u32,
+  pub action_id: u64,
 }
 
 fn sync_player_location_for_soul_card(ctx: &ReducerContext, card: &Card) {
@@ -40,20 +40,41 @@ fn sync_player_location_for_soul_card(ctx: &ReducerContext, card: &Card) {
   }
 }
 
-fn queue_on_create_action(ctx: &ReducerContext, card: &Card) -> Result<(), String> {
+fn start_on_create_action(ctx: &ReducerContext, card: &Card) -> Result<(), String> {
   let card_type     = card_type_from_definition(card.packed_definition);
   let definition_id = definition_id_from_definition(card.packed_definition);
   let Some(def) = crate::definitions::get_card_def(card_type, definition_id) else {
     return Ok(());
   };
-  let Some(recipe_id) = &def.recipe else {
-    return Ok(());
-  };
-  let Some(recipe) = crate::definitions::get_recipe_by_id(recipe_id) else {
-    log::warn!("card {}: unknown recipe '{recipe_id}'", card.card_id);
-    return Ok(());
-  };
-  queue_action_inner(ctx, card.card_id, card.owner_id, recipe.index, card.macro_location, card.micro_location)
+  // Pool: def id (qty 1) + each aspect at its value.
+  // Recipes can match by exact card id, aspect name, or "any".
+  let mut pool: std::collections::HashMap<String, u32> = def.aspects
+    .iter()
+    .map(|(k, &v)| (k.clone(), v as u32))
+    .collect();
+  *pool.entry(def.id.clone()).or_insert(0) += 1;
+
+  // Collect all matching on_create recipes and pick the most specific one.
+  // Specificity is scored per definitions::score_recipe_for_card:
+  //   def id match > aspect match > card_type match > "any" match.
+  let mut best: Option<(&'static crate::definitions::RecipeDef, u32)> = None;
+  for recipe in crate::definitions::on_create_recipes() {
+    let mut p = pool.clone();
+    if crate::definitions::matches_inputs(recipe, &mut p) {
+      let score = crate::definitions::score_recipe_for_card(recipe, def);
+      if best.map_or(true, |(_, s)| score > s) {
+        best = Some((recipe, score));
+      }
+    }
+  }
+
+  if let Some((recipe, _)) = best {
+    return start_action_inner_pool(
+      ctx, card.card_id, card.owner_id, recipe.index,
+      card.macro_location, card.micro_location, &pool,
+    );
+  }
+  Ok(())
 }
 
 pub fn insert_card_row(
@@ -99,7 +120,7 @@ pub fn insert_card_row(
     });
   }
 
-  queue_on_create_action(ctx, &inserted)?;
+  start_on_create_action(ctx, &inserted)?;
   Ok(inserted.card_id)
 }
 
@@ -122,7 +143,7 @@ pub fn insert_panel_card_row(
     action_id:         0,
   });
 
-  queue_on_create_action(ctx, &inserted)?;
+  start_on_create_action(ctx, &inserted)?;
   Ok(inserted.card_id)
 }
 
@@ -175,7 +196,7 @@ pub fn update_card_data(
 pub fn update_card_action_id(
   ctx: &ReducerContext,
   card_id: u32,
-  action_id: u32,
+  action_id: u64,
 ) -> Result<(), String> {
   if let Some(mut row) = ctx.db.cards().card_id().find(&card_id) {
     row.action_id = action_id;
@@ -303,7 +324,7 @@ pub fn delete_card(
   card_id: u32,
 ) -> Result<(), String> {
   for action in ctx.db.actions().card_id().filter(&card_id) {
-    ctx.db.actions().action_id().delete(&action.action_id);
+    delete_action_rows(ctx, action.action_id);
   }
   ctx.db.cards().card_id().delete(&card_id);
   Ok(())

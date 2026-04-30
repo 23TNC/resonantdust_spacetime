@@ -1,4 +1,4 @@
-use crate::actions::{actions, Action};
+use crate::actions::{actions, start_action_inner};
 use crate::cards::{cards, Card};
 use crate::packing::{
   pack_definition, pack_macro_world, pack_micro_hex,
@@ -81,13 +81,6 @@ struct CardSeed {
 struct ActionSeed {
   card_id: u32,
   recipe: u16,
-
-  #[serde(default)]
-  start: u32,
-  #[serde(default)]
-  end: u32,
-  #[serde(default)]
-  flags: u8,
 
   #[serde(default, alias = "soul_id")]
   owner_id: Option<u32>,
@@ -294,17 +287,7 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
       (None, None) => 0,
     };
 
-    ctx.db.actions().insert(Action {
-      action_id: 0,
-      card_id: row.card_id,
-      recipe: row.recipe,
-      start: row.start,
-      end: row.end,
-      flags: row.flags,
-      owner_id: resolved_owner_id,
-      macro_location,
-      micro_location,
-    });
+    start_action_inner(ctx, row.card_id, resolved_owner_id, row.recipe, macro_location, micro_location)?;
   }
 
   Ok(())

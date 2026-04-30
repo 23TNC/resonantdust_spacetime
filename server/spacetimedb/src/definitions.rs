@@ -36,8 +36,6 @@ struct RawCardDef {
     abilities: Vec<String>,
     #[serde(default)]
     aspects: HashMap<String, u8>,
-    #[serde(default)]
-    recipe: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,8 +60,6 @@ pub struct CardDef {
     pub abilities:    Vec<String>,
     /// Aspect tags with additive values 1–3 indicating strength of association.
     pub aspects:  HashMap<String, u8>,
-    /// Recipe to queue automatically when a card of this definition is created.
-    pub recipe:   Option<String>,
 }
 
 /// Recursive recipe entity tree — mirrors the TypeScript RecipeEntity type.
@@ -241,7 +237,6 @@ fn build_registry() -> Registry {
                 display_name: raw.display_name.clone(),
                 abilities:    raw.abilities.clone(),
                 aspects:      raw.aspects.clone(),
-                recipe:       raw.recipe.clone(),
             });
         }
     }
@@ -315,12 +310,6 @@ pub fn get_card_def(card_type: u8, definition_id: u8) -> Option<&'static CardDef
 /// Look up a recipe by its 0-based wire index (Action::recipe field).
 pub fn get_recipe(index: u16) -> Option<&'static RecipeDef> {
     registry().recipes.get(index as usize)
-}
-
-/// Look up a recipe by its string id.
-pub fn get_recipe_by_id(id: &str) -> Option<&'static RecipeDef> {
-    let &idx = registry().recipe_ids.get(id)?;
-    get_recipe(idx)
 }
 
 /// Duration in seconds for the given recipe index, or `fallback` if not found.
@@ -439,4 +428,51 @@ pub fn matches_inputs(recipe: &RecipeDef, pool: &mut HashMap<String, u32>) -> bo
     if let Some(catalysts) = &recipe.catalysts { if !match_entity(catalysts, pool) { return false; } }
     if let Some(reagents)  = &recipe.reagents  { if !match_entity(reagents,  pool) { return false; } }
     true
+}
+
+// ── Recipe priority scoring ───────────────────────────────────────────────────
+//
+// When multiple on_create recipes match the same card we pick the most
+// specific one.  Specificity is the sum of per-leaf weights across catalysts
+// and reagents (tile is structural and excluded from scoring).
+//
+// Leaf weight by match category (higher = more specific):
+//   def id   1000  — key matches the card's own definition id exactly
+//   aspect    100  — key is one of the card's aspect names
+//   card type  10  — future: key names a card_type category
+//   "any"       1  — wildcard
+
+const WEIGHT_DEF_ID:    u32 = 1000;
+const WEIGHT_ASPECT:    u32 = 100;
+const WEIGHT_CARD_TYPE: u32 = 10;
+const WEIGHT_ANY:       u32 = 1;
+
+fn score_entity(entity: &Entity, def: &CardDef) -> u32 {
+    match entity {
+        Entity::Empty => 0,
+        Entity::Leaf { def_id, qty } => {
+            let w = if def_id == "any" {
+                WEIGHT_ANY
+            } else if def_id == &def.id {
+                WEIGHT_DEF_ID
+            } else if def.aspects.contains_key(def_id.as_str()) {
+                WEIGHT_ASPECT
+            } else {
+                WEIGHT_CARD_TYPE
+            };
+            w * qty
+        }
+        Entity::And { a, b } => score_entity(a, def) + score_entity(b, def),
+        // For OR, take whichever branch scores higher — we're asking "how
+        // specific could this match be", not simulating a particular path.
+        Entity::Or { a, b, .. } => score_entity(a, def).max(score_entity(b, def)),
+    }
+}
+
+/// Specificity score for a recipe matched against a particular card definition.
+/// Higher score wins when multiple on_create recipes match the same card.
+pub fn score_recipe_for_card(recipe: &RecipeDef, def: &CardDef) -> u32 {
+    let cat = recipe.catalysts.as_ref().map_or(0, |e| score_entity(e, def));
+    let rea = recipe.reagents.as_ref().map_or(0, |e| score_entity(e, def));
+    cat + rea
 }

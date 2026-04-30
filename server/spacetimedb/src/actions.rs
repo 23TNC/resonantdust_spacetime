@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use spacetimedb::{ReducerContext, Table};
+use spacetimedb::{ReducerContext, ScheduleAt, Table, Timestamp};
 use crate::cards::{cards, Card};
-use crate::definitions::{Entity, ProductTarget, get_recipe};
+use crate::definitions::{Entity, ProductTarget, get_recipe, resolve_duration};
 use crate::packing::{
   pack_macro_world, pack_micro_hex,
   card_type_from_definition, definition_id_from_definition,
@@ -9,9 +9,20 @@ use crate::packing::{
   CARD_FLAG_STACKED_UP, CARD_FLAG_STACKED_DOWN, CARD_FLAG_STACKABLE,
 };
 
-pub const ACTION_FLAG_STARTED:   u8 = 1 << 0;
-pub const ACTION_FLAG_COMPLETED: u8 = 1 << 1;
-pub const ACTION_FLAG_QUEUED:    u8 = 1 << 2;
+// ── ActionScheduler — internal scheduled table, not sent to clients ───────────
+
+#[spacetimedb::table(accessor = action_scheduler, scheduled(complete_action))]
+#[derive(Debug, Clone)]
+pub struct ActionScheduler {
+  #[primary_key]
+  #[auto_inc]
+  pub id: u64,
+  pub scheduled_at: ScheduleAt,
+  #[index(btree)]
+  pub action_id: u32,
+}
+
+// ── Action — public table subscribed to by clients ────────────────────────────
 
 #[spacetimedb::table(accessor = actions, public)]
 #[derive(Debug, Clone)]
@@ -22,9 +33,7 @@ pub struct Action {
   #[index(btree)]
   pub card_id: u32,
   pub recipe: u16,
-  pub start: u32,
   pub end: u32,
-  pub flags: u8,
   #[index(btree)]
   pub owner_id: u32,
   #[index(btree)]
@@ -41,6 +50,14 @@ pub fn current_seconds(ctx: &ReducerContext) -> Result<u32, String> {
   u32::try_from(secs).map_err(|_| "ReducerContext timestamp exceeds u32 seconds range".to_string())
 }
 
+/// Delete an action and its associated scheduler row.
+pub fn delete_action_rows(ctx: &ReducerContext, action_id: u32) {
+  for sched in ctx.db.action_scheduler().action_id().filter(&action_id) {
+    ctx.db.action_scheduler().id().delete(&sched.id);
+  }
+  ctx.db.actions().action_id().delete(&action_id);
+}
+
 pub fn queue_action_inner(
   ctx:            &ReducerContext,
   card_id:        u32,
@@ -49,19 +66,81 @@ pub fn queue_action_inner(
   macro_location: u64,
   micro_location: u32,
 ) -> Result<(), String> {
-  let now = current_seconds(ctx)?;
-  ctx.db.actions().insert(Action {
+  let inserted = ctx.db.actions().insert(Action {
     action_id: 0,
     card_id,
     recipe,
-    start: now,
     end: 0,
-    flags: ACTION_FLAG_QUEUED,
     owner_id,
     macro_location,
     micro_location,
   });
+  ctx.db.action_scheduler().insert(ActionScheduler {
+    id:           0,
+    scheduled_at: ScheduleAt::Time(Timestamp::from_micros_since_unix_epoch(i64::MAX)),
+    action_id:    inserted.action_id,
+  });
   Ok(())
+}
+
+fn insert_scheduled_action(
+  ctx:            &ReducerContext,
+  card_id:        u32,
+  owner_id:       u32,
+  recipe:         u16,
+  macro_location: u64,
+  micro_location: u32,
+  duration:       u32,
+) -> Result<(), String> {
+  let now = current_seconds(ctx)?;
+  let complete_at = Timestamp::from_micros_since_unix_epoch(
+    ctx.timestamp.to_micros_since_unix_epoch()
+      .saturating_add(duration as i64 * 1_000_000),
+  );
+  let inserted = ctx.db.actions().insert(Action {
+    action_id: 0,
+    card_id,
+    recipe,
+    end: now.saturating_add(duration),
+    owner_id,
+    macro_location,
+    micro_location,
+  });
+  ctx.db.action_scheduler().insert(ActionScheduler {
+    id:           0,
+    scheduled_at: ScheduleAt::Time(complete_at),
+    action_id:    inserted.action_id,
+  });
+  Ok(())
+}
+
+pub fn start_action_inner(
+  ctx:            &ReducerContext,
+  card_id:        u32,
+  owner_id:       u32,
+  recipe:         u16,
+  macro_location: u64,
+  micro_location: u32,
+) -> Result<(), String> {
+  let duration = crate::definitions::recipe_duration(recipe, 0);
+  insert_scheduled_action(ctx, card_id, owner_id, recipe, macro_location, micro_location, duration)
+}
+
+/// Like `start_action_inner` but evaluates conditional durations against the
+/// provided aspect pool rather than falling back to the first catch-all entry.
+pub fn start_action_inner_pool(
+  ctx:            &ReducerContext,
+  card_id:        u32,
+  owner_id:       u32,
+  recipe:         u16,
+  macro_location: u64,
+  micro_location: u32,
+  pool:           &HashMap<String, u32>,
+) -> Result<(), String> {
+  let recipe_def = get_recipe(recipe)
+    .ok_or_else(|| format!("recipe {recipe} not found"))?;
+  let duration = resolve_duration(recipe_def, pool);
+  insert_scheduled_action(ctx, card_id, owner_id, recipe, macro_location, micro_location, duration)
 }
 
 #[spacetimedb::reducer]
@@ -90,22 +169,23 @@ pub fn start_action(
 ) -> Result<(), String> {
   let mut action = ctx.db.actions().action_id().find(&action_id)
     .ok_or_else(|| format!("action {action_id} not found"))?;
-  if action.flags & ACTION_FLAG_QUEUED == 0 {
-    return Err(format!("action {action_id} is not in queued state"));
-  }
   let now      = current_seconds(ctx)?;
   let duration = crate::definitions::recipe_duration(action.recipe, 0);
-  action.start  = now;
-  action.end    = now.saturating_add(duration);
-  action.flags  = ACTION_FLAG_STARTED;
+  let complete_at = Timestamp::from_micros_since_unix_epoch(
+    ctx.timestamp.to_micros_since_unix_epoch()
+      .saturating_add(duration as i64 * 1_000_000),
+  );
+  action.end = now.saturating_add(duration);
   ctx.db.actions().action_id().update(action);
+  if let Some(mut sched) = ctx.db.action_scheduler().action_id().filter(&action_id).next() {
+    sched.scheduled_at = ScheduleAt::Time(complete_at);
+    ctx.db.action_scheduler().id().update(sched);
+  }
   Ok(())
 }
 
 // ── Stack helpers ─────────────────────────────────────────────────────────────
 
-/// Collect all cards chained from `root_id` in one direction (STACKED_UP or
-/// STACKED_DOWN). For stacked cards `micro_location` is the parent card_id.
 fn collect_chain(all: &[Card], root_id: u32, direction: u16) -> Vec<Card> {
   let mut chain   = Vec::new();
   let mut parents = std::collections::HashSet::new();
@@ -126,7 +206,6 @@ fn collect_chain(all: &[Card], root_id: u32, direction: u16) -> Vec<Card> {
   chain
 }
 
-/// Build a pool mapping definition string id → [card_id, ...] from a card slice.
 fn build_card_pool(cards: &[&Card]) -> HashMap<String, Vec<u32>> {
   let mut pool: HashMap<String, Vec<u32>> = HashMap::new();
   for card in cards {
@@ -134,12 +213,14 @@ fn build_card_pool(cards: &[&Card]) -> HashMap<String, Vec<u32>> {
     let did = definition_id_from_definition(card.packed_definition);
     if let Some(def) = crate::definitions::get_card_def(ct, did) {
       pool.entry(def.id.clone()).or_default().push(card.card_id);
+      for aspect_name in def.aspects.keys() {
+        pool.entry(aspect_name.clone()).or_default().push(card.card_id);
+      }
     }
   }
   pool
 }
 
-/// Consume cards matching `entity` from `pool`. Returns the card_ids removed.
 fn consume_entity(entity: &Entity, pool: &mut HashMap<String, Vec<u32>>) -> Vec<u32> {
   match entity {
     Entity::Empty => vec![],
@@ -176,7 +257,6 @@ fn consume_entity(entity: &Entity, pool: &mut HashMap<String, Vec<u32>>) -> Vec<
     }
 
     Entity::Or { a, b, .. } => {
-      // Try A first; fall back to B if A yields nothing (and A isn't Empty).
       let snap = pool.clone();
       let va = consume_entity(a, pool);
       if va.is_empty() && !matches!(a.as_ref(), Entity::Empty) {
@@ -189,7 +269,6 @@ fn consume_entity(entity: &Entity, pool: &mut HashMap<String, Vec<u32>>) -> Vec<
   }
 }
 
-/// Recursively generate product cards for one entity into a single target panel.
 fn generate_entity_products(
   ctx:       &ReducerContext,
   entity:    &Entity,
@@ -231,7 +310,6 @@ fn generate_entity_products(
   Ok(())
 }
 
-/// Generate all product groups for a completed action, routing each to its target.
 fn generate_products(
   ctx:      &ReducerContext,
   recipe:   &crate::definitions::RecipeDef,
@@ -253,21 +331,18 @@ fn generate_products(
 
 #[spacetimedb::reducer]
 pub fn complete_action(
-  ctx: &ReducerContext,
-  action_id: u32,
+  ctx:       &ReducerContext,
+  scheduler: ActionScheduler,
 ) -> Result<(), String> {
-  // 1. Validate state.
+  let scheduler_id = scheduler.id;
+  let action_id    = scheduler.action_id;
+
   let action = ctx.db.actions().action_id().find(&action_id)
     .ok_or_else(|| format!("action {action_id} not found"))?;
-  if action.flags & ACTION_FLAG_STARTED == 0 {
-    return Err(format!("action {action_id} is not in started state"));
-  }
 
-  // 2. Look up the recipe.
   let recipe = get_recipe(action.recipe)
     .ok_or_else(|| format!("recipe {} not found", action.recipe))?;
 
-  // 3. Get the root card and every other card sharing its macro_location.
   let root_card = ctx.db.cards().card_id().find(&action.card_id)
     .ok_or_else(|| format!("action card {} not found", action.card_id))?;
   let zone_cards: Vec<Card> = ctx.db.cards()
@@ -275,37 +350,35 @@ pub fn complete_action(
     .filter(&root_card.macro_location)
     .collect();
 
-  // 4. Collect the up-chain and down-chain independently.
   let up_chain   = collect_chain(&zone_cards, root_card.card_id, CARD_FLAG_STACKED_UP);
   let down_chain = collect_chain(&zone_cards, root_card.card_id, CARD_FLAG_STACKED_DOWN);
 
-  // 5. Generate products BEFORE consuming reagents,
-  //    because the root card itself may be a reagent and could be deleted.
   if !recipe.products.is_empty() {
-    let mut rng = action_id;
+    let mut rng = scheduler_id as u32;
     generate_products(ctx, recipe, action.owner_id, action.card_id, &mut rng)?;
   }
 
-  // 6. Consume reagents — delete cards that satisfy the reagent entity.
   if let Some(reagents) = &recipe.reagents {
     let all_stack: Vec<&Card> = std::iter::once(&root_card)
       .chain(up_chain.iter())
       .chain(down_chain.iter())
       .collect();
-    let mut pool     = build_card_pool(&all_stack);
-    let to_delete    = consume_entity(reagents, &mut pool);
+    let mut pool  = build_card_pool(&all_stack);
+    let mut seen  = std::collections::HashSet::new();
+    let to_delete = consume_entity(reagents, &mut pool);
     for cid in to_delete {
+      if !seen.insert(cid) { continue; }
       for act in ctx.db.actions().card_id().filter(&cid) {
         if act.action_id != action_id {
-          ctx.db.actions().action_id().delete(&act.action_id);
+          delete_action_rows(ctx, act.action_id);
         }
       }
-      log::info!("complete_action {action_id}: deleting card {cid}");
+      log::info!("complete_action {scheduler_id}: deleting card {cid}");
       ctx.db.cards().card_id().delete(&cid);
     }
   }
 
-  // 7. Delete the completed action.
+  ctx.db.action_scheduler().id().delete(&scheduler_id);
   ctx.db.actions().action_id().delete(&action_id);
 
   Ok(())
@@ -316,6 +389,6 @@ pub fn delete_action(
   ctx: &ReducerContext,
   action_id: u32,
 ) -> Result<(), String> {
-  ctx.db.actions().action_id().delete(&action_id);
+  delete_action_rows(ctx, action_id);
   Ok(())
 }
