@@ -1,3 +1,0 @@
-[submodule "server/spacetimedb/data"]
-	path = server/spacetimedb/data
-	url = git@github.com:23TNC/resonantdust_data.git
