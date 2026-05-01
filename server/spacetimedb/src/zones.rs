@@ -1,13 +1,17 @@
-use crate::packing::pack_macro_world;
+use crate::packing::{pack_macro_world, ZONE_SIZE};
 use spacetimedb::{reducer, ReducerContext, Table};
-
-const ZONE_SIZE: u8 = 8;
 
 #[spacetimedb::table(accessor = zones, public)]
 #[derive(Debug, Clone)]
 pub struct Zone {
+  /// Zone PK component: layer (0..255).  Subscriptions filter by (layer,
+  /// macro_zone) — both must equal the queried zone.
+  #[index(btree)]
+  pub layer: u8,
+  /// Zone PK component: world coords packed as [zone_q:i16][zone_r:i16].
+  /// Always a world macro_zone for zones; panel layers do not have zone rows.
   #[primary_key]
-  pub macro_location: u64,
+  pub macro_zone: u32,
   // [ type: u4 ][ category: u4 ]
   pub definition: u8,
   pub t0: u64,
@@ -21,7 +25,7 @@ pub struct Zone {
 }
 
 fn validate_local_coord(name: &str, value: u8) -> Result<(), String> {
-  if value >= ZONE_SIZE {
+  if (value as i32) >= ZONE_SIZE {
     return Err(format!("{name} must be in 0..={}", ZONE_SIZE - 1));
   }
   Ok(())
@@ -78,9 +82,10 @@ fn make_filled_row(tile_def: u8) -> u64 {
   b | (b << 8) | (b << 16) | (b << 24) | (b << 32) | (b << 40) | (b << 48) | (b << 56)
 }
 
-fn empty_zone(macro_location: u64, definition: u8) -> Zone {
+fn empty_zone(layer: u8, macro_zone: u32, definition: u8) -> Zone {
   Zone {
-    macro_location,
+    layer,
+    macro_zone,
     definition,
     t0: 0,
     t1: 0,
@@ -93,14 +98,11 @@ fn empty_zone(macro_location: u64, definition: u8) -> Zone {
   }
 }
 
-fn zone_from_coords(zone_q: i16, zone_r: i16, layer: u8) -> u64 {
-  pack_macro_world(zone_q, zone_r, layer)
-}
-
 #[reducer]
 pub fn upsert_zone(
   ctx: &ReducerContext,
-  macro_location: u64,
+  layer: u8,
+  macro_zone: u32,
   definition: u8,
   t0: u64,
   t1: u64,
@@ -113,10 +115,10 @@ pub fn upsert_zone(
 ) -> Result<(), String> {
   validate_zone_definition(definition)?;
 
-  let row = Zone { macro_location, definition, t0, t1, t2, t3, t4, t5, t6, t7 };
+  let row = Zone { layer, macro_zone, definition, t0, t1, t2, t3, t4, t5, t6, t7 };
 
-  if ctx.db.zones().macro_location().find(&macro_location).is_some() {
-    ctx.db.zones().macro_location().delete(macro_location);
+  if ctx.db.zones().macro_zone().find(&macro_zone).is_some() {
+    ctx.db.zones().macro_zone().delete(macro_zone);
   }
   ctx.db.zones().insert(row);
 
@@ -139,19 +141,19 @@ pub fn upsert_zone_at(
   t6: u64,
   t7: u64,
 ) -> Result<(), String> {
-  let macro_location = zone_from_coords(zone_q, zone_r, layer);
-  upsert_zone(ctx, macro_location, definition, t0, t1, t2, t3, t4, t5, t6, t7)
+  upsert_zone(ctx, layer, pack_macro_world(zone_q, zone_r), definition, t0, t1, t2, t3, t4, t5, t6, t7)
 }
 
 #[reducer]
 pub fn fill_zone(
   ctx: &ReducerContext,
-  macro_location: u64,
+  layer: u8,
+  macro_zone: u32,
   definition: u8,
   tile_def: u8,
 ) -> Result<(), String> {
   let row = make_filled_row(tile_def);
-  upsert_zone(ctx, macro_location, definition, row, row, row, row, row, row, row, row)
+  upsert_zone(ctx, layer, macro_zone, definition, row, row, row, row, row, row, row, row)
 }
 
 #[reducer]
@@ -163,25 +165,26 @@ pub fn fill_zone_at(
   definition: u8,
   tile_def: u8,
 ) -> Result<(), String> {
-  let macro_location = zone_from_coords(zone_q, zone_r, layer);
-  fill_zone(ctx, macro_location, definition, tile_def)
+  fill_zone(ctx, layer, pack_macro_world(zone_q, zone_r), definition, tile_def)
 }
 
 #[reducer]
 pub fn set_zone_definition(
   ctx: &ReducerContext,
-  macro_location: u64,
+  layer: u8,
+  macro_zone: u32,
   definition: u8,
 ) -> Result<(), String> {
   validate_zone_definition(definition)?;
 
-  let mut row = ctx.db.zones().macro_location().find(&macro_location)
-    .unwrap_or_else(|| empty_zone(macro_location, definition));
+  let mut row = ctx.db.zones().macro_zone().find(&macro_zone)
+    .unwrap_or_else(|| empty_zone(layer, macro_zone, definition));
 
   row.definition = definition;
+  row.layer      = layer;
 
-  if ctx.db.zones().macro_location().find(&macro_location).is_some() {
-    ctx.db.zones().macro_location().delete(macro_location);
+  if ctx.db.zones().macro_zone().find(&macro_zone).is_some() {
+    ctx.db.zones().macro_zone().delete(macro_zone);
   }
   ctx.db.zones().insert(row);
 
@@ -196,26 +199,26 @@ pub fn set_zone_definition_at(
   layer: u8,
   definition: u8,
 ) -> Result<(), String> {
-  let macro_location = zone_from_coords(zone_q, zone_r, layer);
-  set_zone_definition(ctx, macro_location, definition)
+  set_zone_definition(ctx, layer, pack_macro_world(zone_q, zone_r), definition)
 }
 
 #[reducer]
 pub fn set_zone_row(
   ctx: &ReducerContext,
-  macro_location: u64,
+  layer: u8,
+  macro_zone: u32,
   local_r: u8,
   row_value: u64,
 ) -> Result<(), String> {
   validate_local_coord("local_r", local_r)?;
 
-  let mut row = ctx.db.zones().macro_location().find(&macro_location)
-    .unwrap_or_else(|| empty_zone(macro_location, 0));
+  let mut row = ctx.db.zones().macro_zone().find(&macro_zone)
+    .unwrap_or_else(|| empty_zone(layer, macro_zone, 0));
 
   set_row(&mut row, local_r, row_value);
 
-  if ctx.db.zones().macro_location().find(&macro_location).is_some() {
-    ctx.db.zones().macro_location().delete(macro_location);
+  if ctx.db.zones().macro_zone().find(&macro_zone).is_some() {
+    ctx.db.zones().macro_zone().delete(macro_zone);
   }
   ctx.db.zones().insert(row);
 
@@ -231,14 +234,14 @@ pub fn set_zone_row_at(
   local_r: u8,
   row_value: u64,
 ) -> Result<(), String> {
-  let macro_location = zone_from_coords(zone_q, zone_r, layer);
-  set_zone_row(ctx, macro_location, local_r, row_value)
+  set_zone_row(ctx, layer, pack_macro_world(zone_q, zone_r), local_r, row_value)
 }
 
 #[reducer]
 pub fn set_zone_tile(
   ctx: &ReducerContext,
-  macro_location: u64,
+  layer: u8,
+  macro_zone: u32,
   local_q: u8,
   local_r: u8,
   tile_def: u8,
@@ -246,15 +249,15 @@ pub fn set_zone_tile(
   validate_local_coord("local_q", local_q)?;
   validate_local_coord("local_r", local_r)?;
 
-  let mut row = ctx.db.zones().macro_location().find(&macro_location)
-    .unwrap_or_else(|| empty_zone(macro_location, 0));
+  let mut row = ctx.db.zones().macro_zone().find(&macro_zone)
+    .unwrap_or_else(|| empty_zone(layer, macro_zone, 0));
 
   let current = get_row(&row, local_r);
   let updated = set_packed_tile(current, local_q, tile_def);
   set_row(&mut row, local_r, updated);
 
-  if ctx.db.zones().macro_location().find(&macro_location).is_some() {
-    ctx.db.zones().macro_location().delete(macro_location);
+  if ctx.db.zones().macro_zone().find(&macro_zone).is_some() {
+    ctx.db.zones().macro_zone().delete(macro_zone);
   }
   ctx.db.zones().insert(row);
 
@@ -271,16 +274,15 @@ pub fn set_zone_tile_at(
   local_r: u8,
   tile_def: u8,
 ) -> Result<(), String> {
-  let macro_location = zone_from_coords(zone_q, zone_r, layer);
-  set_zone_tile(ctx, macro_location, local_q, local_r, tile_def)
+  set_zone_tile(ctx, layer, pack_macro_world(zone_q, zone_r), local_q, local_r, tile_def)
 }
 
 #[reducer]
 pub fn delete_zone(
   ctx: &ReducerContext,
-  macro_location: u64,
+  macro_zone: u32,
 ) -> Result<(), String> {
-  ctx.db.zones().macro_location().delete(macro_location);
+  ctx.db.zones().macro_zone().delete(macro_zone);
   Ok(())
 }
 
@@ -289,8 +291,7 @@ pub fn delete_zone_at(
   ctx: &ReducerContext,
   zone_q: i16,
   zone_r: i16,
-  layer: u8,
+  _layer: u8,
 ) -> Result<(), String> {
-  let macro_location = zone_from_coords(zone_q, zone_r, layer);
-  delete_zone(ctx, macro_location)
+  delete_zone(ctx, pack_macro_world(zone_q, zone_r))
 }

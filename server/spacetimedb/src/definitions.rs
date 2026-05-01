@@ -12,6 +12,7 @@ use serde_json::Value;
 
 // ── Embedded JSON files ───────────────────────────────────────────────────────
 
+const CARD_TYPES_JSON: &str = include_str!("../data/card_types.json");
 const DISCIPLINE_JSON: &str = include_str!("../data/cards/discipline.json");
 const FACULTY_JSON:    &str = include_str!("../data/cards/faculty.json");
 const REQUISITES_JSON: &str = include_str!("../data/cards/requisites.json");
@@ -19,6 +20,184 @@ const REVERY_JSON:     &str = include_str!("../data/cards/revery.json");
 const SOUL_JSON:       &str = include_str!("../data/cards/soul.json");
 const TILE_JSON:       &str = include_str!("../data/cards/tile.json");
 const RECIPES_JSON:    &str = include_str!("../data/recipes/basic.json");
+
+// ── Card type registry ────────────────────────────────────────────────────────
+// Loaded from data/card_types.json.  Public API exposes a `CardTypeIds`
+// struct of named u8 fields populated at first access.  The matching client
+// values come from the same file via pixijs/src/definitions/CardTypes.ts.
+
+const PUBLIC_MAX_ID: u8 = 3;
+
+#[derive(Debug, Deserialize)]
+struct RawCardTypesFile {
+    types: HashMap<String, RawCardTypeEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCardTypeEntry {
+    id:         u8,
+    visibility: String,
+    shape:      String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardShape {
+    Rect,
+    Hex,
+}
+
+#[derive(Debug, Clone)]
+pub struct CardTypeIds {
+    pub requisites:     u8,
+    pub revery:         u8,
+    pub discipline:     u8,
+    pub faculty:        u8,
+    pub soul:           u8,
+    pub floor:          u8,
+    pub tile_object:    u8,
+    pub tile_decorator: u8,
+}
+
+static CARD_TYPE_IDS: OnceLock<CardTypeIds> = OnceLock::new();
+static CARD_TYPE_BY_ID:    OnceLock<HashMap<u8, String>> = OnceLock::new();
+static CARD_TYPE_BY_NAME:  OnceLock<HashMap<String, u8>> = OnceLock::new();
+static CARD_TYPE_SHAPES:   OnceLock<HashMap<u8, CardShape>> = OnceLock::new();
+
+#[allow(clippy::type_complexity)]
+fn load_card_type_registry() -> (
+    CardTypeIds,
+    HashMap<u8, String>,
+    HashMap<String, u8>,
+    HashMap<u8, CardShape>,
+) {
+    let file: RawCardTypesFile = serde_json::from_str(CARD_TYPES_JSON)
+        .expect("card_types.json: failed to parse");
+
+    let mut by_id   = HashMap::new();
+    let mut by_name = HashMap::new();
+    let mut shapes  = HashMap::new();
+
+    for (name, entry) in &file.types {
+        // Validate visibility consistency with the bit-cutoff rule.
+        let derived = if entry.id <= PUBLIC_MAX_ID { "public" } else { "private" };
+        if entry.visibility != derived {
+            panic!(
+                "card_types.json: type '{}' (id {}) declares visibility '{}' but \
+                 bit cutoff (id <= {}) implies '{}'",
+                name, entry.id, entry.visibility, PUBLIC_MAX_ID, derived
+            );
+        }
+        let shape = match entry.shape.as_str() {
+            "rect" => CardShape::Rect,
+            "hex"  => CardShape::Hex,
+            other  => panic!(
+                "card_types.json: type '{}' has invalid shape '{}' (expected 'rect' or 'hex')",
+                name, other,
+            ),
+        };
+        if let Some(other) = by_id.get(&entry.id) {
+            panic!("card_types.json: id {} appears on both '{}' and '{}'",
+                   entry.id, other, name);
+        }
+        by_id.insert(entry.id, name.clone());
+        by_name.insert(name.clone(), entry.id);
+        shapes.insert(entry.id, shape);
+    }
+
+    let required = |key: &str| -> u8 {
+        *by_name.get(key).unwrap_or_else(|| {
+            panic!("card_types.json: required type '{}' not present", key)
+        })
+    };
+
+    let ids = CardTypeIds {
+        requisites:     required("requisites"),
+        revery:         required("revery"),
+        discipline:     required("discipline"),
+        faculty:        required("faculty"),
+        soul:           required("soul"),
+        floor:          required("floor"),
+        tile_object:    required("tile_object"),
+        tile_decorator: required("tile_decorator"),
+    };
+
+    (ids, by_id, by_name, shapes)
+}
+
+fn ensure_card_type_registry() {
+    if CARD_TYPE_IDS.get().is_some() { return; }
+    let (ids, by_id, by_name, shapes) = load_card_type_registry();
+    let _ = CARD_TYPE_IDS.set(ids);
+    let _ = CARD_TYPE_BY_ID.set(by_id);
+    let _ = CARD_TYPE_BY_NAME.set(by_name);
+    let _ = CARD_TYPE_SHAPES.set(shapes);
+}
+
+/// Look up the shape of a card type id.  Returns None for unknown ids.
+#[allow(dead_code)]
+pub fn card_shape(card_type: u8) -> Option<CardShape> {
+    ensure_card_type_registry();
+    CARD_TYPE_SHAPES.get().and_then(|m| m.get(&card_type).copied())
+}
+
+/// True iff the card type is drawn as a hexagon.
+#[allow(dead_code)]
+pub fn is_hex_card_type(card_type: u8) -> bool {
+    matches!(card_shape(card_type), Some(CardShape::Hex))
+}
+
+/// True iff the card type is drawn as a rectangle.
+#[allow(dead_code)]
+pub fn is_rect_card_type(card_type: u8) -> bool {
+    matches!(card_shape(card_type), Some(CardShape::Rect))
+}
+
+/// Card type id constants, loaded from `data/card_types.json`.
+pub fn card_types() -> &'static CardTypeIds {
+    ensure_card_type_registry();
+    CARD_TYPE_IDS.get().expect("card type registry not initialised")
+}
+
+/// Look up a type id by canonical name.
+#[allow(dead_code)]
+pub fn card_type_id(name: &str) -> Option<u8> {
+    ensure_card_type_registry();
+    CARD_TYPE_BY_NAME.get().and_then(|m| m.get(name).copied())
+}
+
+/// Look up the canonical name for a type id.
+#[allow(dead_code)]
+pub fn card_type_name(id: u8) -> Option<&'static str> {
+    ensure_card_type_registry();
+    CARD_TYPE_BY_ID.get().and_then(|m| m.get(&id)).map(|s| s.as_str())
+}
+
+/// True iff the type at this id is in the public partition (id <= PUBLIC_MAX_ID).
+#[allow(dead_code)]
+pub fn is_public_card_type(id: u8) -> bool {
+    id <= PUBLIC_MAX_ID
+}
+
+/// Determine the actor's chain index for a recipe.
+///
+/// - `on_create` / `explicit`: actor IS the root at chain[0].
+/// - `top_stack` / `bottom_stack`:
+///   - With an explicit `root` precondition → actor at chain[1] (root and
+///     actor are distinct chain positions).
+///   - Without a `root` precondition → actor at chain[0]; the chain root
+///     IS the actor and the recipe's slots match outward from there.
+///     This makes recipes like "stack two corpus → fatigue" express
+///     naturally as `slots: [["corpus"], ["corpus"]]` without inventing
+///     a no-op root entity.  Whether root is consumed or just matched
+///     is then controlled by listing `0` in `reagents`.
+pub fn actor_index_for(recipe: &RecipeDef) -> usize {
+    match recipe.recipe_type {
+        RecipeType::TopStack | RecipeType::BottomStack => {
+            if recipe.root.is_some() { 1 } else { 0 }
+        }
+        RecipeType::OnCreate | RecipeType::Explicit => 0,
+    }
+}
 
 // ── Raw deserialization shapes ────────────────────────────────────────────────
 
@@ -45,10 +224,17 @@ struct RawRecipe {
     recipe_type: Option<String>,
     #[serde(default)]
     duration: Value,
-    tile:      Option<Value>,
-    catalysts: Option<Value>,
-    reagents:  Option<Value>,
-    products:  Option<Value>,
+    /// Optional precondition on the root card (chain index 0).
+    root:     Option<Value>,
+    /// Ordered slot entities; one per chain position outward from the actor.
+    /// May be empty (on_create recipes typically have no positional slots).
+    #[serde(default)]
+    slots:    Vec<Value>,
+    /// Chain indexes that are consumed at recipe completion.
+    /// 0 = root, 1+ = slot[i-1] (chain index = slot index + actor_index).
+    #[serde(default)]
+    reagents: Vec<u8>,
+    products: Option<Value>,
 }
 
 // ── Parsed types ──────────────────────────────────────────────────────────────
@@ -72,14 +258,17 @@ pub enum Entity {
 }
 
 /// How a recipe selects which cards to act on.
+///
+/// `BothStack` was removed in the recipe schema redesign — recipes operate on
+/// a single branch direction.  Top and bottom branches serve different
+/// gameplay roles (player-authored actions vs incoming event queue) and the
+/// adjacency matcher walks one direction at a time per recipe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecipeType {
-    /// Acts on the top card of a stack.
+    /// Walks the up branch from actor outward.
     TopStack,
-    /// Acts on the bottom card of a stack.
+    /// Walks the down branch from actor outward.
     BottomStack,
-    /// Acts on both ends of a stack.
-    BothStack,
     /// Queued automatically when a matching card is created.
     OnCreate,
     /// Triggered explicitly by player action.
@@ -103,12 +292,23 @@ pub enum RecipeDuration {
 }
 
 /// Where a product group's cards are placed when a recipe completes.
+///
+/// Per `RECIPE_REDESIGN.md` §6.  The world-placement variants are reserved
+/// here but their generators are stubs — wiring them requires a placement
+/// rule for "where in the hex / which empty cell."  Defer to the floor /
+/// zone recipe phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductTarget {
-    /// Cards go into the owner's panel (owner_id from the action).
-    Owner,
-    /// Cards go into the root card's panel (card_id from the action).
-    Root,
+    /// Action owner's inventory panel.  (Old key: "owner".)
+    ActorPanel,
+    /// Root card owner's inventory panel.  (Old key: "root".)
+    RootPanel,
+    /// Action owner soul's world hex.  Reserved.
+    ActorWorld,
+    /// Root owner soul's world hex.  Reserved.
+    RootOwnerWorld,
+    /// Root card's own world hex.  Reserved.
+    RootWorld,
 }
 
 /// One group of products with a shared placement target.
@@ -125,46 +325,54 @@ pub struct RecipeDef {
     pub index:       u16,
     pub recipe_type: RecipeType,
     pub duration:    RecipeDuration,
-    pub tile:        Option<Entity>,
-    pub catalysts:   Option<Entity>,
-    pub reagents:    Option<Entity>,
+    /// Optional precondition on the root card (chain index 0).
+    pub root:        Option<Entity>,
+    /// Ordered slot entities; one per chain position outward from the actor.
+    /// `slots[i]` matches against `chain[actor_index + i]`.
+    pub slots:       Vec<Entity>,
+    /// Chain indexes that get consumed at completion.  0 = root, 1+ = chain
+    /// position (offset by actor_index for slot positions).  Stored sorted
+    /// and deduped at parse time.
+    pub reagents:    Vec<u8>,
     pub products:    Vec<ProductGroup>,
 }
 
 // ── Entity parsing ────────────────────────────────────────────────────────────
 
 fn parse_entity(v: &Value) -> Entity {
+    // Bare string: "defId" → Leaf with qty=1.  Allows strings as OR branches.
+    if let Some(s) = v.as_str() {
+        return Entity::Leaf { def_id: s.to_owned(), qty: 1 };
+    }
+
     let arr = match v.as_array() {
         Some(a) if !a.is_empty() => a,
         _ => return Entity::Empty,
     };
 
-    // Leaf: ["def_id", qty]
+    // OR form: [A, [wa, wb], C] — middle element is a pure-number array (including []).
+    // Detected before the string-leaf check so string branches ("log", "vigor") work.
+    if arr.len() == 3 {
+        if let Some(mid) = arr[1].as_array() {
+            if mid.iter().all(|w| w.is_number()) {
+                let weights = if mid.len() == 2 {
+                    [mid[0].as_u64().unwrap_or(1) as u32, mid[1].as_u64().unwrap_or(1) as u32]
+                } else {
+                    [1, 1]
+                };
+                return Entity::Or {
+                    a: Box::new(parse_entity(&arr[0])),
+                    weights,
+                    b: Box::new(parse_entity(&arr[2])),
+                };
+            }
+        }
+    }
+
+    // Leaf: ["defId"] or ["defId", qty]
     if let Some(s) = arr[0].as_str() {
         let qty = arr.get(1).and_then(Value::as_u64).unwrap_or(1) as u32;
         return Entity::Leaf { def_id: s.to_owned(), qty };
-    }
-
-    // Compound: first element must be an array
-    if !arr[0].is_array() { return Entity::Empty; }
-
-    // OR form: three elements, third is a non-empty array
-    if arr.len() == 3 {
-        let c = &arr[2];
-        if c.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-            let weights = arr[1].as_array()
-                .filter(|w| w.len() == 2)
-                .and_then(|w| Some([
-                    w[0].as_u64()? as u32,
-                    w[1].as_u64()? as u32,
-                ]))
-                .unwrap_or([1, 1]);
-            return Entity::Or {
-                a: Box::new(parse_entity(&arr[0])),
-                weights,
-                b: Box::new(parse_entity(c)),
-            };
-        }
     }
 
     // AND form: [A, B] or [A, B, []]
@@ -179,6 +387,10 @@ fn parse_duration(v: &Value) -> RecipeDuration {
         Value::Number(n) => RecipeDuration::Fixed(n.as_u64().unwrap_or(0) as u32),
         Value::Array(arr) => {
             let conditions = arr.iter().filter_map(|entry| {
+                // Bare number: unconditional catch-all.
+                if let Some(n) = entry.as_u64() {
+                    return Some(DurationCondition { duration: n as u32, condition: Entity::Empty });
+                }
                 let row = entry.as_array()?;
                 let duration = row.first()?.as_u64()? as u32;
                 let condition = match row.get(1) {
@@ -206,12 +418,15 @@ struct Registry {
     cards:      HashMap<CardKey, CardDef>,
     by_str_id:  HashMap<String, CardKey>,
     recipes:    Vec<RecipeDef>,
-    recipe_ids: HashMap<String, u16>,
 }
 
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
 
 fn build_registry() -> Registry {
+    // Load and validate card types alongside; both registries are populated
+    // before any caller observes either.
+    ensure_card_type_registry();
+
     const CARD_FILES: &[&str] = &[
         DISCIPLINE_JSON,
         FACULTY_JSON,
@@ -246,20 +461,26 @@ fn build_registry() -> Registry {
         Vec::new()
     });
 
-    let mut recipes    = Vec::with_capacity(raw_recipes.len());
-    let mut recipe_ids = HashMap::new();
+    let mut recipes = Vec::with_capacity(raw_recipes.len());
 
     for (i, raw) in raw_recipes.into_iter().enumerate() {
         let index = i as u16;
-        recipe_ids.insert(raw.id.clone(), index);
         let products = raw.products
             .as_ref()
             .and_then(Value::as_object)
             .map(|obj| {
                 obj.iter().filter_map(|(key, val)| {
                     let target = match key.as_str() {
-                        "owner" => ProductTarget::Owner,
-                        "root"  => ProductTarget::Root,
+                        // Canonical names per RECIPE_REDESIGN.md §6.
+                        "actor_panel"      => ProductTarget::ActorPanel,
+                        "root_panel"       => ProductTarget::RootPanel,
+                        "actor_world"      => ProductTarget::ActorWorld,
+                        "root_owner_world" => ProductTarget::RootOwnerWorld,
+                        "root_world"       => ProductTarget::RootWorld,
+                        // Legacy aliases — accept and warn-on-removal in a later sweep.
+                        "owner"            => ProductTarget::ActorPanel,
+                        "root"             => ProductTarget::RootPanel,
+                        "world"            => ProductTarget::RootWorld,
                         _ => { log::warn!("definitions: unknown product target '{key}'"); return None; }
                     };
                     Some(ProductGroup { target, entity: parse_entity(val) })
@@ -270,7 +491,6 @@ fn build_registry() -> Registry {
         let recipe_type = match raw.recipe_type.as_deref() {
             Some("top_stack")    => RecipeType::TopStack,
             Some("bottom_stack") => RecipeType::BottomStack,
-            Some("both_stack")   => RecipeType::BothStack,
             Some("on_create")    => RecipeType::OnCreate,
             Some("explicit")     => RecipeType::Explicit,
             Some(other) => {
@@ -280,19 +500,34 @@ fn build_registry() -> Registry {
             None => RecipeType::OnCreate,
         };
 
+        // Parse slots and validate reagent indexes against them.
+        let slots: Vec<Entity> = raw.slots.iter().map(parse_entity).collect();
+        let max_chain_idx: u8 = (slots.len() as u8).saturating_add(1);  // root + slots
+        let mut reagents = raw.reagents;
+        reagents.sort();
+        reagents.dedup();
+        for &i in &reagents {
+            if i >= max_chain_idx {
+                log::warn!(
+                    "definitions: recipe '{}' reagent index {} out of range (max {})",
+                    raw.id, i, max_chain_idx.saturating_sub(1)
+                );
+            }
+        }
+
         recipes.push(RecipeDef {
             id:          raw.id,
             index,
             recipe_type,
             duration:    parse_duration(&raw.duration),
-            tile:        raw.tile.as_ref().map(parse_entity),
-            catalysts:   raw.catalysts.as_ref().map(parse_entity),
-            reagents:    raw.reagents.as_ref().map(parse_entity),
+            root:        raw.root.as_ref().map(parse_entity),
+            slots,
+            reagents,
             products,
         });
     }
 
-    Registry { cards, by_str_id, recipes, recipe_ids }
+    Registry { cards, by_str_id, recipes }
 }
 
 fn registry() -> &'static Registry {
@@ -338,7 +573,7 @@ pub fn resolve_duration(recipe: &RecipeDef, pool: &HashMap<String, u32>) -> u32 
                     return entry.duration;
                 }
                 let mut tmp = pool.clone();
-                if match_entity(&entry.condition, &mut tmp) {
+                if match_entity_pool(&entry.condition, &mut tmp) {
                     return entry.duration;
                 }
             }
@@ -369,12 +604,23 @@ pub fn on_create_recipes() -> impl Iterator<Item = &'static RecipeDef> {
     registry().recipes.iter().filter(|r| r.recipe_type == RecipeType::OnCreate)
 }
 
-// ── Input matching ────────────────────────────────────────────────────────────
-//
-// Checks whether a pool of card definition ids satisfies an Entity requirement.
-// Mutates the pool on success (cards consumed). Leaves it unmodified on failure.
+/// Iterate all recipes whose type is TopStack.
+pub fn top_stack_recipes() -> impl Iterator<Item = &'static RecipeDef> {
+    registry().recipes.iter().filter(|r| r.recipe_type == RecipeType::TopStack)
+}
 
-fn match_entity(entity: &Entity, pool: &mut HashMap<String, u32>) -> bool {
+/// Iterate all recipes whose type is BottomStack.
+pub fn bottom_stack_recipes() -> impl Iterator<Item = &'static RecipeDef> {
+    registry().recipes.iter().filter(|r| r.recipe_type == RecipeType::BottomStack)
+}
+
+// ── Duration condition matching ───────────────────────────────────────────────
+//
+// Used only for resolve_duration: checks whether a single card's aspect pool
+// satisfies an entity condition.  Aspect quantities represent the card's aspect
+// strength (value), not card counts.  Pool is mutated on success.
+
+fn match_entity_pool(entity: &Entity, pool: &mut HashMap<String, u32>) -> bool {
     match entity {
         Entity::Empty => true,
 
@@ -405,74 +651,159 @@ fn match_entity(entity: &Entity, pool: &mut HashMap<String, u32>) -> bool {
         }
 
         Entity::And { a, b } => {
-            let snapshot: HashMap<String, u32> = pool.clone();
-            if !match_entity(a, pool) { return false; }
-            if !match_entity(b, pool) { *pool = snapshot; return false; }
+            let snapshot = pool.clone();
+            if !match_entity_pool(a, pool) { return false; }
+            if !match_entity_pool(b, pool) { *pool = snapshot; return false; }
             true
         }
 
         Entity::Or { a, b, .. } => {
-            let snapshot: HashMap<String, u32> = pool.clone();
-            if match_entity(a, pool) { return true; }
+            let snapshot = pool.clone();
+            if match_entity_pool(a, pool) { return true; }
             *pool = snapshot;
-            match_entity(b, pool)
+            match_entity_pool(b, pool)
         }
     }
 }
 
-/// Returns true if the provided card definition id pool satisfies all input
-/// requirements (tile, catalysts, reagents) of the given recipe.
-/// `pool` maps definition id → count and is consumed by the check.
-pub fn matches_inputs(recipe: &RecipeDef, pool: &mut HashMap<String, u32>) -> bool {
-    if let Some(tile)      = &recipe.tile      { if !match_entity(tile,      pool) { return false; } }
-    if let Some(catalysts) = &recipe.catalysts { if !match_entity(catalysts, pool) { return false; } }
-    if let Some(reagents)  = &recipe.reagents  { if !match_entity(reagents,  pool) { return false; } }
-    true
+// ── Adjacency matching ────────────────────────────────────────────────────────
+//
+// Recipe matching walks a chain (root + outward branch) and checks whether
+// the recipe's `slots` array fits the chain at the actor's position.
+// Adjacency means each slot maps to a fixed chain position; no permutation
+// search is needed.
+//
+// Slot weights (higher = more specific) — used to pick between competing
+// recipes that match at the same chain position:
+//
+//   exact def id  4  — card's definition id matches the slot's def_id
+//   aspect name   3  — card has the slot's def_id as an aspect key
+//   "any"         1  — wildcard accepts any card
+
+pub const WEIGHT_DEF_ID: u32 = 4;
+pub const WEIGHT_ASPECT: u32 = 3;
+pub const WEIGHT_ANY:    u32 = 1;
+
+/// Score a leaf-id against a card definition.  Returns None if it doesn't fit.
+fn score_leaf(def: &CardDef, leaf_id: &str) -> Option<u32> {
+    if leaf_id == "any"           { return Some(WEIGHT_ANY); }
+    if def.id == leaf_id          { return Some(WEIGHT_DEF_ID); }
+    if def.aspects.contains_key(leaf_id) { return Some(WEIGHT_ASPECT); }
+    None
 }
 
-// ── Recipe priority scoring ───────────────────────────────────────────────────
-//
-// When multiple on_create recipes match the same card we pick the most
-// specific one.  Specificity is the sum of per-leaf weights across catalysts
-// and reagents (tile is structural and excluded from scoring).
-//
-// Leaf weight by match category (higher = more specific):
-//   def id   1000  — key matches the card's own definition id exactly
-//   aspect    100  — key is one of the card's aspect names
-//   card type  10  — future: key names a card_type category
-//   "any"       1  — wildcard
-
-const WEIGHT_DEF_ID:    u32 = 1000;
-const WEIGHT_ASPECT:    u32 = 100;
-const WEIGHT_CARD_TYPE: u32 = 10;
-const WEIGHT_ANY:       u32 = 1;
-
-fn score_entity(entity: &Entity, def: &CardDef) -> u32 {
+/// Match a single entity (slot or root condition) against a card.
+/// Returns the best weight on success, or None.
+///
+/// Recursive: AND requires both branches to satisfy; OR returns the
+/// best-matching branch.  Aspect leaves with an explicit qty check the
+/// card's aspect value; `qty=1` (the default for bare strings) is a
+/// presence-only check.
+pub fn match_entity_card(entity: &Entity, def: &CardDef) -> Option<u32> {
     match entity {
-        Entity::Empty => 0,
+        Entity::Empty => Some(0),
+
         Entity::Leaf { def_id, qty } => {
-            let w = if def_id == "any" {
-                WEIGHT_ANY
-            } else if def_id == &def.id {
-                WEIGHT_DEF_ID
-            } else if def.aspects.contains_key(def_id.as_str()) {
-                WEIGHT_ASPECT
-            } else {
-                WEIGHT_CARD_TYPE
-            };
-            w * qty
+            // Aspect-with-qty: card's aspect value must meet the threshold.
+            if *qty > 1 {
+                let val = def.aspects.get(def_id).copied().unwrap_or(0);
+                if (val as u32) < *qty { return None; }
+                return Some(WEIGHT_ASPECT);
+            }
+            score_leaf(def, def_id)
         }
-        Entity::And { a, b } => score_entity(a, def) + score_entity(b, def),
-        // For OR, take whichever branch scores higher — we're asking "how
-        // specific could this match be", not simulating a particular path.
-        Entity::Or { a, b, .. } => score_entity(a, def).max(score_entity(b, def)),
+
+        Entity::And { a, b } => {
+            let wa = match_entity_card(a, def)?;
+            let wb = match_entity_card(b, def)?;
+            Some(wa + wb)
+        }
+
+        Entity::Or { a, b, .. } => {
+            let wa = match_entity_card(a, def);
+            let wb = match_entity_card(b, def);
+            match (wa, wb) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                (Some(x), None)    => Some(x),
+                (None,    Some(y)) => Some(y),
+                (None,    None)    => None,
+            }
+        }
     }
 }
 
-/// Specificity score for a recipe matched against a particular card definition.
-/// Higher score wins when multiple on_create recipes match the same card.
-pub fn score_recipe_for_card(recipe: &RecipeDef, def: &CardDef) -> u32 {
-    let cat = recipe.catalysts.as_ref().map_or(0, |e| score_entity(e, def));
-    let rea = recipe.reagents.as_ref().map_or(0, |e| score_entity(e, def));
-    cat + rea
+/// Result of a successful adjacency match.
+pub struct RecipeMatchResult {
+    /// Sum of per-slot match weights.  Higher = more specific assignment.
+    pub weight: u32,
+    /// card_ids of cards at the chain positions named by `recipe.reagents`.
+    /// These get deleted at completion.  Order matches `recipe.reagents`.
+    pub reagent_card_ids: Vec<u32>,
+}
+
+/// Try to match a recipe at a specific chain position.
+///
+/// `chain` is the ordered list of cards from root (index 0) outward along
+/// the recipe's branch direction.  `actor_index` is the chain position the
+/// recipe's `slots[0]` should be checked against.  For top_stack /
+/// bottom_stack recipes, `actor_index` is typically 1 (just past the root);
+/// for on_create recipes the trigger is treated as the root and slots is
+/// empty so `actor_index` is irrelevant.
+///
+/// Returns None if any of these are true:
+/// - `recipe.root` precondition fails against `chain[0]`.
+/// - The chain is too short to contain all of `recipe.slots`.
+/// - Any slot doesn't match the card at its target chain position.
+/// - Any card in the matched window has `CARD_FLAG_SLOT_HOLD` set
+///   (claimed by another running action).
+pub fn try_match_recipe_at(
+    recipe:      &RecipeDef,
+    chain:       &[(u32, &CardDef, u16 /* flags */)],
+    actor_index: usize,
+) -> Option<RecipeMatchResult> {
+    if chain.is_empty() { return None; }
+
+    // Root precondition.
+    let mut weight = 0;
+    if let Some(root_entity) = &recipe.root {
+        weight += match_entity_card(root_entity, chain[0].1)?;
+    }
+
+    // Slots must fit within the chain past actor_index.
+    let end = actor_index + recipe.slots.len();
+    if end > chain.len() { return None; }
+
+    // Per-slot positional check; bail on first mismatch or held card.
+    for (slot_i, slot_entity) in recipe.slots.iter().enumerate() {
+        let chain_pos = actor_index + slot_i;
+        let (_card_id, card_def, flags) = chain[chain_pos];
+        if flags & crate::packing::CARD_FLAG_SLOT_HOLD != 0 {
+            return None;
+        }
+        weight += match_entity_card(slot_entity, card_def)?;
+    }
+
+    // Build reagent card_id list in the order the recipe specified.
+    let mut reagent_card_ids = Vec::with_capacity(recipe.reagents.len());
+    for &chain_idx in &recipe.reagents {
+        let i = chain_idx as usize;
+        if i >= chain.len() {
+            // Out-of-range reagent index.  Defensive — parse-time validation
+            // should already have warned about this.
+            return None;
+        }
+        reagent_card_ids.push(chain[i].0);
+    }
+
+    Some(RecipeMatchResult { weight, reagent_card_ids })
+}
+
+/// Returns true if the recipe matches at the given chain position.
+#[allow(dead_code)]
+pub fn matches_at(
+    recipe:      &RecipeDef,
+    chain:       &[(u32, &CardDef, u16)],
+    actor_index: usize,
+) -> bool {
+    try_match_recipe_at(recipe, chain, actor_index).is_some()
 }

@@ -1,8 +1,9 @@
-use crate::actions::{actions, start_action_inner};
+use crate::actions::actions;
 use crate::cards::{cards, Card};
 use crate::packing::{
-  pack_definition, pack_macro_world, pack_micro_hex,
-  world_to_zone, world_to_position,
+  pack_definition, pack_macro_world, pack_micro_zone, pack_micro_pixel, pack_micro_parent,
+  with_stack_state, world_to_zone, world_to_position,
+  STACK_STATE_LOOSE, STACK_STATE_UP, STACK_STATE_DOWN,
 };
 use crate::players::{players, Player};
 use crate::zones::{zones, Zone};
@@ -18,12 +19,6 @@ struct BootstrapData {
 
   #[serde(default)]
   card: Vec<CardSeed>,
-
-  #[serde(default)]
-  action: Vec<ActionSeed>,
-
-  #[serde(default)]
-  actions: Vec<ActionSeed>,
 
   #[serde(default)]
   zones: Vec<ZoneSeed>,
@@ -75,31 +70,23 @@ struct CardSeed {
   pixel_x: Option<i16>,
   #[serde(default)]
   pixel_y: Option<i16>,
-}
 
-#[derive(Debug, Deserialize)]
-struct ActionSeed {
-  card_id: u32,
-  recipe: u16,
+  /// Stack the new card UP onto this parent card_id.  Inherits parent's
+  /// (layer, macro_zone, micro_zone); sets micro_location to packed parent_id;
+  /// sets stack_state to UP in flags.  Mutually exclusive with `stacked_on_down`.
+  #[serde(default, alias = "stacked_on_up")]
+  stacked_on: Option<u32>,
 
-  #[serde(default, alias = "soul_id")]
-  owner_id: Option<u32>,
-
+  /// Stack the new card DOWN onto this parent card_id.  Same semantics as
+  /// `stacked_on` but flips the direction.
   #[serde(default)]
-  player: Option<String>,
-
-  #[serde(default)]
-  q: Option<i32>,
-  #[serde(default)]
-  r: Option<i32>,
-  #[serde(default, alias = "z")]
-  layer: Option<u8>,
+  stacked_on_down: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ZoneSeed {
   #[serde(default)]
-  macro_location: Option<u64>,
+  macro_zone: Option<u32>,
 
   #[serde(default)]
   zone_q: Option<i16>,
@@ -131,25 +118,22 @@ fn pack_zone_definition(card_type: u8, category: u8) -> Result<u8, String> {
   Ok((card_type << 4) | category)
 }
 
-fn resolve_macro_micro(q: Option<i32>, r: Option<i32>, layer: Option<u8>) -> (u64, u32) {
+fn resolve_macro_micro(q: Option<i32>, r: Option<i32>) -> (u32, u8) {
   let q = q.unwrap_or(0);
   let r = r.unwrap_or(0);
-  let layer = layer.unwrap_or(0);
   let (zone_q, zone_r) = world_to_zone(q, r);
   let (local_q, local_r) = world_to_position(q, r);
   (
-    pack_macro_world(zone_q, zone_r, layer),
-    pack_micro_hex(local_q, local_r),
+    pack_macro_world(zone_q, zone_r),
+    pack_micro_zone(local_q, local_r),
   )
 }
 
-fn resolve_zone_seed(row: &ZoneSeed) -> Result<u64, String> {
-  match (row.zone_q, row.zone_r, row.layer, row.macro_location) {
-    (Some(zone_q), Some(zone_r), layer, _) => {
-      Ok(pack_macro_world(zone_q, zone_r, layer.unwrap_or(0)))
-    }
-    (_, _, _, Some(macro_location)) => Ok(macro_location),
-    _ => Err("zone entry must provide zone_q/zone_r or macro_location".to_string()),
+fn resolve_zone_seed(row: &ZoneSeed) -> Result<u32, String> {
+  match (row.zone_q, row.zone_r, row.macro_zone) {
+    (Some(zone_q), Some(zone_r), _) => Ok(pack_macro_world(zone_q, zone_r)),
+    (_, _, Some(macro_zone)) => Ok(macro_zone),
+    _ => Err("zone entry must provide zone_q/zone_r or macro_zone".to_string()),
   }
 }
 
@@ -163,11 +147,13 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
   let data = parse_bootstrap()?;
 
   for row in data.zones {
-    let macro_location = resolve_zone_seed(&row)?;
+    let macro_zone = resolve_zone_seed(&row)?;
+    let layer      = row.layer.unwrap_or(crate::packing::WORLD_LAYER_GROUND);
     let definition = pack_zone_definition(row.card_type, row.category)?;
 
     let zone_row = Zone {
-      macro_location,
+      layer,
+      macro_zone,
       definition,
       t0: row.t0,
       t1: row.t1,
@@ -179,40 +165,45 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
       t7: row.t7,
     };
 
-    if ctx.db.zones().macro_location().find(&macro_location).is_some() {
-      ctx.db.zones().macro_location().update(zone_row);
+    if ctx.db.zones().macro_zone().find(&macro_zone).is_some() {
+      ctx.db.zones().macro_zone().update(zone_row);
     } else {
       ctx.db.zones().insert(zone_row);
     }
   }
 
   for row in data.player {
-    let (macro_location, micro_location) =
-      resolve_macro_micro(row.q, row.r, row.layer);
+    let (macro_zone, micro_zone) = resolve_macro_micro(row.q, row.r);
+    let layer = row.layer.unwrap_or(crate::packing::WORLD_LAYER_GROUND);
     if let Some(existing) = ctx.db.players().name().find(&row.name) {
       if let Some(mut card) = ctx.db.cards().card_id().find(&existing.soul_id) {
         card.packed_definition = pack_definition(row.card_type, row.category, row.definition_id);
-        card.owner_id = existing.soul_id;
-        card.flags = row.flags;
-        card.macro_location = macro_location;
-        card.micro_location = micro_location;
+        card.owner_id   = existing.soul_id;
+        card.flags      = with_stack_state(row.flags, STACK_STATE_LOOSE);
+        card.layer      = layer;
+        card.macro_zone = macro_zone;
+        card.micro_zone = micro_zone;
+        card.micro_location = pack_micro_pixel(0, 0);
         ctx.db.cards().card_id().update(card);
       }
 
       ctx.db.players().player_id().update(Player {
         player_id: existing.player_id,
-        name: existing.name,
-        soul_id: existing.soul_id,
-        macro_location,
-        micro_location,
+        name:      existing.name,
+        soul_id:   existing.soul_id,
+        layer,
+        macro_zone,
+        micro_zone,
       });
     } else {
       let inserted = ctx.db.cards().insert(Card {
         card_id: 0,
-        macro_location,
-        micro_location,
+        layer,
+        macro_zone,
+        micro_zone,
+        micro_location: pack_micro_pixel(0, 0),
         owner_id: 0,
-        flags: row.flags,
+        flags: with_stack_state(row.flags, STACK_STATE_LOOSE),
         packed_definition: pack_definition(row.card_type, row.category, row.definition_id),
         data: 0,
         action_id: 0,
@@ -227,8 +218,9 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
         player_id: 0,
         name: row.name,
         soul_id,
-        macro_location,
-        micro_location,
+        layer,
+        macro_zone,
+        micro_zone,
       });
     }
   }
@@ -249,6 +241,22 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
       (None, None) => 0,
     };
 
+    // Stacked cards take precedence: position is derived from parent.
+    match (row.stacked_on, row.stacked_on_down) {
+      (Some(_), Some(_)) => {
+        return Err("card seed cannot specify both stacked_on and stacked_on_down".to_string());
+      }
+      (Some(parent_id), None) => {
+        insert_stacked_seed(ctx, &row, resolved_owner_id, parent_id, STACK_STATE_UP)?;
+        continue;
+      }
+      (None, Some(parent_id)) => {
+        insert_stacked_seed(ctx, &row, resolved_owner_id, parent_id, STACK_STATE_DOWN)?;
+        continue;
+      }
+      (None, None) => {}
+    }
+
     match (row.pixel_x, row.pixel_y) {
       (Some(_), Some(_)) => {
         crate::cards::insert_panel_card_row(
@@ -262,33 +270,43 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
           ctx,
           row.card_type, row.category, row.definition_id,
           resolved_owner_id, row.flags,
-          row.q.unwrap_or(0), row.r.unwrap_or(0), row.layer.unwrap_or(0),
+          row.q.unwrap_or(0), row.r.unwrap_or(0),
+          row.layer.unwrap_or(crate::packing::WORLD_LAYER_GROUND),
         )?;
       }
     };
   }
 
-  for row in data.actions.into_iter().chain(data.action.into_iter()) {
-    let (macro_location, micro_location) =
-      resolve_macro_micro(row.q, row.r, row.layer);
+  Ok(())
+}
 
-    let resolved_owner_id = match (row.owner_id, row.player.as_deref()) {
-      (Some(_), Some(_)) => {
-        return Err("action cannot specify both owner_id and player".to_string());
-      }
-      (Some(owner_id), None) => owner_id,
-      (None, Some(player_name)) => {
-        if let Some(player) = ctx.db.players().name().find(&player_name.to_string()) {
-          player.soul_id
-        } else {
-          return Err(format!("player '{}' not found", player_name));
-        }
-      }
-      (None, None) => 0,
-    };
+/// Insert a stacked seed card.  Inherits the parent's (layer, macro_zone,
+/// micro_zone); sets micro_location to the packed parent_id; sets the
+/// requested STACK_STATE in flags.
+fn insert_stacked_seed(
+  ctx:           &ReducerContext,
+  row:           &CardSeed,
+  owner_id:      u32,
+  parent_id:     u32,
+  state:         u8,
+) -> Result<(), String> {
+  let parent = ctx.db.cards().card_id().find(&parent_id)
+    .ok_or_else(|| format!("card seed: parent card {} not found", parent_id))?;
 
-    start_action_inner(ctx, row.card_id, resolved_owner_id, row.recipe, macro_location, micro_location)?;
-  }
+  let flags = with_stack_state(row.flags, state);
+
+  ctx.db.cards().insert(Card {
+    card_id: 0,
+    layer:          parent.layer,
+    macro_zone:     parent.macro_zone,
+    micro_zone:     parent.micro_zone,
+    micro_location: pack_micro_parent(parent_id),
+    owner_id,
+    flags,
+    packed_definition: pack_definition(row.card_type, row.category, row.definition_id),
+    data: 0,
+    action_id: 0,
+  });
 
   Ok(())
 }
@@ -308,7 +326,7 @@ pub fn reset_and_bootstrap(ctx: &ReducerContext) -> Result<(), String> {
   }
 
   for row in ctx.db.zones().iter() {
-    ctx.db.zones().macro_location().delete(&row.macro_location);
+    ctx.db.zones().macro_zone().delete(&row.macro_zone);
   }
 
   bootstrap(ctx)
