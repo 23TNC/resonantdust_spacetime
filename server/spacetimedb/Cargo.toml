@@ -1,0 +1,21 @@
+[package]
+name = "resonantdust_spacetime"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# Enables development-only reducers in `src/debug.rs`. NOT for production
+# deploys — these reducers bypass authentication and validation.
+debug = []
+
+[dependencies]
+spacetimedb = { version = "=2.0.3" }
+# `preserve_order` so card definition_ids reflect JSON insertion order rather
+# than alphabetical key order — the JSON file controls definition_id 1, 2, …
+serde_json = { version = "1.0", features = ["preserve_order"] }
