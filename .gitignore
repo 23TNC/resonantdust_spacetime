@@ -13,7 +13,7 @@
 /build/
 bin/
 dist/
-server/spacetimedb/target/*
+server/spacetimedb/target
 config
 data
 keys
