@@ -5,7 +5,7 @@
 // All current card definitions use category 0, so this key uniquely
 // identifies any definition.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use serde::Deserialize;
 use serde_json::Value;
@@ -37,13 +37,10 @@ struct RawCardTypesFile {
 struct RawCardTypeEntry {
     id:         u8,
     visibility: String,
-    shape:      String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CardShape {
-    Rect,
-    Hex,
+    /// Drawn-shape hint for the client; the server doesn't read this.
+    #[serde(default)]
+    #[allow(dead_code)]
+    shape:      Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,26 +56,15 @@ pub struct CardTypeIds {
 }
 
 static CARD_TYPE_IDS: OnceLock<CardTypeIds> = OnceLock::new();
-static CARD_TYPE_BY_ID:    OnceLock<HashMap<u8, String>> = OnceLock::new();
-static CARD_TYPE_BY_NAME:  OnceLock<HashMap<String, u8>> = OnceLock::new();
-static CARD_TYPE_SHAPES:   OnceLock<HashMap<u8, CardShape>> = OnceLock::new();
 
-#[allow(clippy::type_complexity)]
-fn load_card_type_registry() -> (
-    CardTypeIds,
-    HashMap<u8, String>,
-    HashMap<String, u8>,
-    HashMap<u8, CardShape>,
-) {
+fn load_card_type_registry() -> CardTypeIds {
     let file: RawCardTypesFile = serde_json::from_str(CARD_TYPES_JSON)
         .expect("card_types.json: failed to parse");
 
-    let mut by_id   = HashMap::new();
-    let mut by_name = HashMap::new();
-    let mut shapes  = HashMap::new();
+    let mut by_name: HashMap<String, u8> = HashMap::new();
+    let mut by_id:   HashMap<u8, String> = HashMap::new();
 
     for (name, entry) in &file.types {
-        // Validate visibility consistency with the bit-cutoff rule.
         let derived = if entry.id <= PUBLIC_MAX_ID { "public" } else { "private" };
         if entry.visibility != derived {
             panic!(
@@ -87,21 +73,12 @@ fn load_card_type_registry() -> (
                 name, entry.id, entry.visibility, PUBLIC_MAX_ID, derived
             );
         }
-        let shape = match entry.shape.as_str() {
-            "rect" => CardShape::Rect,
-            "hex"  => CardShape::Hex,
-            other  => panic!(
-                "card_types.json: type '{}' has invalid shape '{}' (expected 'rect' or 'hex')",
-                name, other,
-            ),
-        };
         if let Some(other) = by_id.get(&entry.id) {
             panic!("card_types.json: id {} appears on both '{}' and '{}'",
                    entry.id, other, name);
         }
         by_id.insert(entry.id, name.clone());
         by_name.insert(name.clone(), entry.id);
-        shapes.insert(entry.id, shape);
     }
 
     let required = |key: &str| -> u8 {
@@ -110,7 +87,7 @@ fn load_card_type_registry() -> (
         })
     };
 
-    let ids = CardTypeIds {
+    CardTypeIds {
         requisites:     required("requisites"),
         revery:         required("revery"),
         discipline:     required("discipline"),
@@ -119,80 +96,23 @@ fn load_card_type_registry() -> (
         floor:          required("floor"),
         tile_object:    required("tile_object"),
         tile_decorator: required("tile_decorator"),
-    };
-
-    (ids, by_id, by_name, shapes)
+    }
 }
 
-fn ensure_card_type_registry() {
-    if CARD_TYPE_IDS.get().is_some() { return; }
-    let (ids, by_id, by_name, shapes) = load_card_type_registry();
-    let _ = CARD_TYPE_IDS.set(ids);
-    let _ = CARD_TYPE_BY_ID.set(by_id);
-    let _ = CARD_TYPE_BY_NAME.set(by_name);
-    let _ = CARD_TYPE_SHAPES.set(shapes);
-}
-
-/// Look up the shape of a card type id.  Returns None for unknown ids.
-#[allow(dead_code)]
-pub fn card_shape(card_type: u8) -> Option<CardShape> {
-    ensure_card_type_registry();
-    CARD_TYPE_SHAPES.get().and_then(|m| m.get(&card_type).copied())
-}
-
-/// True iff the card type is drawn as a hexagon.
-#[allow(dead_code)]
-pub fn is_hex_card_type(card_type: u8) -> bool {
-    matches!(card_shape(card_type), Some(CardShape::Hex))
-}
-
-/// True iff the card type is drawn as a rectangle.
-#[allow(dead_code)]
-pub fn is_rect_card_type(card_type: u8) -> bool {
-    matches!(card_shape(card_type), Some(CardShape::Rect))
-}
-
-/// Card type id constants, loaded from `data/card_types.json`.
+/// Card type id constants, loaded from `data/card_types.json` on first access.
 pub fn card_types() -> &'static CardTypeIds {
-    ensure_card_type_registry();
-    CARD_TYPE_IDS.get().expect("card type registry not initialised")
-}
-
-/// Look up a type id by canonical name.
-#[allow(dead_code)]
-pub fn card_type_id(name: &str) -> Option<u8> {
-    ensure_card_type_registry();
-    CARD_TYPE_BY_NAME.get().and_then(|m| m.get(name).copied())
-}
-
-/// Look up the canonical name for a type id.
-#[allow(dead_code)]
-pub fn card_type_name(id: u8) -> Option<&'static str> {
-    ensure_card_type_registry();
-    CARD_TYPE_BY_ID.get().and_then(|m| m.get(&id)).map(|s| s.as_str())
-}
-
-/// True iff the type at this id is in the public partition (id <= PUBLIC_MAX_ID).
-#[allow(dead_code)]
-pub fn is_public_card_type(id: u8) -> bool {
-    id <= PUBLIC_MAX_ID
+    CARD_TYPE_IDS.get_or_init(load_card_type_registry)
 }
 
 /// Determine the actor's chain index for a recipe.
 ///
 /// - `on_create` / `explicit`: actor IS the root at chain[0].
-/// - `top_stack` / `bottom_stack`:
-///   - With an explicit `root` precondition → actor at chain[1] (root and
-///     actor are distinct chain positions).
-///   - Without a `root` precondition → actor at chain[0]; the chain root
-///     IS the actor and the recipe's slots match outward from there.
-///     This makes recipes like "stack two corpus → fatigue" express
-///     naturally as `slots: [["corpus"], ["corpus"]]` without inventing
-///     a no-op root entity.  Whether root is consumed or just matched
-///     is then controlled by listing `0` in `reagents`.
+/// - `top_stack`:
+///   - With an explicit `root` precondition → actor at chain[1].
+///   - Without a `root` precondition → actor at chain[0].
 pub fn actor_index_for(recipe: &RecipeDef) -> usize {
     match recipe.recipe_type {
-        RecipeType::TopStack | RecipeType::BottomStack => {
+        RecipeType::TopStack => {
             if recipe.root.is_some() { 1 } else { 0 }
         }
         RecipeType::OnCreate | RecipeType::Explicit => 0,
@@ -258,17 +178,10 @@ pub enum Entity {
 }
 
 /// How a recipe selects which cards to act on.
-///
-/// `BothStack` was removed in the recipe schema redesign — recipes operate on
-/// a single branch direction.  Top and bottom branches serve different
-/// gameplay roles (player-authored actions vs incoming event queue) and the
-/// adjacency matcher walks one direction at a time per recipe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecipeType {
     /// Walks the up branch from actor outward.
     TopStack,
-    /// Walks the down branch from actor outward.
-    BottomStack,
     /// Queued automatically when a matching card is created.
     OnCreate,
     /// Triggered explicitly by player action.
@@ -423,9 +336,8 @@ struct Registry {
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
 
 fn build_registry() -> Registry {
-    // Load and validate card types alongside; both registries are populated
-    // before any caller observes either.
-    ensure_card_type_registry();
+    // Force the card-type registry to load + validate alongside.
+    let _ = card_types();
 
     const CARD_FILES: &[&str] = &[
         DISCIPLINE_JSON,
@@ -489,10 +401,9 @@ fn build_registry() -> Registry {
             .unwrap_or_default();
 
         let recipe_type = match raw.recipe_type.as_deref() {
-            Some("top_stack")    => RecipeType::TopStack,
-            Some("bottom_stack") => RecipeType::BottomStack,
-            Some("on_create")    => RecipeType::OnCreate,
-            Some("explicit")     => RecipeType::Explicit,
+            Some("top_stack") => RecipeType::TopStack,
+            Some("on_create") => RecipeType::OnCreate,
+            Some("explicit")  => RecipeType::Explicit,
             Some(other) => {
                 log::warn!("definitions: unknown recipe type '{other}', defaulting to OnCreate");
                 RecipeType::OnCreate
@@ -582,16 +493,6 @@ pub fn resolve_duration(recipe: &RecipeDef, pool: &HashMap<String, u32>) -> u32 
     }
 }
 
-/// Number of loaded recipes.
-pub fn recipe_count() -> usize {
-    registry().recipes.len()
-}
-
-/// Number of loaded card definitions.
-pub fn card_def_count() -> usize {
-    registry().cards.len()
-}
-
 /// Look up a card definition by its string id (e.g. "corpus", "log").
 /// Returns (card_type, definition_id 1-based) for use with pack_definition.
 pub fn find_def_by_str_id(id: &str) -> Option<(u8, u8)> {
@@ -607,11 +508,6 @@ pub fn on_create_recipes() -> impl Iterator<Item = &'static RecipeDef> {
 /// Iterate all recipes whose type is TopStack.
 pub fn top_stack_recipes() -> impl Iterator<Item = &'static RecipeDef> {
     registry().recipes.iter().filter(|r| r.recipe_type == RecipeType::TopStack)
-}
-
-/// Iterate all recipes whose type is BottomStack.
-pub fn bottom_stack_recipes() -> impl Iterator<Item = &'static RecipeDef> {
-    registry().recipes.iter().filter(|r| r.recipe_type == RecipeType::BottomStack)
 }
 
 // ── Duration condition matching ───────────────────────────────────────────────
@@ -699,7 +595,7 @@ fn score_leaf(def: &CardDef, leaf_id: &str) -> Option<u32> {
 /// best-matching branch.  Aspect leaves with an explicit qty check the
 /// card's aspect value; `qty=1` (the default for bare strings) is a
 /// presence-only check.
-pub fn match_entity_card(entity: &Entity, def: &CardDef) -> Option<u32> {
+fn match_entity_card(entity: &Entity, def: &CardDef) -> Option<u32> {
     match entity {
         Entity::Empty => Some(0),
 
@@ -743,23 +639,24 @@ pub struct RecipeMatchResult {
 
 /// Try to match a recipe at a specific chain position.
 ///
-/// `chain` is the ordered list of cards from root (index 0) outward along
-/// the recipe's branch direction.  `actor_index` is the chain position the
-/// recipe's `slots[0]` should be checked against.  For top_stack /
-/// bottom_stack recipes, `actor_index` is typically 1 (just past the root);
-/// for on_create recipes the trigger is treated as the root and slots is
-/// empty so `actor_index` is irrelevant.
+/// `chain` is the ordered list of cards from root (index 0) outward up
+/// the stack.  `actor_index` is the chain position the recipe's `slots[0]`
+/// should be checked against.  For top_stack recipes, `actor_index` is
+/// typically 1 (just past the root); for on_create recipes the trigger is
+/// treated as the root and slots is empty so `actor_index` is irrelevant.
+/// `held` is the set of card_ids currently claimed by some running action
+/// — sourced from `CardHold` rows, never from card flags.
 ///
 /// Returns None if any of these are true:
 /// - `recipe.root` precondition fails against `chain[0]`.
 /// - The chain is too short to contain all of `recipe.slots`.
 /// - Any slot doesn't match the card at its target chain position.
-/// - Any card in the matched window has `CARD_FLAG_SLOT_HOLD` set
-///   (claimed by another running action).
+/// - Any card in the matched window appears in `held`.
 pub fn try_match_recipe_at(
     recipe:      &RecipeDef,
-    chain:       &[(u32, &CardDef, u16 /* flags */)],
+    chain:       &[(u32, &CardDef)],
     actor_index: usize,
+    held:        &HashSet<u32>,
 ) -> Option<RecipeMatchResult> {
     if chain.is_empty() { return None; }
 
@@ -776,10 +673,8 @@ pub fn try_match_recipe_at(
     // Per-slot positional check; bail on first mismatch or held card.
     for (slot_i, slot_entity) in recipe.slots.iter().enumerate() {
         let chain_pos = actor_index + slot_i;
-        let (_card_id, card_def, flags) = chain[chain_pos];
-        if flags & crate::packing::CARD_FLAG_SLOT_HOLD != 0 {
-            return None;
-        }
+        let (card_id, card_def) = chain[chain_pos];
+        if held.contains(&card_id) { return None; }
         weight += match_entity_card(slot_entity, card_def)?;
     }
 
@@ -798,12 +693,3 @@ pub fn try_match_recipe_at(
     Some(RecipeMatchResult { weight, reagent_card_ids })
 }
 
-/// Returns true if the recipe matches at the given chain position.
-#[allow(dead_code)]
-pub fn matches_at(
-    recipe:      &RecipeDef,
-    chain:       &[(u32, &CardDef, u16)],
-    actor_index: usize,
-) -> bool {
-    try_match_recipe_at(recipe, chain, actor_index).is_some()
-}

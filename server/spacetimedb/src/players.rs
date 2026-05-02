@@ -1,6 +1,5 @@
 use spacetimedb::{reducer, ReducerContext, Table};
 use crate::cards::{cards, insert_card_row};
-use crate::packing::{pack_macro_world, pack_micro_zone, world_to_zone, world_to_position};
 
 #[spacetimedb::table(accessor = players, public)]
 #[derive(Debug, Clone)]
@@ -12,8 +11,7 @@ pub struct Player {
   pub name: String,
   #[index(btree)]
   pub soul_id: u32,
-  /// Layer the player's soul currently occupies (always a world layer for
-  /// the soul card itself; players don't sit "in panel layers").
+  /// Layer the player's soul currently occupies (always a world layer).
   pub layer: u8,
   /// World macro_zone the soul currently occupies.
   #[index(btree)]
@@ -59,58 +57,5 @@ pub fn upsert_player(
     micro_zone,
   })?;
 
-  Ok(())
-}
-
-#[reducer]
-pub fn update_player_soul_id(
-  ctx: &ReducerContext,
-  player_id: u32,
-  soul_id: u32,
-) -> Result<(), String> {
-  if let Some(mut row) = ctx.db.players().player_id().find(&player_id) {
-    row.soul_id = soul_id;
-
-    if let Some(soul_card) = ctx.db.cards().card_id().find(&soul_id) {
-      row.layer      = soul_card.layer;
-      row.macro_zone = soul_card.macro_zone;
-      row.micro_zone = soul_card.micro_zone;
-    }
-
-    ctx.db.players().player_id().update(row);
-    Ok(())
-  } else {
-    Err(format!("player {player_id} not found"))
-  }
-}
-
-#[reducer]
-pub fn update_player_location(
-  ctx: &ReducerContext,
-  player_id: u32,
-  q: i32,
-  r: i32,
-  layer: u8,
-) -> Result<(), String> {
-  let (zone_q, zone_r) = world_to_zone(q, r);
-  let (local_q, local_r) = world_to_position(q, r);
-
-  if let Some(mut row) = ctx.db.players().player_id().find(&player_id) {
-    row.layer      = layer;
-    row.macro_zone = pack_macro_world(zone_q, zone_r);
-    row.micro_zone = pack_micro_zone(local_q, local_r);
-    ctx.db.players().player_id().update(row);
-    Ok(())
-  } else {
-    Err(format!("player {player_id} not found"))
-  }
-}
-
-#[reducer]
-pub fn delete_player(
-  ctx: &ReducerContext,
-  player_id: u32,
-) -> Result<(), String> {
-  ctx.db.players().player_id().delete(&player_id);
   Ok(())
 }
