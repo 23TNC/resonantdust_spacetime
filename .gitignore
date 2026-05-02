@@ -13,9 +13,9 @@
 /build/
 bin/
 dist/
-/spacetime/server/spacetimedb/target/*
-/spacetime/config
-/spacetime/data
+spacetime/server/spacetimedb/target/*
+spacetime/config
+spacetime/data
 
 # spacetimedb data
 /spacetime-data/*
