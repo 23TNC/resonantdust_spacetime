@@ -11,15 +11,48 @@
 //!
 //! Helpers (called from `cards.rs`):
 //!
-//! - [`try_start_top_stack_action`] — caller passes the submitted root +
-//!   up-branch; we try every `TopStack` recipe and start one if a match
-//!   fits.
-//! - [`try_start_bottom_stack_action`] — same shape for the down-branch.
+//! - [`process_top_branch`] — caller passes the submitted root +
+//!   up-branch; we iterate every potential actor along the chain,
+//!   evaluate `TopStack` recipes against each actor's visible window,
+//!   and apply the upgrade rules below.
+//! - [`process_bottom_branch`] — same shape for the down-branch.
 //! - [`try_start_on_create_action`] — caller passes a freshly-inserted
 //!   card; we try every `OnCreate` recipe whose `root` matches that card.
-//! - [`cancel_actions_for_cards`] — caller passes the card_ids in a
-//!   submitted stack; any action with a [`CardHold`] for one of those
-//!   cards is cancelled.
+//!
+//! # Visible chain & upgrade rules
+//!
+//! For each potential actor in the submitted branch chain, we build a
+//! **visible chain** — the actor plus cards extending outward (toward
+//! higher branch indices) that are either *free* (no `CardHold`) or
+//! *claimed by the actor's own current action*. The walk stops at the
+//! first card claimed by some other action.
+//!
+//! With the actor's current action (`current`, may be `None`) and the
+//! best-scoring recipe over the visible chain (`best`, may be `None`):
+//!
+//! ```text
+//! (None,    None)    → nothing
+//! (Some(a), None)    → cancel a
+//! (None,    Some(r)) → start r
+//! (Some(a), Some(r)) →
+//!     same recipe AND slot fillers unchanged → keep a running
+//!     otherwise → cancel a, start r
+//! ```
+//!
+//! Slot fillers are **strict** — any card swap, reorder, or removal in
+//! the slot window cancels and (if a recipe still matches) restarts.
+//! The chain root is **fluid** — it isn't held in `CardHold` and isn't
+//! tracked on the `Action` row. The recipe's `root` entity is just a
+//! pre-condition the matcher re-checks on every submission; if the
+//! chain root drifted but still satisfies `root`, the action keeps
+//! running unchanged. If the new root no longer matches, the matcher
+//! returns `None` and the action is cancelled.
+//!
+//! Not holding the root is what lets multiple recipes share one — e.g.
+//! `[attack, sword]` over a top branch and `[heal, anima]` over the
+//! bottom can both be rooted on the same `human` card concurrently.
+//! Holding the root would have made that single card a contention
+//! point and forced the recipes to be mutually exclusive.
 //!
 //! # Why no public reducers
 //!
@@ -79,7 +112,8 @@ pub struct Action {
   #[primary_key]
   #[auto_inc]
   pub action_id: u32,
-  /// Actor card_id (slot 1 of the matched recipe).
+  /// Actor card_id (slot 1 of the matched recipe). Set at start, never
+  /// changes for the lifetime of the action.
   #[index(btree)]
   pub card_id: u32,
   /// Recipe registry index (`RecipeDef.index`).
@@ -351,7 +385,7 @@ fn aspect_pool(defs: &[&CardDefinition]) -> BTreeMap<AspectId, i32> {
   pool
 }
 
-// ─── Stack matching ──────────────────────────────────────────────────────────
+// ─── Recipe scoring ──────────────────────────────────────────────────────────
 
 /// Lexicographically-compared priority for a successful recipe match.
 ///
@@ -373,137 +407,21 @@ struct MatchWeight {
   slot_weight: u32,
 }
 
-/// Outcome of fitting a recipe to a stack. Carries everything needed to
-/// start the action.
-struct MatchResult {
-  /// Actor card_id (slot 1 in the recipe).
-  actor_card_id: u32,
-  /// Position of the actor in the chain (0 = root, 1 = first stack_up
-  /// element, etc.).
-  actor_pos: usize,
-  /// Card_ids that the action will claim — actor + slot fillers + root
-  /// (if the recipe declares one).
+/// Outcome of scoring a recipe against an actor candidate. Carries
+/// everything `start_action` needs.
+struct ActorMatch {
+  weight: MatchWeight,
+  /// Card_ids the action will claim — actor + slot fillers, in chain
+  /// order. The chain root is **not** included even when the recipe
+  /// has a `root` entity: holding it would block other recipes from
+  /// rooting on the same card, e.g. `[attack, sword] + human` and
+  /// `[heal, anima] + human` running concurrently. The matcher
+  /// re-checks `recipe.root` against the current chain root on every
+  /// upgrade pass, so the root drifting away cancels the action
+  /// without needing a `CardHold` on it.
   claimed: Vec<u32>,
   /// Aspect pool for duration resolution.
   pool: BTreeMap<AspectId, i32>,
-  /// Lexicographic priority weight of this match. Used to pick the best
-  /// match across recipes (and across actor positions within a recipe).
-  weight: MatchWeight,
-}
-
-/// Attempt to fit `recipe` against a chain of cards. The chain is
-/// `[root, branch[0], branch[1], …]` for stack recipes. `recipe.slots` is
-/// 1-indexed; slot 1 is the actor. The matcher slides the actor's
-/// position along the chain (starting at chain[1] for rooted recipes,
-/// chain[0] otherwise), evaluates every position where the slot window
-/// fits, and returns the **highest-weight** match — slots may match more
-/// or less specifically at different positions (e.g. an `Or` slot
-/// satisfied by a Card-key match at one position vs. an Aspect at
-/// another), so we pick the best.
-fn try_match_stack(
-  recipe: &RecipeDef,
-  chain: &[Card],
-  defs: &[Option<&'static CardDefinition>],
-) -> Option<MatchResult> {
-  if recipe.slots.is_empty() {
-    return None;
-  }
-
-  // Earliest position the actor can sit at. If the recipe pins a `root`
-  // entity, the chain must have a root that matches and the actor sits
-  // at chain[1]+. Otherwise the actor can sit at chain[0]+.
-  let min_actor_pos = if recipe.root.is_some() { 1 } else { 0 };
-
-  // Root tier weight — constant across actor positions because the
-  // chain root is always `chain[0]` regardless of where the actor sits.
-  // For recipes without `root`, contributes 0.
-  let root_weight = if let Some(root_entity) = &recipe.root {
-    let root_def = defs.first().and_then(|d| *d)?;
-    let w = entity_match_weight(root_entity, root_def);
-    if w == 0 {
-      return None;
-    }
-    w
-  } else {
-    0
-  };
-
-  // Tile tier weight — top of the priority hierarchy. Forward-looking:
-  // resolution requires knowing which hex tile a stack sits on, which
-  // depends on world-layer card data we don't have wired up yet. Until
-  // that lands, a recipe with `tile` set still parses, but the matcher
-  // scores `tile_weight = 0` and the field has no effect on priority.
-  // TODO: when world cards exist, look up the tile card's def for the
-  // chain's `(layer, macro_zone)` and call `entity_match_weight` on it.
-  let tile_weight = 0;
-
-  let mut best: Option<MatchResult> = None;
-  for actor_pos in min_actor_pos..chain.len() {
-    if actor_pos + recipe.slots.len() > chain.len() {
-      break;
-    }
-    let mut slot_weight: u32 = 0;
-    let mut all_match = true;
-    for (slot_idx, slot_entity) in recipe.slots.iter().enumerate() {
-      let chain_idx = actor_pos + slot_idx;
-      let Some(def) = defs[chain_idx] else {
-        all_match = false;
-        break;
-      };
-      let w = entity_match_weight(slot_entity, def);
-      if w == 0 {
-        all_match = false;
-        break;
-      }
-      slot_weight += w;
-    }
-    if !all_match {
-      continue;
-    }
-
-    // Build the claim window: actor + slot range, plus root if rooted.
-    let mut claimed: Vec<u32> = Vec::new();
-    if recipe.root.is_some() {
-      claimed.push(chain[0].card_id);
-    }
-    for i in actor_pos..(actor_pos + recipe.slots.len()) {
-      let id = chain[i].card_id;
-      if !claimed.contains(&id) {
-        claimed.push(id);
-      }
-    }
-
-    // Aspect pool for duration: every claimed card's defs.
-    let claim_defs: Vec<&CardDefinition> = claimed
-      .iter()
-      .filter_map(|id| {
-        chain
-          .iter()
-          .position(|c| c.card_id == *id)
-          .and_then(|i| defs[i])
-      })
-      .collect();
-    let pool = aspect_pool(&claim_defs);
-
-    let weight = MatchWeight {
-      tile_weight,
-      root_weight,
-      slot_weight,
-    };
-    let candidate = MatchResult {
-      actor_card_id: chain[actor_pos].card_id,
-      actor_pos,
-      claimed,
-      pool,
-      weight,
-    };
-    match best.as_ref() {
-      None => best = Some(candidate),
-      Some(b) if weight > b.weight => best = Some(candidate),
-      _ => {}
-    }
-  }
-  best
 }
 
 /// Build a chain of `Card` rows from card_ids. Returns `Err` if any
@@ -528,80 +446,331 @@ fn decode_chain(chain: &[Card]) -> Result<Vec<Option<&'static CardDefinition>>, 
   chain.iter().map(card_def_for).collect()
 }
 
+/// Score `recipe` for an actor at `branch_chain[actor_idx]` over the
+/// visible window `branch_chain[actor_idx..visible_end]`. The chain
+/// root is always `branch_chain[0]` (the submitted root) regardless of
+/// where the actor sits — for `top_stack` and `bottom_stack` recipes
+/// alike. Returns `None` if the slot list doesn't fit, any required
+/// entity fails to match, or any decode fails.
+fn score_recipe_for_actor(
+  recipe: &RecipeDef,
+  branch_chain: &[Card],
+  branch_chain_defs: &[Option<&'static CardDefinition>],
+  actor_idx: usize,
+  visible_end: usize,
+) -> Option<ActorMatch> {
+  let slot_count = recipe.slots.len();
+  if slot_count == 0 {
+    return None;
+  }
+  if actor_idx + slot_count > visible_end {
+    return None;
+  }
+
+  // Rooted recipes pin the chain root at `branch_chain[0]` and the
+  // actor sits *above* it — so actor_idx 0 is reserved for the root,
+  // not the actor. Without this guard, a recipe with both `root` and a
+  // slot list could double-match its first slot against the chain
+  // root, producing a degenerate single-card claim.
+  if recipe.root.is_some() && actor_idx == 0 {
+    return None;
+  }
+
+  // Root tier weight — constant across actor positions because the
+  // chain root is always `branch_chain[0]`. For recipes without
+  // `root`, contributes 0.
+  let root_weight = if let Some(root_entity) = &recipe.root {
+    let def = (*branch_chain_defs.first()?)?;
+    let w = entity_match_weight(root_entity, def);
+    if w == 0 {
+      return None;
+    }
+    w
+  } else {
+    0
+  };
+
+  // Tile tier — forward-looking. See note on tile resolution in
+  // `data/recipes/AGENT.md`. Today this is always 0.
+  let tile_weight = 0;
+
+  let mut slot_weight: u32 = 0;
+  for (i, slot_entity) in recipe.slots.iter().enumerate() {
+    let def = branch_chain_defs[actor_idx + i]?;
+    let w = entity_match_weight(slot_entity, def);
+    if w == 0 {
+      return None;
+    }
+    slot_weight += w;
+  }
+
+  // Build claim list: actor + slot fillers, in chain order. The chain
+  // root is intentionally not held — see `ActorMatch.claimed` doc.
+  let mut claimed: Vec<u32> = Vec::with_capacity(slot_count);
+  for i in 0..slot_count {
+    claimed.push(branch_chain[actor_idx + i].card_id);
+  }
+
+  // Aspect pool for duration: every claimed card's def + the chain
+  // root's def for rooted recipes (the root contributes its aspects
+  // to the pool even though it isn't held).
+  let mut claim_defs: Vec<&CardDefinition> = claimed
+    .iter()
+    .filter_map(|id| {
+      branch_chain
+        .iter()
+        .zip(branch_chain_defs.iter())
+        .find_map(|(c, d)| if c.card_id == *id { *d } else { None })
+    })
+    .collect();
+  if recipe.root.is_some() {
+    if let Some(def) = branch_chain_defs.first().and_then(|d| *d) {
+      if !claimed.contains(&branch_chain[0].card_id) {
+        claim_defs.push(def);
+      }
+    }
+  }
+  let pool = aspect_pool(&claim_defs);
+
+  Some(ActorMatch {
+    weight: MatchWeight { tile_weight, root_weight, slot_weight },
+    claimed,
+    pool,
+  })
+}
+
+// ─── Visible chain ───────────────────────────────────────────────────────────
+
+/// Walk outward from `branch_chain[actor_idx]` and return the exclusive
+/// end index of the visible window. A card is visible if it is *free*
+/// (no `CardHold`) or *claimed by the actor's own action*. The walk
+/// stops at the first card claimed by some other action, excluding it.
+fn build_visible_chain(
+  ctx: &ReducerContext,
+  branch_chain: &[Card],
+  actor_idx: usize,
+  actor_action_id: Option<u32>,
+) -> usize {
+  let mut end = actor_idx;
+  for j in actor_idx..branch_chain.len() {
+    let hold_action = ctx
+      .db
+      .card_holds()
+      .card_id()
+      .find(&branch_chain[j].card_id)
+      .map(|h| h.action_id);
+    let visible = match (hold_action, actor_action_id) {
+      (None, _) => true,
+      (Some(a), Some(b)) if a == b => true,
+      _ => false,
+    };
+    if visible {
+      end = j + 1;
+    } else {
+      break;
+    }
+  }
+  end
+}
+
+// ─── Strict slot-filler equality ─────────────────────────────────────────────
+
+/// Whether the action's currently-claimed cards match the new slot
+/// window `branch_chain[actor_idx..actor_idx+recipe.slots.len()]`
+/// **as a set**.
+///
+/// Used as the strict "slot fillers haven't moved" gate before keeping
+/// a same-recipe action running. The claim is exactly the slot window
+/// (actor + slot fillers) — the chain root isn't held — so the
+/// comparison is direct, no set subtraction needed.
+///
+/// Set equality (rather than positional) reflects what we can compare
+/// with the data on hand — `CardHold` doesn't preserve slot index. In
+/// practice the chain order is fixed by the user's stack, so a set
+/// match implies a positional match for any well-formed submission.
+fn slot_fillers_unchanged(
+  ctx: &ReducerContext,
+  action: &Action,
+  recipe: &RecipeDef,
+  branch_chain: &[Card],
+  actor_idx: usize,
+) -> bool {
+  let slot_count = recipe.slots.len();
+  if actor_idx + slot_count > branch_chain.len() {
+    return false;
+  }
+  let new_set: BTreeSet<u32> = branch_chain[actor_idx..actor_idx + slot_count]
+    .iter()
+    .map(|c| c.card_id)
+    .collect();
+  let old_set: BTreeSet<u32> = ctx
+    .db
+    .card_holds()
+    .action_id()
+    .filter(&action.action_id)
+    .map(|h| h.card_id)
+    .collect();
+  old_set == new_set
+}
+
 // ─── Public entry points ─────────────────────────────────────────────────────
 
-/// Try to start a `TopStack` action against this stack. Considers every
-/// registered top-stack recipe and picks the **highest-weight** match
-/// (lex-ordered `tile > root > slots`). Within ties, declaration order
-/// in the recipe registry breaks the tie.
-///
-/// Returns `Ok(Some(action_id))` on success, `Ok(None)` if no recipe
-/// matched, `Err` on a registry-build failure or a card-resolve failure.
-///
-/// `chain_card_ids` is `[root, stack_up[0], stack_up[1], …]` — the
-/// caller assembles this from the submitted [`crate::cards::InventoryStack`].
-pub fn try_start_top_stack_action(
+/// Process the top branch of a submitted stack. `branch_chain_ids` is
+/// `[root, stack_up[0], stack_up[1], …]`. For every card in the chain,
+/// the matcher evaluates that card as a potential actor over its
+/// visible chain, scores all `TopStack` recipes, and applies the
+/// upgrade rules from the module docs.
+pub fn process_top_branch(
   ctx: &ReducerContext,
-  chain_card_ids: &[u32],
+  branch_chain_ids: &[u32],
   owner_id: u32,
-) -> Result<Option<u32>, String> {
-  try_start_stack_action(ctx, chain_card_ids, owner_id, RecipeType::TopStack)
+) -> Result<(), String> {
+  process_branch(ctx, branch_chain_ids, RecipeType::TopStack, owner_id)
 }
 
-/// Same as [`try_start_top_stack_action`] but for the bottom branch.
-/// `chain_card_ids` is `[root, stack_down[0], stack_down[1], …]`.
-pub fn try_start_bottom_stack_action(
+/// Same as [`process_top_branch`] for the bottom branch.
+/// `branch_chain_ids` is `[root, stack_down[0], stack_down[1], …]`.
+pub fn process_bottom_branch(
   ctx: &ReducerContext,
-  chain_card_ids: &[u32],
+  branch_chain_ids: &[u32],
   owner_id: u32,
-) -> Result<Option<u32>, String> {
-  try_start_stack_action(ctx, chain_card_ids, owner_id, RecipeType::BottomStack)
+) -> Result<(), String> {
+  process_branch(ctx, branch_chain_ids, RecipeType::BottomStack, owner_id)
 }
 
-fn try_start_stack_action(
+fn process_branch(
   ctx: &ReducerContext,
-  chain_card_ids: &[u32],
-  owner_id: u32,
+  branch_chain_ids: &[u32],
   recipe_type: RecipeType,
-) -> Result<Option<u32>, String> {
-  if chain_card_ids.is_empty() {
-    return Ok(None);
+  owner_id: u32,
+) -> Result<(), String> {
+  if branch_chain_ids.is_empty() {
+    return Ok(());
   }
-  let chain = fetch_cards(ctx, chain_card_ids)?;
-  let defs = decode_chain(&chain)?;
-  let held = held_card_set(ctx);
+  let branch_chain = fetch_cards(ctx, branch_chain_ids)?;
+  let branch_chain_defs = decode_chain(&branch_chain)?;
 
-  // Score every matching recipe; keep the highest-weight one. Ties go
-  // to the first-encountered (registry-declaration order is the
-  // tiebreak).
-  let mut best: Option<(&'static RecipeDef, MatchResult)> = None;
+  for actor_idx in 0..branch_chain.len() {
+    process_actor_candidate(
+      ctx,
+      &branch_chain,
+      &branch_chain_defs,
+      actor_idx,
+      recipe_type,
+      owner_id,
+    )?;
+  }
+  Ok(())
+}
+
+/// Apply the upgrade decision for one actor candidate. Single source of
+/// truth for the four-way table in the module docs.
+fn process_actor_candidate(
+  ctx: &ReducerContext,
+  branch_chain: &[Card],
+  branch_chain_defs: &[Option<&'static CardDefinition>],
+  actor_idx: usize,
+  recipe_type: RecipeType,
+  owner_id: u32,
+) -> Result<(), String> {
+  let actor = &branch_chain[actor_idx];
+
+  // Look up the actor's current action, if any. The actor is *us* only
+  // when the held action's `card_id` equals the actor's id; otherwise
+  // this card is a slot filler in someone else's action and we leave
+  // it alone (its actor will reach the same conclusion when *its*
+  // candidate iteration runs).
+  let actor_action_id = ctx
+    .db
+    .card_holds()
+    .card_id()
+    .find(&actor.card_id)
+    .map(|h| h.action_id);
+  let current_action = actor_action_id.and_then(|id| ctx.db.actions().action_id().find(&id));
+  if let Some(ref a) = current_action {
+    if a.card_id != actor.card_id {
+      return Ok(());
+    }
+    // Actor's current action is for a *different* branch direction. The
+    // root card of a Y-stack is the actor of one branch's action and
+    // also sits at chain[0] of the other branch — but the other branch
+    // has no business cancelling the first branch's action. The other
+    // branch's own evaluator will handle that action when it runs.
+    let current_recipe = definitions::recipe(a.recipe)?;
+    if let Some(cur) = current_recipe {
+      if cur.recipe_type != recipe_type {
+        return Ok(());
+      }
+    }
+  }
+
+  // Visible window [actor_idx, visible_end). For a free actor this is
+  // free-or-empty cards beyond it; for an actor mid-action this also
+  // includes the action's own slot fillers.
+  let visible_end = build_visible_chain(ctx, branch_chain, actor_idx, actor_action_id);
+
+  // Score every recipe of this type against the visible window. Skip
+  // candidates whose claim would conflict with another action's hold.
+  // (The actor's own action is not a conflict — we may keep it.)
+  let mut best: Option<(&'static RecipeDef, ActorMatch)> = None;
   for recipe in definitions::recipes_of_type(recipe_type)? {
-    let Some(result) = try_match_stack(recipe, &chain, &defs) else { continue };
-    // Skip if any claimed card is already held by another action.
-    if result.claimed.iter().any(|id| held.contains(id)) {
+    let Some(m) = score_recipe_for_actor(
+      recipe,
+      branch_chain,
+      branch_chain_defs,
+      actor_idx,
+      visible_end,
+    ) else {
+      continue;
+    };
+
+    let blocked = m.claimed.iter().any(|id| {
+      ctx.db.card_holds().card_id().find(id).map_or(false, |h| {
+        Some(h.action_id) != actor_action_id
+      })
+    });
+    if blocked {
       continue;
     }
-    let weight = result.weight;
+
     match best.as_ref() {
-      None => best = Some((recipe, result)),
-      Some((_, b)) if weight > b.weight => best = Some((recipe, result)),
+      None => best = Some((recipe, m)),
+      Some((_, b)) if m.weight > b.weight => best = Some((recipe, m)),
       _ => {}
     }
   }
-  match best {
-    Some((recipe, result)) => {
-      let action_id = start_action(ctx, recipe, &chain, &result, owner_id)?;
-      Ok(Some(action_id))
+
+  // Four-way decision. See module docs for the rules.
+  match (&current_action, best) {
+    (None, None) => Ok(()),
+    (Some(a), None) => {
+      delete_action_rows(ctx, a.action_id);
+      Ok(())
     }
-    None => Ok(None),
+    (None, Some((recipe, m))) => {
+      start_action(ctx, recipe, actor, branch_chain, &m, owner_id)?;
+      Ok(())
+    }
+    (Some(a), Some((recipe, m))) => {
+      if a.recipe == recipe.index && slot_fillers_unchanged(ctx, a, recipe, branch_chain, actor_idx) {
+        // Same recipe, same slot fillers — keep running. The chain
+        // root isn't held, so a drifted-but-still-matching root needs
+        // no bookkeeping update; the matcher already validated it
+        // when scoring `m` above.
+        Ok(())
+      } else {
+        // Different recipe, or slot fillers moved — cancel and start.
+        delete_action_rows(ctx, a.action_id);
+        start_action(ctx, recipe, actor, branch_chain, &m, owner_id)?;
+        Ok(())
+      }
+    }
   }
 }
 
-/// Try to start an `OnCreate` action for a freshly-created card. Picks
-/// the **highest-weight** match across `OnCreate` recipes (the new card
-/// is matched against each recipe's `root` entity, and the per-leaf
-/// match weight becomes the tier `root_weight`). Ties go to declaration
-/// order.
+/// `OnCreate` matcher. The freshly-created card is both root and
+/// actor; the visible chain is the card itself. Picks the highest-
+/// weight `OnCreate` recipe whose `root` entity matches the card.
 pub fn try_start_on_create_action(
   ctx: &ReducerContext,
   card_id: u32,
@@ -616,91 +785,57 @@ pub fn try_start_on_create_action(
     return Ok(None);
   };
 
-  let held = held_card_set(ctx);
-  if held.contains(&card_id) {
+  if ctx.db.card_holds().card_id().find(&card_id).is_some() {
     // Already participating in an action — don't double-start.
     return Ok(None);
   }
 
-  let mut best: Option<(&'static RecipeDef, MatchResult)> = None;
+  let mut best: Option<(&'static RecipeDef, ActorMatch)> = None;
   for recipe in definitions::recipes_of_type(RecipeType::OnCreate)? {
     let Some(root_entity) = &recipe.root else { continue };
     let root_w = entity_match_weight(root_entity, card_def);
     if root_w == 0 {
       continue;
     }
-
-    // OnCreate uses the card itself as both root and actor. The single
-    // claim is the card. Reagent index 0 references the root (= the
-    // card); higher indices are not meaningful for OnCreate (no slots).
     let pool = aspect_pool(&[card_def]);
-    let weight = MatchWeight {
-      tile_weight: 0,
-      root_weight: root_w,
-      slot_weight: 0,
-    };
-    let result = MatchResult {
-      actor_card_id: card_id,
-      actor_pos: 0,
+    let m = ActorMatch {
+      weight: MatchWeight {
+        tile_weight: 0,
+        root_weight: root_w,
+        slot_weight: 0,
+      },
       claimed: vec![card_id],
       pool,
-      weight,
     };
     match best.as_ref() {
-      None => best = Some((recipe, result)),
-      Some((_, b)) if weight > b.weight => best = Some((recipe, result)),
+      None => best = Some((recipe, m)),
+      Some((_, b)) if m.weight > b.weight => best = Some((recipe, m)),
       _ => {}
     }
   }
   match best {
-    Some((recipe, result)) => {
-      let action_id = start_action(ctx, recipe, std::slice::from_ref(&card), &result, card.owner_id)?;
+    Some((recipe, m)) => {
+      let branch_chain = vec![card.clone()];
+      let action_id = start_action(ctx, recipe, &card, &branch_chain, &m, card.owner_id)?;
       Ok(Some(action_id))
     }
     None => Ok(None),
   }
 }
 
-/// Cancel any actions whose claim window includes any card in
-/// `card_ids`. Called by the trigger path (`submit_inventory_stacks`)
-/// for every card in a submitted stack — if a card is now in a
-/// different stack composition than when its action started, the
-/// action's claim is structurally disturbed and the action is cancelled.
-///
-/// Returns the number of actions cancelled.
-pub fn cancel_actions_for_cards(ctx: &ReducerContext, card_ids: &[u32]) -> u32 {
-  let mut to_cancel: BTreeSet<u32> = BTreeSet::new();
-  for &card_id in card_ids {
-    if let Some(hold) = ctx.db.card_holds().card_id().find(&card_id) {
-      to_cancel.insert(hold.action_id);
-    }
-  }
-  let count = to_cancel.len() as u32;
-  for action_id in to_cancel {
-    delete_action_rows(ctx, action_id);
-  }
-  count
-}
-
-// ─── Action start ────────────────────────────────────────────────────────────
+// ─── Action start / refresh ──────────────────────────────────────────────────
 
 /// Insert an Action row, schedule its completion, and claim every card
 /// in the match window. Returns the new `action_id`.
 fn start_action(
   ctx: &ReducerContext,
   recipe: &RecipeDef,
-  chain: &[Card],
-  result: &MatchResult,
+  actor: &Card,
+  branch_chain: &[Card],
+  m: &ActorMatch,
   owner_id: u32,
 ) -> Result<u32, String> {
-  let actor = chain.get(result.actor_pos).ok_or_else(|| {
-    format!(
-      "actor_pos {} out of range for chain length {}",
-      result.actor_pos,
-      chain.len()
-    )
-  })?;
-  let duration = resolve_duration(&recipe.duration, &result.pool);
+  let duration = resolve_duration(&recipe.duration, &m.pool);
   let now = current_seconds(ctx)?;
   let end = now.saturating_add(duration);
 
@@ -727,7 +862,7 @@ fn start_action(
 
   let inserted = ctx.db.actions().insert(Action {
     action_id: 0,
-    card_id: result.actor_card_id,
+    card_id: actor.card_id,
     recipe: recipe.index,
     owner_id,
     layer: actor.layer,
@@ -740,12 +875,8 @@ fn start_action(
     scheduled_at: ScheduleAt::Time(complete_at),
     action_id: inserted.action_id,
   });
-  claim_cards(ctx, inserted.action_id, &result.claimed);
+  claim_cards(ctx, inserted.action_id, &m.claimed);
   Ok(inserted.action_id)
-}
-
-fn held_card_set(ctx: &ReducerContext) -> BTreeSet<u32> {
-  ctx.db.card_holds().iter().map(|h| h.card_id).collect()
 }
 
 // ─── Reducers ────────────────────────────────────────────────────────────────
@@ -824,6 +955,20 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
     .collect();
   let claimed_cards = fetch_cards(ctx, &claimed_ids)?;
 
+  // Defense-in-depth: re-check that every claimed card's current
+  // definition still satisfies the recipe shape. The upgrade path is
+  // supposed to cancel any action whose claim drifted, but a desync
+  // (mutated card def, lost hold, etc.) shouldn't be able to push a
+  // stale completion through. Refuse rather than produce mismatched
+  // products.
+  if !recipe_still_satisfies_claim(recipe, &claimed_cards)? {
+    delete_action_rows(ctx, action_id);
+    return Err(format!(
+      "complete_action: action {} no longer satisfies recipe {:?} — refused",
+      action_id, recipe.id,
+    ));
+  }
+
   // Find the actor inside the claim list (it always has a hold). Used
   // for product-target resolution.
   let actor = claimed_cards
@@ -841,63 +986,32 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
   // scheduler id so the outcome is reproducible per-action.
   if !recipe.products.is_empty() {
     let mut rng_state: u32 = scheduler.scheduled_id as u32;
-    generate_products(ctx, recipe, &actor, &claimed_cards, &mut rng_state)?;
+    generate_products(ctx, recipe, &actor, &mut rng_state)?;
   }
 
   // Consume reagents. Reagent indices are 1-based against the recipe's
-  // slots (slot 1 = actor, slot 2 = next card outward, …); index 0
+  // slots (slot 1 = actor, slot 2 = next card outward, …); index `0`
   // refers to the chain root.
   //
-  // Important: we **don't** index into `claimed_cards` to resolve a slot
-  // position. The vec was built from
-  // `card_holds().action_id().filter()`, whose secondary iteration
-  // order is PK (card_id), not the original claim/insertion order. So
-  // `claimed_cards[0]` is the lowest-card_id claimed card, not
-  // necessarily slot 1.
+  // For `OnCreate`, the actor *is* the chain root — `action.card_id`
+  // resolves both indices `0` and `1` to the same card. For stack
+  // recipes, the chain root isn't held (so multiple recipes can root
+  // on it concurrently) and isn't stored on the `Action` row, so
+  // reagent `0` is a no-op for stack recipes today; if a future
+  // recipe needs to consume the chain root of a stack, that's where
+  // chain-context-at-completion needs to come from. None of the
+  // current recipes use this for stack types.
   //
-  // Reagent 1 (the actor) is `action.card_id` — known unambiguously.
-  // Reagent 0 in OnCreate is also the actor. Reagent 0 in a rooted
-  // stack recipe is the chain root, which we recover by scanning
-  // `claimed_cards` for the one whose def matches `recipe.root`.
-  // Reagents past slot 1 (`n >= 2`) require slot-position info that
-  // isn't currently preserved on `CardHold` — those are skipped with a
-  // log warning.
+  // Reagents past slot 1 (`n >= 2`) need slot-position info that
+  // CardHold doesn't preserve — see TODO below.
   for &reagent_idx in &recipe.reagents {
     let card_id = match reagent_idx {
-      0 => {
-        match recipe.recipe_type {
-          RecipeType::OnCreate => action.card_id,
-          RecipeType::TopStack | RecipeType::BottomStack => {
-            let Some(root_entity) = &recipe.root else {
-              // Reagent 0 in a non-rooted stack recipe is currently a
-              // no-op (the matcher doesn't claim chain[0] for
-              // non-rooted recipes). Documented gotcha; needs the
-              // matcher to also claim the chain root when reagent 0 is
-              // listed before this branch can do anything useful.
-              continue;
-            };
-            // Find the claimed card whose def matches the recipe's
-            // root entity. There should be exactly one (the chain
-            // root).
-            let mut found: Option<u32> = None;
-            for c in &claimed_cards {
-              if let Some(def) = card_def_for(c)? {
-                if entity_matches(root_entity, def) {
-                  found = Some(c.card_id);
-                  break;
-                }
-              }
-            }
-            match found {
-              Some(id) => id,
-              None => continue,
-            }
-          }
-        }
-      }
+      0 => match recipe.recipe_type {
+        RecipeType::OnCreate => action.card_id,
+        RecipeType::TopStack | RecipeType::BottomStack => continue,
+      },
       1 => {
-        // Slot 1 is always the actor — known unambiguously regardless
-        // of CardHold iteration order.
+        // Slot 1 is always the actor.
         action.card_id
       }
       _n => {
@@ -929,6 +1043,43 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
   Ok(())
 }
 
+/// Defense-in-depth: verify the claim window is still consistent with
+/// the recipe at completion time. The upgrade machinery is supposed to
+/// have cancelled any drifted action long before now; this is the
+/// belt-and-braces check that runs anyway.
+///
+/// Every claimed card must still match at least one slot entity in
+/// the recipe. This isn't a strict positional check (`CardHold` doesn't
+/// preserve slot index) but it catches a `packed_definition` that's
+/// drifted to something the recipe wouldn't accept at any position.
+///
+/// The chain root isn't held — so it isn't in `claimed_cards` and
+/// isn't checked here. The matcher re-validates `recipe.root` against
+/// the current chain root on every upgrade pass, which is the only
+/// place it can be checked (the chain root isn't recoverable from
+/// server state at completion time).
+fn recipe_still_satisfies_claim(
+  recipe: &RecipeDef,
+  claimed_cards: &[Card],
+) -> Result<bool, String> {
+  for c in claimed_cards {
+    let Some(def) = card_def_for(c)? else {
+      return Ok(false);
+    };
+    // OnCreate has empty `slots`; its claim is the actor / root, which
+    // we instead check against `recipe.root`.
+    let matches = if recipe.slots.is_empty() {
+      recipe.root.as_ref().map_or(false, |r| entity_matches(r, def))
+    } else {
+      recipe.slots.iter().any(|e| entity_matches(e, def))
+    };
+    if !matches {
+      return Ok(false);
+    }
+  }
+  Ok(true)
+}
+
 // ─── Product generation ──────────────────────────────────────────────────────
 
 /// Where one product card row will be inserted.
@@ -945,11 +1096,10 @@ fn generate_products(
   ctx: &ReducerContext,
   recipe: &RecipeDef,
   actor: &Card,
-  claimed_cards: &[Card],
   rng: &mut u32,
 ) -> Result<(), String> {
   for group in &recipe.products {
-    let dest = resolve_product_destination(&group.target, actor, claimed_cards);
+    let dest = resolve_product_destination(&group.target, actor);
     for entity in &group.entities {
       generate_entity_products(ctx, entity, &dest, rng)?;
     }
@@ -960,23 +1110,24 @@ fn generate_products(
 fn resolve_product_destination(
   target: &ProductTarget,
   actor: &Card,
-  claimed_cards: &[Card],
 ) -> ProductDestination {
   // The destination panel is identified by `macro_zone` — the player
   // whose inventory holds the relevant card — *not* by `owner_id`. For
   // inventory cards `macro_zone == panel_player_id` by definition.
+  //
+  // `RootPanel` would ideally route to the chain root's holder, but
+  // the chain root isn't held by the action and isn't recoverable
+  // from server state at completion (server doesn't track inventory
+  // stack composition). For the inventory POC every claimed card is
+  // in the same player's panel anyway, so falling back to the actor's
+  // panel is a no-op there. When world layers land and a stack can
+  // span panels, the chain root will need a server-side
+  // representation (likely passed at submission and snapshotted onto
+  // the `Action` row).
   match target {
-    ProductTarget::ActorPanel => ProductDestination::Panel {
+    ProductTarget::ActorPanel | ProductTarget::RootPanel => ProductDestination::Panel {
       panel_player_id: actor.macro_zone,
     },
-    ProductTarget::RootPanel => {
-      // Root is claimed[0] when the recipe declared a root; otherwise
-      // there's no root and we fall back to the actor's panel.
-      let root = claimed_cards.first().unwrap_or(actor);
-      ProductDestination::Panel {
-        panel_player_id: root.macro_zone,
-      }
-    }
   }
 }
 

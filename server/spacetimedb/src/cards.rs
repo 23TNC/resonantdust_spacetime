@@ -133,18 +133,18 @@ pub struct InventoryStack {
 
 /// Client-driven inventory stack submission. The server validates every
 /// card_id in every submitted stack belongs to the caller's inventory,
-/// then orchestrates the action machinery:
+/// then walks each branch through the action upgrade machinery:
 ///
-/// 1. **Cancel.** Every action holding any submitted card is cancelled
-///    via [`actions::cancel_actions_for_cards`]. This is strict: a no-op
-///    submission of a stack whose composition didn't actually change
-///    will still cancel any running action on it. Switch to lenient
-///    matcher-replay if/when timer-reset becomes a UX problem.
-/// 2. **Top-stack match.** For each submitted stack, build the up-chain
-///    `[root, stack_up[0], …]` and try to start a matching `TopStack`
-///    recipe via [`actions::try_start_top_stack_action`].
-/// 3. **Bottom-stack match.** Same shape for `[root, stack_down[0], …]`
-///    via [`actions::try_start_bottom_stack_action`].
+/// 1. **Top branch.** For each submitted stack, build the up-chain
+///    `[root, stack_up[0], …]` and call
+///    [`actions::process_top_branch`]. The branch processor iterates
+///    every potential actor along the chain and applies the upgrade
+///    rules (start, keep, refresh, or cancel) — no blanket pre-cancel.
+///    A no-op submission whose stack composition didn't actually
+///    change leaves any running action *running*, with its timer
+///    untouched.
+/// 2. **Bottom branch.** Same shape for `[root, stack_down[0], …]` via
+///    [`actions::process_bottom_branch`].
 ///
 /// `OnCreate` triggers fire from [`insert_card_row`], not from here.
 #[reducer]
@@ -218,26 +218,21 @@ pub fn submit_inventory_stacks(
   }
 
   // ─── Action orchestration ──────────────────────────────────────────
-  // Validation passed. Cancel disturbed actions, then run the matcher
-  // on each submitted stack.
-
-  // `seen` is the deduped set of every submitted card_id. Cancel any
-  // action holding any of them.
-  let touched: Vec<u32> = seen.iter().copied().collect();
-  actions::cancel_actions_for_cards(ctx, &touched);
-
+  // Validation passed. Walk each branch through the upgrade machinery.
+  // No blanket pre-cancel — `process_*_branch` cancels exactly the
+  // actions that are actually disturbed.
   for stack in &stacks {
     // Top branch chain: [root, stack_up[0], stack_up[1], …]
     let mut top_chain: Vec<u32> = Vec::with_capacity(1 + stack.stack_up.len());
     top_chain.push(stack.root);
     top_chain.extend(stack.stack_up.iter().copied());
-    actions::try_start_top_stack_action(ctx, &top_chain, player_id)?;
+    actions::process_top_branch(ctx, &top_chain, player_id)?;
 
     // Bottom branch chain: [root, stack_down[0], stack_down[1], …]
     let mut bottom_chain: Vec<u32> = Vec::with_capacity(1 + stack.stack_down.len());
     bottom_chain.push(stack.root);
     bottom_chain.extend(stack.stack_down.iter().copied());
-    actions::try_start_bottom_stack_action(ctx, &bottom_chain, player_id)?;
+    actions::process_bottom_branch(ctx, &bottom_chain, player_id)?;
   }
 
   Ok(())
