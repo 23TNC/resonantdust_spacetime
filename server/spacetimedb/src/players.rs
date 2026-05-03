@@ -30,7 +30,9 @@ pub struct Player {
   /// World macro_zone the soul currently occupies. `0` while unplaced.
   #[index(btree)]
   pub macro_zone: u32,
-  /// In-zone hex position of the soul. `0` while unplaced.
+  /// In-zone position of the soul: `[local_q:u3][local_r:u3][stack_state:u2]`
+  /// — hex coords plus the soul's role in its stack (bits 1..0). `0` while
+  /// unplaced.
   pub micro_zone: u8,
   /// Within-`micro_zone` position of the soul. Parallel to
   /// `Card.micro_location`: variant per the soul's stack state — either a

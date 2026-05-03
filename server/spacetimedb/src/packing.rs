@@ -1,9 +1,9 @@
 //! Bit-packing helpers for the cards table.
 //!
 //! Currently only `packed_definition` is packed. The other packing helpers
-//! (`macro_zone` variants, `micro_zone`, `micro_location`, `flags`) were
-//! removed along with their fields when the table was cut down to the
-//! inventory POC. They'll come back with the world board.
+//! (`macro_zone` variants, `micro_zone`, `micro_location`) were removed
+//! along with their fields when the table was cut down to the inventory
+//! POC. They'll come back with the world board.
 
 // ---------- packed_definition (u16) ----------
 // bits 15..12 card_type (u4), bits 11..8 card_category (u4), bits 7..0 definition_id (u8).

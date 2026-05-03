@@ -184,6 +184,7 @@ pub struct CardDefinition {
 }
 
 const CARD_TYPES_JSON: &str = include_str!("../data/card_types.json");
+const CARD_IDS_JSON: &str = include_str!("../data/cards/id.json");
 
 /// Maximum valid id for a `card_type` or `card_category`. Both occupy the
 /// `u4` halves of `packed_definition`, so 0xF is the hard cap.
@@ -200,6 +201,8 @@ struct CardRegistry {
   by_packed: BTreeMap<u16, CardDefinition>,
   /// `(type_id, category_id, key)` → `packed_definition`.
   by_path: BTreeMap<(u8, u8, String), u16>,
+  /// Bare key → `packed_definition`, from `cards/id.json`.
+  by_key: BTreeMap<String, u16>,
   type_ids: BTreeMap<String, u8>,
   category_ids: BTreeMap<String, u8>,
 }
@@ -216,6 +219,14 @@ fn cards_registry() -> Result<&'static CardRegistry, String> {
 /// failure.
 pub fn decode_definition(packed: u16) -> Result<Option<&'static CardDefinition>, String> {
   Ok(cards_registry()?.by_packed.get(&packed))
+}
+
+/// Look up a card's `packed_definition` by its bare key (e.g. `"fatigue"`).
+/// Uses the stable mapping from `cards/id.json` — O(log n), no scan needed.
+/// Returns `Ok(None)` if the registry built but no card with that key exists;
+/// `Err` on registry-build failure.
+pub fn find_packed_by_key(card_key: &str) -> Result<Option<u16>, String> {
+  Ok(cards_registry()?.by_key.get(card_key).copied())
 }
 
 /// Resolve a `"type/key"` or `"type/category/key"` string to the card's
@@ -258,8 +269,45 @@ fn build_cards() -> Result<CardRegistry, String> {
   let type_ids = json_id_map(&types_root, "types")?;
   let category_ids = json_id_map(&types_root, "categories")?;
 
+  // Load stable definition_id map — must exist (run gen-ids.py before building).
+  // Format: { "<card_type>": { "<key>": <definition_id>, ... }, ... }
+  let id_root: Value = serde_json::from_str(CARD_IDS_JSON)
+    .map_err(|e| format!("cards/id.json: parse failed: {}", e))?;
+  let id_obj = id_root
+    .as_object()
+    .ok_or_else(|| "cards/id.json: top-level not an object".to_string())?;
+  let mut definition_ids: BTreeMap<String, BTreeMap<String, BTreeMap<String, u8>>> = BTreeMap::new();
+  for (type_name, type_val) in id_obj {
+    let type_obj = type_val
+      .as_object()
+      .ok_or_else(|| format!("cards/id.json: entry for type {:?} not an object", type_name))?;
+    for (category_name, cat_val) in type_obj {
+      let cat_obj = cat_val
+        .as_object()
+        .ok_or_else(|| format!("cards/id.json: entry for {:?}/{:?} not an object", type_name, category_name))?;
+      let mut inner: BTreeMap<String, u8> = BTreeMap::new();
+      for (key, val) in cat_obj {
+        let n = val.as_u64().ok_or_else(|| {
+          format!("cards/id.json: definition_id for {:?}/{:?}/{:?} not an integer", type_name, category_name, key)
+        })?;
+        if n == 0 || n > u8::MAX as u64 {
+          return Err(format!(
+            "cards/id.json: definition_id {} for {:?}/{:?}/{:?} out of range (1–255)",
+            n, type_name, category_name, key
+          ));
+        }
+        inner.insert(key.clone(), n as u8);
+      }
+      definition_ids
+        .entry(type_name.clone())
+        .or_default()
+        .insert(category_name.clone(), inner);
+    }
+  }
+
   let mut by_packed: BTreeMap<u16, CardDefinition> = BTreeMap::new();
   let mut by_path: BTreeMap<(u8, u8, String), u16> = BTreeMap::new();
+  let mut by_key: BTreeMap<String, u16> = BTreeMap::new();
 
   for (filename, content) in CARDS_FILES {
     let buckets: Value = serde_json::from_str(content)
@@ -291,28 +339,28 @@ fn build_cards() -> Result<CardRegistry, String> {
         )
       })?;
 
-      for (idx, (key, value)) in cards_obj.iter().enumerate() {
-        // 1-indexed; 0 reserved as sentinel.
-        let definition_id_idx = idx + 1;
-        if definition_id_idx > u8::MAX as usize {
-          return Err(format!(
-            "{}: bucket {}/{}: more than {} cards (definition_id overflow)",
-            filename,
-            type_name,
-            category_name,
-            u8::MAX,
-          ));
-        }
-        let definition_id = definition_id_idx as u8;
+      for (key, value) in cards_obj.iter() {
+        let definition_id = definition_ids
+          .get(type_name)
+          .and_then(|m| m.get(category_name))
+          .and_then(|m| m.get(key.as_str()))
+          .copied()
+          .ok_or_else(|| {
+            format!(
+              "{}: card {:?} ({:?}/{:?}) not found in cards/id.json — run gen-ids.py",
+              filename, key, type_name, category_name
+            )
+          })?;
         let definition = parse_card(filename, value, card_type, card_category, definition_id, key)?;
         let packed = pack_definition(card_type, card_category, definition_id);
         by_packed.insert(packed, definition);
         by_path.insert((card_type, card_category, key.clone()), packed);
+        by_key.insert(key.clone(), packed);
       }
     }
   }
 
-  Ok(CardRegistry { by_packed, by_path, type_ids, category_ids })
+  Ok(CardRegistry { by_packed, by_path, by_key, type_ids, category_ids })
 }
 
 /// Build a `name → id` map from a section of `card_types.json`.
@@ -459,6 +507,475 @@ fn is_valid_hex_color(s: &str) -> bool {
     return false;
   }
   bytes[1..].iter().all(|&b| b.is_ascii_hexdigit())
+}
+
+// ---------- Recipes ----------
+
+/// A condition tree against a card. Used both to validate slot fillers
+/// (where the tree is matched against a candidate card) and to drive
+/// product generation (where `WeightedOr` selects between two outputs).
+///
+/// JSON grammar:
+/// - `"corpus"` → `Card("corpus")`
+/// - `["aspect", N]` → `Aspect(aspect_id("aspect"), N)`
+/// - `[E]` → just `E` (degenerate one-element array, common in slot
+///   wrapping)
+/// - `[E1, E2]` → `And(E1, E2)`
+/// - `[E1, [], E2]` → `Or(E1, E2)`
+/// - `[E1, [Wa, Wb], E2]` → `WeightedOr(E1, E2, Wa, Wb)` (intended for
+///   products; treated as a non-weighted `Or` if used inside a slot match)
+#[derive(Debug, Clone)]
+pub enum Entity {
+  Card(String),
+  Aspect(AspectId, i32),
+  And(Box<Entity>, Box<Entity>),
+  Or(Box<Entity>, Box<Entity>),
+  WeightedOr {
+    a: Box<Entity>,
+    b: Box<Entity>,
+    weight_a: u32,
+    weight_b: u32,
+  },
+}
+
+/// Determines what shape of trigger fires the recipe.
+///
+/// - `TopStack` / `BottomStack` — fired when the client submits a stack
+///   via `submit_inventory_stacks`; the server tries to fit the slots
+///   along the relevant branch.
+/// - `OnCreate` — fired when a card is inserted via `insert_card_row`;
+///   the new card itself is checked against the recipe's `root` entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipeType {
+  TopStack,
+  BottomStack,
+  OnCreate,
+}
+
+/// Where products from a completed action go. Resolved at completion time.
+///
+/// - `RootPanel` — owner of the chain root's inventory.
+/// - `ActorPanel` — owner of the actor card's inventory.
+///
+/// More targets (e.g. `ActorWorld`, `RootWorld`) belong here when world
+/// cards land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductTarget {
+  RootPanel,
+  ActorPanel,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProductGroup {
+  pub target: ProductTarget,
+  /// Each entity in this list produces one output card on completion.
+  /// `WeightedOr` entities pick one alternative at random.
+  pub entities: Vec<Entity>,
+}
+
+/// Recipe duration. Either fixed seconds or a list of `(seconds,
+/// condition)` cases evaluated against an aspect pool, with a fallback at
+/// the tail.
+#[derive(Debug, Clone)]
+pub enum Duration {
+  Fixed(u32),
+  Conditional {
+    cases: Vec<(u32, Entity)>,
+    fallback: u32,
+  },
+}
+
+#[derive(Debug, Clone)]
+pub struct RecipeDef {
+  /// Stable ID from `recipes/id.json`. Stored in `Action.recipe` on the
+  /// wire and never reassigned — safe across recipe additions and reorders.
+  pub index: u32,
+  /// Human-readable id from JSON, e.g. `"woodcutting"`.
+  pub id: String,
+  pub recipe_type: RecipeType,
+  /// For `OnCreate`: the actor card must satisfy this entity. For stack
+  /// types this is `None` unless the recipe wants to constrain the chain
+  /// root separately from the slot list.
+  pub root: Option<Entity>,
+  /// Slot list. Slot 1 is the actor; slots 2.. fill in chain order from
+  /// the actor outward along the recipe's branch. Empty for `OnCreate`.
+  pub slots: Vec<Entity>,
+  /// 1-indexed slot positions consumed on completion. `0` means "the
+  /// chain root", which is only meaningful when `root` is `Some`.
+  pub reagents: Vec<u8>,
+  pub products: Vec<ProductGroup>,
+  pub duration: Duration,
+}
+
+const RECIPES_FILES: &[(&str, &str)] = &[
+  ("recipes/01.json", include_str!("../data/recipes/01.json")),
+];
+const RECIPE_IDS_JSON: &str = include_str!("../data/recipes/id.json");
+
+struct RecipeRegistry {
+  /// Stable ID → recipe definition.
+  by_id: BTreeMap<u32, RecipeDef>,
+  /// Human-readable name → stable ID.
+  id_by_name: BTreeMap<String, u32>,
+  /// `RecipeType` (encoded as u8) → stable IDs in declaration order.
+  by_type: BTreeMap<u8, Vec<u32>>,
+}
+
+static RECIPES: OnceLock<Result<RecipeRegistry, String>> = OnceLock::new();
+
+fn recipes_registry() -> Result<&'static RecipeRegistry, String> {
+  RECIPES.get_or_init(build_recipes).as_ref().map_err(|e| e.clone())
+}
+
+/// Look up a recipe by its stable ID (what `Action.recipe` stores).
+/// Returns `Ok(None)` if no recipe with that ID is registered.
+pub fn recipe(index: u32) -> Result<Option<&'static RecipeDef>, String> {
+  Ok(recipes_registry()?.by_id.get(&index))
+}
+
+/// Look up a recipe by its human-readable id. `Ok(None)` if unknown.
+pub fn find_recipe(id: &str) -> Result<Option<&'static RecipeDef>, String> {
+  let registry = recipes_registry()?;
+  let Some(&stable_id) = registry.id_by_name.get(id) else {
+    return Ok(None);
+  };
+  Ok(registry.by_id.get(&stable_id))
+}
+
+/// All recipes of a given type, in declaration order.
+pub fn recipes_of_type(rt: RecipeType) -> Result<Vec<&'static RecipeDef>, String> {
+  let registry = recipes_registry()?;
+  let key = recipe_type_key(rt);
+  let Some(ids) = registry.by_type.get(&key) else {
+    return Ok(Vec::new());
+  };
+  Ok(ids.iter().filter_map(|id| registry.by_id.get(id)).collect())
+}
+
+fn recipe_type_key(rt: RecipeType) -> u8 {
+  match rt {
+    RecipeType::TopStack => 0,
+    RecipeType::BottomStack => 1,
+    RecipeType::OnCreate => 2,
+  }
+}
+
+fn build_recipes() -> Result<RecipeRegistry, String> {
+  // Load stable ID map — must exist (run gen-ids.py before building).
+  let ids_root: Value = serde_json::from_str(RECIPE_IDS_JSON)
+    .map_err(|e| format!("recipes/id.json: parse failed: {}", e))?;
+  let ids_obj = ids_root
+    .as_object()
+    .ok_or_else(|| "recipes/id.json: top-level not an object".to_string())?;
+  let stable_ids: BTreeMap<String, u32> = ids_obj
+    .iter()
+    .map(|(name, val)| {
+      let id = val
+        .as_u64()
+        .ok_or_else(|| format!("recipes/id.json: value for {:?} not an integer", name))?;
+      Ok((name.clone(), id as u32))
+    })
+    .collect::<Result<_, String>>()?;
+
+  let mut by_id: BTreeMap<u32, RecipeDef> = BTreeMap::new();
+  let mut id_by_name: BTreeMap<String, u32> = BTreeMap::new();
+  let mut by_type: BTreeMap<u8, Vec<u32>> = BTreeMap::new();
+
+  for (filename, content) in RECIPES_FILES {
+    let recipes_value: Value = serde_json::from_str(content)
+      .map_err(|e| format!("{}: parse failed: {}", filename, e))?;
+    let recipes_arr = recipes_value
+      .as_array()
+      .ok_or_else(|| format!("{}: top-level not an array", filename))?;
+
+    for recipe_value in recipes_arr {
+      let id = recipe_value["id"]
+        .as_str()
+        .ok_or_else(|| format!("{}: recipe missing 'id'", filename))?
+        .to_string();
+
+      let stable_id = stable_ids.get(&id).copied().ok_or_else(|| {
+        format!(
+          "{}: recipe {:?} not found in recipes/id.json — run gen-ids.py",
+          filename, id
+        )
+      })?;
+
+      if id_by_name.contains_key(&id) {
+        return Err(format!(
+          "{}: recipe id {:?} declared more than once",
+          filename, id
+        ));
+      }
+
+      let recipe_type = match recipe_value["type"].as_str() {
+        Some("top_stack") => RecipeType::TopStack,
+        Some("bottom_stack") => RecipeType::BottomStack,
+        Some("on_create") => RecipeType::OnCreate,
+        Some(other) => {
+          return Err(format!(
+            "{}: recipe {:?} unknown type {:?}",
+            filename, id, other
+          ));
+        }
+        None => {
+          return Err(format!("{}: recipe {:?} missing 'type'", filename, id));
+        }
+      };
+
+      let root = if recipe_value.get("root").is_some() {
+        Some(parse_entity(&recipe_value["root"], filename, &id, "root")?)
+      } else {
+        None
+      };
+
+      let slots = if let Some(slots_arr) = recipe_value.get("slots").and_then(Value::as_array) {
+        slots_arr
+          .iter()
+          .enumerate()
+          .map(|(i, v)| parse_entity(v, filename, &id, &format!("slots[{}]", i)))
+          .collect::<Result<Vec<_>, _>>()?
+      } else {
+        Vec::new()
+      };
+
+      let reagents = if let Some(arr) = recipe_value.get("reagents").and_then(Value::as_array) {
+        arr
+          .iter()
+          .map(|v| {
+            let n = v.as_u64().ok_or_else(|| {
+              format!("{}: recipe {:?} reagents has non-integer entry: {:?}", filename, id, v)
+            })?;
+            if n > u8::MAX as u64 {
+              return Err(format!(
+                "{}: recipe {:?} reagent index {} exceeds u8 max",
+                filename, id, n
+              ));
+            }
+            Ok(n as u8)
+          })
+          .collect::<Result<Vec<_>, _>>()?
+      } else {
+        Vec::new()
+      };
+
+      let products = if let Some(products_obj) = recipe_value
+        .get("products")
+        .and_then(Value::as_object)
+      {
+        let mut groups: Vec<ProductGroup> = Vec::new();
+        for (target_name, target_value) in products_obj {
+          let target = match target_name.as_str() {
+            "root_panel" => ProductTarget::RootPanel,
+            "actor_panel" => ProductTarget::ActorPanel,
+            other => {
+              return Err(format!(
+                "{}: recipe {:?} unknown product target {:?}",
+                filename, id, other
+              ));
+            }
+          };
+          let entities_arr = target_value.as_array().ok_or_else(|| {
+            format!(
+              "{}: recipe {:?} products[{}] not an array",
+              filename, id, target_name
+            )
+          })?;
+          let entities = entities_arr
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+              parse_entity(v, filename, &id, &format!("products[{}][{}]", target_name, i))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+          groups.push(ProductGroup { target, entities });
+        }
+        groups
+      } else {
+        Vec::new()
+      };
+
+      let duration = parse_duration(&recipe_value["duration"], filename, &id)?;
+
+      let def = RecipeDef {
+        index: stable_id,
+        id: id.clone(),
+        recipe_type,
+        root,
+        slots,
+        reagents,
+        products,
+        duration,
+      };
+      by_type
+        .entry(recipe_type_key(recipe_type))
+        .or_default()
+        .push(stable_id);
+      id_by_name.insert(id, stable_id);
+      by_id.insert(stable_id, def);
+    }
+  }
+
+  Ok(RecipeRegistry { by_id, id_by_name, by_type })
+}
+
+fn parse_entity(
+  value: &Value,
+  filename: &str,
+  recipe_id: &str,
+  path: &str,
+) -> Result<Entity, String> {
+  if let Some(s) = value.as_str() {
+    return Ok(Entity::Card(s.to_string()));
+  }
+  let arr = value.as_array().ok_or_else(|| {
+    format!(
+      "{}: recipe {:?} {}: entity not a string or array: {:?}",
+      filename, recipe_id, path, value
+    )
+  })?;
+  match arr.len() {
+    1 => parse_entity(&arr[0], filename, recipe_id, path),
+    2 => {
+      // Disambiguate `[string, number]` (aspect check) from
+      // `[entity, entity]` (AND). Numbers aren't valid entities, so a
+      // numeric second element pins it to the aspect form.
+      if let (Some(s), Some(n)) = (arr[0].as_str(), arr[1].as_i64()) {
+        let id = aspect_id(s)?.ok_or_else(|| {
+          format!(
+            "{}: recipe {:?} {}: unknown aspect {:?} (not declared in aspects.json)",
+            filename, recipe_id, path, s
+          )
+        })?;
+        Ok(Entity::Aspect(id, n as i32))
+      } else {
+        let a = parse_entity(&arr[0], filename, recipe_id, &format!("{}[0]", path))?;
+        let b = parse_entity(&arr[1], filename, recipe_id, &format!("{}[1]", path))?;
+        Ok(Entity::And(Box::new(a), Box::new(b)))
+      }
+    }
+    3 => {
+      let middle = &arr[1];
+      let a = parse_entity(&arr[0], filename, recipe_id, &format!("{}[0]", path))?;
+      let b = parse_entity(&arr[2], filename, recipe_id, &format!("{}[2]", path))?;
+      let middle_arr = middle.as_array().ok_or_else(|| {
+        format!(
+          "{}: recipe {:?} {}: 3-tuple middle not an array: {:?}",
+          filename, recipe_id, path, middle
+        )
+      })?;
+      if middle_arr.is_empty() {
+        Ok(Entity::Or(Box::new(a), Box::new(b)))
+      } else if middle_arr.len() == 2 {
+        let weight_a = middle_arr[0].as_u64().ok_or_else(|| {
+          format!(
+            "{}: recipe {:?} {}: weight[0] not a non-negative integer: {:?}",
+            filename, recipe_id, path, middle_arr[0]
+          )
+        })? as u32;
+        let weight_b = middle_arr[1].as_u64().ok_or_else(|| {
+          format!(
+            "{}: recipe {:?} {}: weight[1] not a non-negative integer: {:?}",
+            filename, recipe_id, path, middle_arr[1]
+          )
+        })? as u32;
+        Ok(Entity::WeightedOr {
+          a: Box::new(a),
+          b: Box::new(b),
+          weight_a,
+          weight_b,
+        })
+      } else {
+        Err(format!(
+          "{}: recipe {:?} {}: 3-tuple middle has {} elements, expected 0 (Or) or 2 (WeightedOr)",
+          filename,
+          recipe_id,
+          path,
+          middle_arr.len()
+        ))
+      }
+    }
+    _ => Err(format!(
+      "{}: recipe {:?} {}: entity array of length {} not supported",
+      filename,
+      recipe_id,
+      path,
+      arr.len()
+    )),
+  }
+}
+
+fn parse_duration(
+  value: &Value,
+  filename: &str,
+  recipe_id: &str,
+) -> Result<Duration, String> {
+  // Fixed: bare number.
+  if let Some(n) = value.as_u64() {
+    return Ok(Duration::Fixed(n as u32));
+  }
+
+  // Conditional: array of `[seconds, condition]` cases plus a trailing
+  // bare-number fallback.
+  let arr = value.as_array().ok_or_else(|| {
+    format!(
+      "{}: recipe {:?} duration not a number or array: {:?}",
+      filename, recipe_id, value
+    )
+  })?;
+
+  if arr.is_empty() {
+    return Err(format!(
+      "{}: recipe {:?} duration is an empty array",
+      filename, recipe_id
+    ));
+  }
+
+  let mut cases: Vec<(u32, Entity)> = Vec::new();
+  let mut fallback: Option<u32> = None;
+
+  for (i, entry) in arr.iter().enumerate() {
+    if let Some(n) = entry.as_u64() {
+      if i != arr.len() - 1 {
+        return Err(format!(
+          "{}: recipe {:?} duration[{}] is a bare number; only the trailing entry can be the fallback",
+          filename, recipe_id, i
+        ));
+      }
+      fallback = Some(n as u32);
+      continue;
+    }
+
+    let case = entry.as_array().ok_or_else(|| {
+      format!(
+        "{}: recipe {:?} duration[{}] not a number or [seconds, condition]: {:?}",
+        filename, recipe_id, i, entry
+      )
+    })?;
+    if case.len() != 2 {
+      return Err(format!(
+        "{}: recipe {:?} duration[{}] not a 2-element [seconds, condition]",
+        filename, recipe_id, i
+      ));
+    }
+    let secs = case[0].as_u64().ok_or_else(|| {
+      format!(
+        "{}: recipe {:?} duration[{}][0] not a non-negative integer: {:?}",
+        filename, recipe_id, i, case[0]
+      )
+    })? as u32;
+    let cond = parse_entity(&case[1], filename, recipe_id, &format!("duration[{}][1]", i))?;
+    cases.push((secs, cond));
+  }
+
+  let fallback = fallback.ok_or_else(|| {
+    format!(
+      "{}: recipe {:?} duration: no trailing fallback (last entry must be a bare number)",
+      filename, recipe_id
+    )
+  })?;
+
+  Ok(Duration::Conditional { cases, fallback })
 }
 
 #[cfg(test)]

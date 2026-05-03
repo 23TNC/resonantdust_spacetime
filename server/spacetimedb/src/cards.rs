@@ -1,6 +1,7 @@
 use spacetimedb::{reducer, ReducerContext, SpacetimeType, Table};
 use std::collections::BTreeSet;
 
+use crate::actions;
 use crate::players;
 // Brings the `players` table-accessor trait into scope so `ctx.db.players()`
 // resolves here. `as _` because the trait shares its name with the module
@@ -26,12 +27,17 @@ pub struct Card {
   /// also hold packed `(zone_q:i16, zone_r:i16)` axial coords.
   #[index(btree)]
   pub macro_zone: u32,
-  /// World cards: in-zone hex coords `[local_q:u3][local_r:u3][reserved:u2]`.
-  /// Inventory cards: held at 0; layout is client-side.
+  /// World cards: `[local_q:u3][local_r:u3][stack_state:u2]` — in-zone hex
+  /// coords plus the card's role in its stack (bits 1..0). The
+  /// authoritative stack_state lives here so other cards in the stack can
+  /// resolve their parent via `micro_location`. Inventory cards: held at 0;
+  /// layout is client-side and the server doesn't track stack_state at
+  /// layer 1.
   pub micro_zone: u8,
-  /// World cards: variant per `stack_state` in `flags` — either a parent
-  /// `card_id` (for stacked cards) or packed `(i16 x, i16 y)` pixel coords
-  /// (for loose cards). Inventory cards: held at 0; layout is client-side.
+  /// World cards: variant per `micro_zone`'s `stack_state` — either a
+  /// parent `card_id` (for stacked cards) or packed `(i16 x, i16 y)` pixel
+  /// coords (for loose cards). Inventory cards: held at 0; layout is
+  /// client-side.
   pub micro_location: u32,
   /// Player who owns this card. Not necessarily the player whose inventory
   /// the card sits in (`macro_zone`) — that's how a card can be stashed in
@@ -40,12 +46,6 @@ pub struct Card {
   pub owner_id: u32,
   /// `[card_type:u4][card_category:u4][definition_id:u8]`
   pub packed_definition: u16,
-  /// `[stack_state:u2][reserved:u6]` (bits 7..6 stack_state, bits 5..0
-  /// reserved). World cards carry the authoritative stack_state so other
-  /// cards in the stack can resolve their parent via `micro_location`.
-  /// Inventory cards: held at 0; the server does not track stack_state at
-  /// layer 1.
-  pub flags: u8,
 }
 
 // ---------- Card creation ----------
@@ -58,11 +58,16 @@ pub struct Card {
 /// Validates that the layer is supported, that the `owner_id` resolves to
 /// an existing `Player`, and that for inventory cards the `macro_zone`
 /// (the inventory holder) does too. `card_id` is auto-assigned; callers
-/// don't pass one in. `micro_zone`, `micro_location`, and `flags` are
-/// zeroed — the inventory layer doesn't track them, and no other
-/// layer-specific code path exists yet. When world card creation lands
-/// it'll need its own helper (or a layer-aware extension here) that takes
-/// those values.
+/// don't pass one in. `micro_zone` and `micro_location` are zeroed — the
+/// inventory layer doesn't track them, and no other layer-specific code
+/// path exists yet. When world card creation lands it'll need its own
+/// helper (or a layer-aware extension here) that takes those values.
+///
+/// After insertion, runs the on_create recipe matcher against the new
+/// card. Any matching `OnCreate` recipe starts an action immediately.
+/// This is also how completion-chains-into-another-recipe works: when a
+/// completing action's product passes through here, the new card gets
+/// its own on_create check for free.
 pub fn insert_card_row(
   ctx: &ReducerContext,
   layer: u8,
@@ -89,7 +94,7 @@ pub fn insert_card_row(
     _ => return Err(format!("unsupported layer {}", layer)),
   }
 
-  Ok(ctx.db.cards().insert(Card {
+  let inserted = ctx.db.cards().insert(Card {
     card_id: 0,
     layer,
     macro_zone,
@@ -97,8 +102,13 @@ pub fn insert_card_row(
     micro_location: 0,
     owner_id,
     packed_definition,
-    flags: 0,
-  }))
+  });
+  // Trigger on_create recipe matching for the freshly-created card.
+  // Errors propagate (registry-build failures, card lookup failures);
+  // a clean "no recipe matched" result returns Ok(None) and we don't
+  // care about the action_id.
+  actions::try_start_on_create_action(ctx, inserted.card_id)?;
+  Ok(inserted)
 }
 
 // ---------- Inventory stack submission ----------
@@ -121,12 +131,22 @@ pub struct InventoryStack {
   pub stack_down: Vec<u32>,
 }
 
-/// Client-driven inventory stack submission. The server validates that every
-/// card_id in every submitted stack lives in the caller's inventory.
+/// Client-driven inventory stack submission. The server validates every
+/// card_id in every submitted stack belongs to the caller's inventory,
+/// then orchestrates the action machinery:
 ///
-/// Future work: cancel actions whose card-set is broken by the new stack
-/// composition; trigger new actions for stacks matching a recipe. Both depend
-/// on tables that don't exist yet.
+/// 1. **Cancel.** Every action holding any submitted card is cancelled
+///    via [`actions::cancel_actions_for_cards`]. This is strict: a no-op
+///    submission of a stack whose composition didn't actually change
+///    will still cancel any running action on it. Switch to lenient
+///    matcher-replay if/when timer-reset becomes a UX problem.
+/// 2. **Top-stack match.** For each submitted stack, build the up-chain
+///    `[root, stack_up[0], …]` and try to start a matching `TopStack`
+///    recipe via [`actions::try_start_top_stack_action`].
+/// 3. **Bottom-stack match.** Same shape for `[root, stack_down[0], …]`
+///    via [`actions::try_start_bottom_stack_action`].
+///
+/// `OnCreate` triggers fire from [`insert_card_row`], not from here.
 #[reducer]
 pub fn submit_inventory_stacks(
   ctx: &ReducerContext,
@@ -195,6 +215,29 @@ pub fn submit_inventory_stacks(
         ));
       }
     }
+  }
+
+  // ─── Action orchestration ──────────────────────────────────────────
+  // Validation passed. Cancel disturbed actions, then run the matcher
+  // on each submitted stack.
+
+  // `seen` is the deduped set of every submitted card_id. Cancel any
+  // action holding any of them.
+  let touched: Vec<u32> = seen.iter().copied().collect();
+  actions::cancel_actions_for_cards(ctx, &touched);
+
+  for stack in &stacks {
+    // Top branch chain: [root, stack_up[0], stack_up[1], …]
+    let mut top_chain: Vec<u32> = Vec::with_capacity(1 + stack.stack_up.len());
+    top_chain.push(stack.root);
+    top_chain.extend(stack.stack_up.iter().copied());
+    actions::try_start_top_stack_action(ctx, &top_chain, player_id)?;
+
+    // Bottom branch chain: [root, stack_down[0], stack_down[1], …]
+    let mut bottom_chain: Vec<u32> = Vec::with_capacity(1 + stack.stack_down.len());
+    bottom_chain.push(stack.root);
+    bottom_chain.extend(stack.stack_down.iter().copied());
+    actions::try_start_bottom_stack_action(ctx, &bottom_chain, player_id)?;
   }
 
   Ok(())
