@@ -209,23 +209,100 @@ fn card_def_for(card: &Card) -> Result<Option<&'static CardDefinition>, String> 
   definitions::decode_definition(card.packed_definition)
 }
 
-/// Does `entity` match the given card definition?
+// Per-leaf match weights (used by `entity_match_weight`). Higher = more
+// specific. Tiers:
+//
+//   Card (exact key)        : 4
+//   Aspect (named, ≥ value) : 3
+//   Type (card_type)        : 2
+//   Any (wildcard)          : 1
+//
+// A composite's weight is built up from its children:
+//
+//   And(A, B) — both must match; weight = weight(A) + weight(B)
+//   Or(A, B) | WeightedOr   — weight of whichever branch satisfied
+//
+// For a non-match the weight is 0 (treated as "didn't match" by callers
+// that only care about a yes/no answer).
+const ENTITY_WEIGHT_CARD: u32 = 4;
+const ENTITY_WEIGHT_ASPECT: u32 = 3;
+const ENTITY_WEIGHT_TYPE: u32 = 2;
+const ENTITY_WEIGHT_ANY: u32 = 1;
+
+/// Score how specifically `entity` matches `card_def`. `0` means no match;
+/// any positive value indicates a match, with higher = more specific. See
+/// the constants above for the per-leaf weight scale.
 ///
-/// `Card` and `Aspect` are leaf checks. `And` / `Or` recurse. `WeightedOr`
-/// is a product-side construct, but we treat it as a non-weighted `Or`
-/// for slot-matching pragmatics — a slot using `WeightedOr` accepts
-/// either alternative, the weights only matter when generating outputs.
-fn entity_matches(entity: &Entity, card_def: &CardDefinition) -> bool {
+/// Used both for "does this fit?" yes/no checks (caller compares `> 0`)
+/// and for the priority weighting that picks the best recipe across a
+/// stack (caller sums slot weights, plus tile/root tier weights).
+fn entity_match_weight(entity: &Entity, card_def: &CardDefinition) -> u32 {
   match entity {
-    Entity::Card(name) => card_def.key == *name,
-    Entity::Aspect(aspect_id, min) => card_def
-      .aspects
-      .iter()
-      .any(|(aid, value)| aid == aspect_id && value >= min),
-    Entity::And(a, b) => entity_matches(a, card_def) && entity_matches(b, card_def),
-    Entity::Or(a, b) => entity_matches(a, card_def) || entity_matches(b, card_def),
-    Entity::WeightedOr { a, b, .. } => entity_matches(a, card_def) || entity_matches(b, card_def),
+    Entity::Card(name) => {
+      if card_def.key == *name {
+        ENTITY_WEIGHT_CARD
+      } else {
+        0
+      }
+    }
+    Entity::Aspect(aspect_id, min) => {
+      let matches = card_def
+        .aspects
+        .iter()
+        .any(|(aid, value)| aid == aspect_id && value >= min);
+      if matches {
+        ENTITY_WEIGHT_ASPECT
+      } else {
+        0
+      }
+    }
+    Entity::Type(type_id) => {
+      if card_def.card_type == *type_id {
+        ENTITY_WEIGHT_TYPE
+      } else {
+        0
+      }
+    }
+    Entity::Any => ENTITY_WEIGHT_ANY,
+    Entity::And(a, b) => {
+      let wa = entity_match_weight(a, card_def);
+      let wb = entity_match_weight(b, card_def);
+      // AND requires both children to match. Sum gives a slot using
+      // `[corpus, ["labor", 1]]` (key + aspect, both required) a
+      // weight of 4 + 3 = 7 — strictly more than either alone.
+      if wa > 0 && wb > 0 {
+        wa + wb
+      } else {
+        0
+      }
+    }
+    Entity::Or(a, b) => {
+      // Take the weight of whichever branch satisfied (first if both).
+      let wa = entity_match_weight(a, card_def);
+      if wa > 0 {
+        wa
+      } else {
+        entity_match_weight(b, card_def)
+      }
+    }
+    Entity::WeightedOr { a, b, .. } => {
+      // For slot-side use the weight of the satisfying branch — same
+      // shape as `Or`. The weights inside `WeightedOr` are for product
+      // selection at completion, not for slot specificity here.
+      let wa = entity_match_weight(a, card_def);
+      if wa > 0 {
+        wa
+      } else {
+        entity_match_weight(b, card_def)
+      }
+    }
   }
+}
+
+/// Thin boolean wrapper over `entity_match_weight` for callers that don't
+/// care about specificity.
+fn entity_matches(entity: &Entity, card_def: &CardDefinition) -> bool {
+  entity_match_weight(entity, card_def) > 0
 }
 
 /// Resolve a recipe's `Duration` against an aspect pool — used both at
@@ -247,11 +324,13 @@ fn resolve_duration(duration: &RecipeDuration, aspect_pool: &BTreeMap<AspectId, 
 }
 
 /// Whether the aspect pool satisfies a condition entity. Used by
-/// `resolve_duration`. `Card` entities don't apply to a pool of aspects
-/// — they're treated as not satisfied.
+/// `resolve_duration`. `Card` and `Type` entities are card-shape checks
+/// that don't apply to a pool of aspects — treated as not satisfied.
+/// `Any` always satisfies (the trivial condition).
 fn pool_satisfies(entity: &Entity, pool: &BTreeMap<AspectId, i32>) -> bool {
   match entity {
-    Entity::Card(_) => false,
+    Entity::Card(_) | Entity::Type(_) => false,
+    Entity::Any => true,
     Entity::Aspect(aspect_id, min) => pool.get(aspect_id).map_or(false, |v| v >= min),
     Entity::And(a, b) => pool_satisfies(a, pool) && pool_satisfies(b, pool),
     Entity::Or(a, b) | Entity::WeightedOr { a, b, .. } => {
@@ -274,6 +353,26 @@ fn aspect_pool(defs: &[&CardDefinition]) -> BTreeMap<AspectId, i32> {
 
 // ─── Stack matching ──────────────────────────────────────────────────────────
 
+/// Lexicographically-compared priority for a successful recipe match.
+///
+/// Field order **is** the comparison order: `tile_weight` outranks
+/// `root_weight` outranks `slot_weight`. Within a tier, the value is the
+/// `entity_match_weight` of how that condition was satisfied — so
+/// `tile: "forest"` (Card → 4) outranks `tile: ["wood", 1]` (Aspect → 3)
+/// in the tile tier without ever consulting root or slots.
+///
+/// Recipes with no `tile` field score `tile_weight = 0`; same for `root`.
+/// `slot_weight` is the sum of per-slot weights, so a recipe with N
+/// card-key slots scores 4N — but no number of slot weights can defeat a
+/// recipe whose tile/root tier is non-zero, because comparison stops at
+/// the first non-equal tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+struct MatchWeight {
+  tile_weight: u32,
+  root_weight: u32,
+  slot_weight: u32,
+}
+
 /// Outcome of fitting a recipe to a stack. Carries everything needed to
 /// start the action.
 struct MatchResult {
@@ -287,14 +386,20 @@ struct MatchResult {
   claimed: Vec<u32>,
   /// Aspect pool for duration resolution.
   pool: BTreeMap<AspectId, i32>,
+  /// Lexicographic priority weight of this match. Used to pick the best
+  /// match across recipes (and across actor positions within a recipe).
+  weight: MatchWeight,
 }
 
 /// Attempt to fit `recipe` against a chain of cards. The chain is
 /// `[root, branch[0], branch[1], …]` for stack recipes. `recipe.slots` is
 /// 1-indexed; slot 1 is the actor. The matcher slides the actor's
 /// position along the chain (starting at chain[1] for rooted recipes,
-/// chain[0] otherwise) and accepts the first position where every slot
-/// fills against the next-N cards.
+/// chain[0] otherwise), evaluates every position where the slot window
+/// fits, and returns the **highest-weight** match — slots may match more
+/// or less specifically at different positions (e.g. an `Or` slot
+/// satisfied by a Card-key match at one position vs. an Aspect at
+/// another), so we pick the best.
 fn try_match_stack(
   recipe: &RecipeDef,
   chain: &[Card],
@@ -309,17 +414,35 @@ fn try_match_stack(
   // at chain[1]+. Otherwise the actor can sit at chain[0]+.
   let min_actor_pos = if recipe.root.is_some() { 1 } else { 0 };
 
-  if let Some(root_entity) = &recipe.root {
+  // Root tier weight — constant across actor positions because the
+  // chain root is always `chain[0]` regardless of where the actor sits.
+  // For recipes without `root`, contributes 0.
+  let root_weight = if let Some(root_entity) = &recipe.root {
     let root_def = defs.first().and_then(|d| *d)?;
-    if !entity_matches(root_entity, root_def) {
+    let w = entity_match_weight(root_entity, root_def);
+    if w == 0 {
       return None;
     }
-  }
+    w
+  } else {
+    0
+  };
 
+  // Tile tier weight — top of the priority hierarchy. Forward-looking:
+  // resolution requires knowing which hex tile a stack sits on, which
+  // depends on world-layer card data we don't have wired up yet. Until
+  // that lands, a recipe with `tile` set still parses, but the matcher
+  // scores `tile_weight = 0` and the field has no effect on priority.
+  // TODO: when world cards exist, look up the tile card's def for the
+  // chain's `(layer, macro_zone)` and call `entity_match_weight` on it.
+  let tile_weight = 0;
+
+  let mut best: Option<MatchResult> = None;
   for actor_pos in min_actor_pos..chain.len() {
     if actor_pos + recipe.slots.len() > chain.len() {
       break;
     }
+    let mut slot_weight: u32 = 0;
     let mut all_match = true;
     for (slot_idx, slot_entity) in recipe.slots.iter().enumerate() {
       let chain_idx = actor_pos + slot_idx;
@@ -327,10 +450,12 @@ fn try_match_stack(
         all_match = false;
         break;
       };
-      if !entity_matches(slot_entity, def) {
+      let w = entity_match_weight(slot_entity, def);
+      if w == 0 {
         all_match = false;
         break;
       }
+      slot_weight += w;
     }
     if !all_match {
       continue;
@@ -360,14 +485,25 @@ fn try_match_stack(
       .collect();
     let pool = aspect_pool(&claim_defs);
 
-    return Some(MatchResult {
+    let weight = MatchWeight {
+      tile_weight,
+      root_weight,
+      slot_weight,
+    };
+    let candidate = MatchResult {
       actor_card_id: chain[actor_pos].card_id,
       actor_pos,
       claimed,
       pool,
-    });
+      weight,
+    };
+    match best.as_ref() {
+      None => best = Some(candidate),
+      Some(b) if weight > b.weight => best = Some(candidate),
+      _ => {}
+    }
   }
-  None
+  best
 }
 
 /// Build a chain of `Card` rows from card_ids. Returns `Err` if any
@@ -394,9 +530,10 @@ fn decode_chain(chain: &[Card]) -> Result<Vec<Option<&'static CardDefinition>>, 
 
 // ─── Public entry points ─────────────────────────────────────────────────────
 
-/// Try to start a `TopStack` action against this stack. Iterates the
-/// registered top-stack recipes in registry-declaration order; first
-/// match wins.
+/// Try to start a `TopStack` action against this stack. Considers every
+/// registered top-stack recipe and picks the **highest-weight** match
+/// (lex-ordered `tile > root > slots`). Within ties, declaration order
+/// in the recipe registry breaks the tie.
 ///
 /// Returns `Ok(Some(action_id))` on success, `Ok(None)` if no recipe
 /// matched, `Err` on a registry-build failure or a card-resolve failure.
@@ -434,21 +571,37 @@ fn try_start_stack_action(
   let defs = decode_chain(&chain)?;
   let held = held_card_set(ctx);
 
+  // Score every matching recipe; keep the highest-weight one. Ties go
+  // to the first-encountered (registry-declaration order is the
+  // tiebreak).
+  let mut best: Option<(&'static RecipeDef, MatchResult)> = None;
   for recipe in definitions::recipes_of_type(recipe_type)? {
     let Some(result) = try_match_stack(recipe, &chain, &defs) else { continue };
     // Skip if any claimed card is already held by another action.
     if result.claimed.iter().any(|id| held.contains(id)) {
       continue;
     }
-    let action_id = start_action(ctx, recipe, &chain, &result, owner_id)?;
-    return Ok(Some(action_id));
+    let weight = result.weight;
+    match best.as_ref() {
+      None => best = Some((recipe, result)),
+      Some((_, b)) if weight > b.weight => best = Some((recipe, result)),
+      _ => {}
+    }
   }
-  Ok(None)
+  match best {
+    Some((recipe, result)) => {
+      let action_id = start_action(ctx, recipe, &chain, &result, owner_id)?;
+      Ok(Some(action_id))
+    }
+    None => Ok(None),
+  }
 }
 
-/// Try to start an `OnCreate` action for a freshly-created card. The
-/// recipe's `root` entity is matched against the card itself. First match
-/// wins.
+/// Try to start an `OnCreate` action for a freshly-created card. Picks
+/// the **highest-weight** match across `OnCreate` recipes (the new card
+/// is matched against each recipe's `root` entity, and the per-leaf
+/// match weight becomes the tier `root_weight`). Ties go to declaration
+/// order.
 pub fn try_start_on_create_action(
   ctx: &ReducerContext,
   card_id: u32,
@@ -469,9 +622,11 @@ pub fn try_start_on_create_action(
     return Ok(None);
   }
 
+  let mut best: Option<(&'static RecipeDef, MatchResult)> = None;
   for recipe in definitions::recipes_of_type(RecipeType::OnCreate)? {
     let Some(root_entity) = &recipe.root else { continue };
-    if !entity_matches(root_entity, card_def) {
+    let root_w = entity_match_weight(root_entity, card_def);
+    if root_w == 0 {
       continue;
     }
 
@@ -479,16 +634,31 @@ pub fn try_start_on_create_action(
     // claim is the card. Reagent index 0 references the root (= the
     // card); higher indices are not meaningful for OnCreate (no slots).
     let pool = aspect_pool(&[card_def]);
+    let weight = MatchWeight {
+      tile_weight: 0,
+      root_weight: root_w,
+      slot_weight: 0,
+    };
     let result = MatchResult {
       actor_card_id: card_id,
       actor_pos: 0,
       claimed: vec![card_id],
       pool,
+      weight,
     };
-    let action_id = start_action(ctx, recipe, std::slice::from_ref(&card), &result, card.owner_id)?;
-    return Ok(Some(action_id));
+    match best.as_ref() {
+      None => best = Some((recipe, result)),
+      Some((_, b)) if weight > b.weight => best = Some((recipe, result)),
+      _ => {}
+    }
   }
-  Ok(None)
+  match best {
+    Some((recipe, result)) => {
+      let action_id = start_action(ctx, recipe, std::slice::from_ref(&card), &result, card.owner_id)?;
+      Ok(Some(action_id))
+    }
+    None => Ok(None),
+  }
 }
 
 /// Cancel any actions whose claim window includes any card in
@@ -861,9 +1031,9 @@ fn generate_entity_products(
         generate_entity_products(ctx, b, dest, rng)?;
       }
     }
-    Entity::Aspect(_, _) => {
-      // An aspect check is a slot-side construct; it doesn't describe
-      // an output card. Silently skip.
+    Entity::Aspect(_, _) | Entity::Type(_) | Entity::Any => {
+      // Slot-side constructs that don't describe an output card.
+      // Silently skip — useful in slot grammars, meaningless here.
     }
   }
   Ok(())

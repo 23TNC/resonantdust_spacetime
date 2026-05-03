@@ -516,18 +516,43 @@ fn is_valid_hex_color(s: &str) -> bool {
 /// product generation (where `WeightedOr` selects between two outputs).
 ///
 /// JSON grammar:
-/// - `"corpus"` → `Card("corpus")`
-/// - `["aspect", N]` → `Aspect(aspect_id("aspect"), N)`
+/// - `"corpus"` → `Card("corpus")` — match a card with this exact key
+/// - `"any"` → `Any` — match any card (lowest specificity)
+/// - `"@discipline"` → `Type(type_id)` — match any card whose `card_type`
+///   resolves to the named type. Resolved at recipe-registry build time
+///   against `card_types.json`; an unknown type is a build error.
+/// - `["aspect", N]` → `Aspect(aspect_id("aspect"), N)` — match a card
+///   whose aspect value is ≥ N
 /// - `[E]` → just `E` (degenerate one-element array, common in slot
 ///   wrapping)
 /// - `[E1, E2]` → `And(E1, E2)`
 /// - `[E1, [], E2]` → `Or(E1, E2)`
 /// - `[E1, [Wa, Wb], E2]` → `WeightedOr(E1, E2, Wa, Wb)` (intended for
 ///   products; treated as a non-weighted `Or` if used inside a slot match)
+///
+/// # Match specificity (used by the priority weighting in `actions.rs`)
+///
+/// When an entity matches a card, the per-leaf weight (more specific →
+/// higher) is:
+///
+/// - `Card`: 4
+/// - `Aspect`: 3
+/// - `Type`: 2
+/// - `Any`: 1
+///
+/// For composite entities, `And` sums the children's weights (slot is
+/// more specific than either alone), `Or` / `WeightedOr` take the weight
+/// of whichever branch satisfied (or 0 if neither did).
 #[derive(Debug, Clone)]
 pub enum Entity {
   Card(String),
   Aspect(AspectId, i32),
+  /// Match any card whose `card_type` equals this `u8`. Resolved at
+  /// recipe-build time so the matcher doesn't need a registry lookup
+  /// per check.
+  Type(u8),
+  /// Match any card. Lowest specificity — used as a slot wildcard.
+  Any,
   And(Box<Entity>, Box<Entity>),
   Or(Box<Entity>, Box<Entity>),
   WeightedOr {
@@ -597,6 +622,12 @@ pub struct RecipeDef {
   /// types this is `None` unless the recipe wants to constrain the chain
   /// root separately from the slot list.
   pub root: Option<Entity>,
+  /// Optional condition on the hex tile under the stack. Matched against
+  /// the tile card's def (when world layer cards exist). Forward-looking:
+  /// today no recipe data sets this and the matcher always scores
+  /// `tile_weight = 0`. Top of the priority hierarchy: a satisfied
+  /// `tile` outranks any combination of `root` and `slots` weights.
+  pub tile: Option<Entity>,
   /// Slot list. Slot 1 is the actor; slots 2.. fill in chain order from
   /// the actor outward along the recipe's branch. Empty for `OnCreate`.
   pub slots: Vec<Entity>,
@@ -677,6 +708,12 @@ fn build_recipes() -> Result<RecipeRegistry, String> {
     })
     .collect::<Result<_, String>>()?;
 
+  // Pull `type_ids` from the cards registry — used by `parse_entity` to
+  // resolve `"@<type_name>"` strings into `Entity::Type(<u8>)` at parse
+  // time. This drives a transitive build of the card registry; if that
+  // fails, recipe build fails too.
+  let type_ids = cards_registry()?.type_ids.clone();
+
   let mut by_id: BTreeMap<u32, RecipeDef> = BTreeMap::new();
   let mut id_by_name: BTreeMap<String, u32> = BTreeMap::new();
   let mut by_type: BTreeMap<u8, Vec<u32>> = BTreeMap::new();
@@ -724,7 +761,13 @@ fn build_recipes() -> Result<RecipeRegistry, String> {
       };
 
       let root = if recipe_value.get("root").is_some() {
-        Some(parse_entity(&recipe_value["root"], filename, &id, "root")?)
+        Some(parse_entity(&recipe_value["root"], &type_ids, filename, &id, "root")?)
+      } else {
+        None
+      };
+
+      let tile = if recipe_value.get("tile").is_some() {
+        Some(parse_entity(&recipe_value["tile"], &type_ids, filename, &id, "tile")?)
       } else {
         None
       };
@@ -733,7 +776,7 @@ fn build_recipes() -> Result<RecipeRegistry, String> {
         slots_arr
           .iter()
           .enumerate()
-          .map(|(i, v)| parse_entity(v, filename, &id, &format!("slots[{}]", i)))
+          .map(|(i, v)| parse_entity(v, &type_ids, filename, &id, &format!("slots[{}]", i)))
           .collect::<Result<Vec<_>, _>>()?
       } else {
         Vec::new()
@@ -785,7 +828,7 @@ fn build_recipes() -> Result<RecipeRegistry, String> {
             .iter()
             .enumerate()
             .map(|(i, v)| {
-              parse_entity(v, filename, &id, &format!("products[{}][{}]", target_name, i))
+              parse_entity(v, &type_ids, filename, &id, &format!("products[{}][{}]", target_name, i))
             })
             .collect::<Result<Vec<_>, _>>()?;
           groups.push(ProductGroup { target, entities });
@@ -795,13 +838,14 @@ fn build_recipes() -> Result<RecipeRegistry, String> {
         Vec::new()
       };
 
-      let duration = parse_duration(&recipe_value["duration"], filename, &id)?;
+      let duration = parse_duration(&recipe_value["duration"], &type_ids, filename, &id)?;
 
       let def = RecipeDef {
         index: stable_id,
         id: id.clone(),
         recipe_type,
         root,
+        tile,
         slots,
         reagents,
         products,
@@ -819,13 +863,34 @@ fn build_recipes() -> Result<RecipeRegistry, String> {
   Ok(RecipeRegistry { by_id, id_by_name, by_type })
 }
 
+/// Sentinel string parsed as `Entity::Any`. Reserved — a card with this
+/// key would shadow the wildcard.
+const ENTITY_ANY_LITERAL: &str = "any";
+/// Prefix marking a string as `Entity::Type(<typename>)`. The remainder
+/// of the string after `@` is looked up in the card-type registry at
+/// recipe-build time.
+const ENTITY_TYPE_PREFIX: char = '@';
+
 fn parse_entity(
   value: &Value,
+  type_ids: &BTreeMap<String, u8>,
   filename: &str,
   recipe_id: &str,
   path: &str,
 ) -> Result<Entity, String> {
   if let Some(s) = value.as_str() {
+    if s == ENTITY_ANY_LITERAL {
+      return Ok(Entity::Any);
+    }
+    if let Some(type_name) = s.strip_prefix(ENTITY_TYPE_PREFIX) {
+      let &type_id = type_ids.get(type_name).ok_or_else(|| {
+        format!(
+          "{}: recipe {:?} {}: unknown card type {:?} (not declared in card_types.json)",
+          filename, recipe_id, path, type_name
+        )
+      })?;
+      return Ok(Entity::Type(type_id));
+    }
     return Ok(Entity::Card(s.to_string()));
   }
   let arr = value.as_array().ok_or_else(|| {
@@ -835,7 +900,7 @@ fn parse_entity(
     )
   })?;
   match arr.len() {
-    1 => parse_entity(&arr[0], filename, recipe_id, path),
+    1 => parse_entity(&arr[0], type_ids, filename, recipe_id, path),
     2 => {
       // Disambiguate `[string, number]` (aspect check) from
       // `[entity, entity]` (AND). Numbers aren't valid entities, so a
@@ -849,15 +914,15 @@ fn parse_entity(
         })?;
         Ok(Entity::Aspect(id, n as i32))
       } else {
-        let a = parse_entity(&arr[0], filename, recipe_id, &format!("{}[0]", path))?;
-        let b = parse_entity(&arr[1], filename, recipe_id, &format!("{}[1]", path))?;
+        let a = parse_entity(&arr[0], type_ids, filename, recipe_id, &format!("{}[0]", path))?;
+        let b = parse_entity(&arr[1], type_ids, filename, recipe_id, &format!("{}[1]", path))?;
         Ok(Entity::And(Box::new(a), Box::new(b)))
       }
     }
     3 => {
       let middle = &arr[1];
-      let a = parse_entity(&arr[0], filename, recipe_id, &format!("{}[0]", path))?;
-      let b = parse_entity(&arr[2], filename, recipe_id, &format!("{}[2]", path))?;
+      let a = parse_entity(&arr[0], type_ids, filename, recipe_id, &format!("{}[0]", path))?;
+      let b = parse_entity(&arr[2], type_ids, filename, recipe_id, &format!("{}[2]", path))?;
       let middle_arr = middle.as_array().ok_or_else(|| {
         format!(
           "{}: recipe {:?} {}: 3-tuple middle not an array: {:?}",
@@ -907,6 +972,7 @@ fn parse_entity(
 
 fn parse_duration(
   value: &Value,
+  type_ids: &BTreeMap<String, u8>,
   filename: &str,
   recipe_id: &str,
 ) -> Result<Duration, String> {
@@ -964,7 +1030,7 @@ fn parse_duration(
         filename, recipe_id, i, case[0]
       )
     })? as u32;
-    let cond = parse_entity(&case[1], filename, recipe_id, &format!("duration[{}][1]", i))?;
+    let cond = parse_entity(&case[1], type_ids, filename, recipe_id, &format!("duration[{}][1]", i))?;
     cases.push((secs, cond));
   }
 
