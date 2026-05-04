@@ -50,7 +50,7 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 
-use crate::packing::pack_definition;
+use crate::packing::{pack_definition, pack_recipe, RECIPE_ID_MASK, RECIPE_TYPE_OR_CATEGORY_MASK};
 
 // ---------- Aspects ----------
 
@@ -205,6 +205,9 @@ struct CardRegistry {
   by_key: BTreeMap<String, u16>,
   type_ids: BTreeMap<String, u8>,
   category_ids: BTreeMap<String, u8>,
+  /// `type_id` → shape (`"rect"` or `"hex"`) from `card_types.json`.
+  /// Drives [`is_hex_type`]; missing types default to `"rect"`.
+  type_shapes: BTreeMap<u8, String>,
 }
 
 static CARDS: OnceLock<Result<CardRegistry, String>> = OnceLock::new();
@@ -227,6 +230,19 @@ pub fn decode_definition(packed: u16) -> Result<Option<&'static CardDefinition>,
 /// `Err` on registry-build failure.
 pub fn find_packed_by_key(card_key: &str) -> Result<Option<u16>, String> {
   Ok(cards_registry()?.by_key.get(card_key).copied())
+}
+
+/// Whether the given `card_type` id resolves to a hex-shaped type
+/// (`"hex"` in `card_types.json`). Used by `magnetic.rs` to decide
+/// whether the action's actor is a hex anchor and slot[0] should be
+/// attached as a hex-root rather than stacked top/bottom. Unknown
+/// type ids default to `false` (rect-like) so a stale `packed_definition`
+/// can't accidentally trip hex-specific paths.
+pub fn is_hex_type(type_id: u8) -> Result<bool, String> {
+  Ok(cards_registry()?
+    .type_shapes
+    .get(&type_id)
+    .map_or(false, |s| s == "hex"))
 }
 
 /// Resolve a `"type/key"` or `"type/category/key"` string to the card's
@@ -268,6 +284,7 @@ fn build_cards() -> Result<CardRegistry, String> {
 
   let type_ids = json_id_map(&types_root, "types")?;
   let category_ids = json_id_map(&types_root, "categories")?;
+  let type_shapes = json_type_shapes(&types_root)?;
 
   // Load stable definition_id map — must exist (run gen-ids.py before building).
   // Format: { "<card_type>": { "<key>": <definition_id>, ... }, ... }
@@ -360,7 +377,35 @@ fn build_cards() -> Result<CardRegistry, String> {
     }
   }
 
-  Ok(CardRegistry { by_packed, by_path, by_key, type_ids, category_ids })
+  Ok(CardRegistry { by_packed, by_path, by_key, type_ids, category_ids, type_shapes })
+}
+
+/// Build a `type_id → shape` map from `card_types.json`'s `types`
+/// section. Skips reserved/comment keys and entries without a `shape`
+/// field. Mirrors the structure of [`json_id_map`] but pulls a
+/// different field.
+fn json_type_shapes(root: &Value) -> Result<BTreeMap<u8, String>, String> {
+  let types_obj = root
+    .get("types")
+    .and_then(Value::as_object)
+    .ok_or_else(|| "card_types.json: 'types' missing or not an object".to_string())?;
+  let mut result = BTreeMap::new();
+  for (name, info) in types_obj {
+    if name.starts_with('_') {
+      continue;
+    }
+    let id = info
+      .get("id")
+      .and_then(Value::as_u64)
+      .ok_or_else(|| format!("card_types.json: types.{:?} missing 'id'", name))?;
+    if id > MAX_TYPE_OR_CATEGORY_ID {
+      continue;
+    }
+    if let Some(shape) = info.get("shape").and_then(Value::as_str) {
+      result.insert(id as u8, shape.to_string());
+    }
+  }
+  Ok(result)
 }
 
 /// Build a `name → id` map from a section of `card_types.json`.
@@ -565,29 +610,145 @@ pub enum Entity {
 
 /// Determines what shape of trigger fires the recipe.
 ///
-/// - `TopStack` / `BottomStack` — fired when the client submits a stack
-///   via `submit_inventory_stacks`; the server tries to fit the slots
-///   along the relevant branch.
+/// - `Stack(Up)` / `Stack(Down)` — fired when the client submits a
+///   stack via `submit_inventory_stacks`; the server tries to fit the
+///   slots along the up- or down-branch from the submitted root.
 /// - `OnCreate` — fired when a card is inserted via `insert_card_row`;
-///   the new card itself is checked against the recipe's `root` entity.
+///   the new card itself is checked against the recipe's `hex`
+///   and/or `root` entity. At least one of those two must be set
+///   (parser-enforced): `hex` requires the new card to be a hex-shaped
+///   type matching the entity, `root` matches any type. An `OnCreate`
+///   recipe with a non-`None` `magnetic` field doubles as a magnetic
+///   recipe — the matched action installs the slot-fill ticker (see
+///   `magnetic.rs`) on the new card, and the inner recipes describe
+///   what the server pulls from the player's inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecipeType {
-  TopStack,
-  BottomStack,
+  Stack(StackDirection),
   OnCreate,
 }
 
-/// Where products from a completed action go. Resolved at completion time.
-///
-/// - `RootPanel` — owner of the chain root's inventory.
-/// - `ActorPanel` — owner of the actor card's inventory.
-///
-/// More targets (e.g. `ActorWorld`, `RootWorld`) belong here when world
-/// cards land.
+/// Which way a stack recipe walks the chain from the submitted root.
+/// `Up` matches what the JSON schema calls the `up` direction (the
+/// player has stacked cards "above" the root); `Down` matches `down`.
+/// The pair of values mirrors `InventoryStack { stack_up, stack_down }`
+/// on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProductTarget {
-  RootPanel,
-  ActorPanel,
+pub enum StackDirection {
+  Up,
+  Down,
+}
+
+/// Magnetic recipes nest a bucket-style sub-tree of *inner* recipes
+/// inside the outer recipe's `magnetic` field. The outer is a normal
+/// recipe (matched against the chain like anything else); the inner
+/// recipes describe what cards the magnetic phase pulls from the
+/// player's inventory and stacks onto the magnetic action's anchor.
+///
+/// Schema:
+///
+/// ```json
+/// "magnetic": {
+///   "type": "stack",
+///   "up":   [ {inner}, {inner}, … ],
+///   "down": [ {inner}, … ]
+/// }
+/// ```
+///
+/// At parse time we flatten the directional arrays into a single
+/// `inners` list, baking each inner's direction into its
+/// `recipe_type`. The flat order is the same order the parser walked,
+/// which is the index used for the *sub-id* stored in the queued
+/// inner action's `flags` (high 4 bits — capped at 16 inners per
+/// outer).
+#[derive(Debug, Clone)]
+pub struct MagneticBucket {
+  pub inners: Vec<InnerRecipe>,
+}
+
+/// One inner recipe inside a [`MagneticBucket`]. Like a top-level
+/// recipe but without `id` (sub-identified by its position in
+/// `MagneticBucket.inners`), without nested `magnetic` (the design
+/// doesn't recurse — magnetic recipes can't themselves contain
+/// magnetic recipes), and without `interval` (only the outer carries
+/// the magnetic phase cadence).
+///
+/// `recipe_type` is baked in from the bucket's direction key at parse
+/// time: under `"up"` it's `Stack(Up)`, under `"down"` it's
+/// `Stack(Down)`, under `"self"` it's `OnCreate`. The tick uses this
+/// to know which way to walk the chain when matching slot fillers.
+///
+/// `duration` is the inner action's duration (in seconds) once the
+/// magnetic phase queues it into `actions` — distinct from the outer
+/// recipe's `duration`, which is the magnetic-phase loop-count cap.
+#[derive(Debug, Clone)]
+pub struct InnerRecipe {
+  pub recipe_type: RecipeType,
+  pub root: Option<Entity>,
+  pub hex: Option<Entity>,
+  pub slots: Vec<Entity>,
+  pub reagents: Vec<Reagent>,
+  pub products: Vec<ProductGroup>,
+  pub duration: Duration,
+}
+
+/// Where products from a completed action go. Two independent axes:
+///
+/// - `place` — what *kind* of destination (an inventory panel today;
+///   future: a hex tile, a loose world spot, a player's pile, …).
+/// - `owner` — which referent of the action defines that destination
+///   (the chain root, the actor, future: the underlying tile, …).
+///
+/// The recipe JSON encodes this as a nested map:
+///
+/// ```json
+/// "products": {
+///   "inventory": {
+///     "root":  [/* entities */],
+///     "actor": [/* entities */]
+///   }
+/// }
+/// ```
+///
+/// Outer key picks the [`ProductPlace`], inner key picks the
+/// [`ProductOwner`]. Adding a new place (e.g. `"hex"`) or a new owner
+/// (e.g. `"hex"` to mean "the tile under the action") is one enum
+/// variant + one match arm in `actions::resolve_product_destination`,
+/// not a new flat target name per combination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductTarget {
+  pub place: ProductPlace,
+  pub owner: ProductOwner,
+}
+
+/// What *kind* of destination a product lands in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductPlace {
+  /// A player's inventory panel. Combined with [`ProductOwner`] to
+  /// pick *which* player's panel. Today this is the only supported
+  /// place; world-tile and loose-world placements will land alongside
+  /// the world board.
+  Inventory,
+}
+
+/// Which action-relative referent the product is attached to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductOwner {
+  /// The chain root for stack/magnetic recipes; the actor for OnCreate
+  /// (where actor == root). For the inventory POC where every claimed
+  /// card is in the same player's panel, this resolves identically to
+  /// `Actor`.
+  Root,
+  /// The action's actor card.
+  Actor,
+  /// The hex card the action is anchored to. The matcher persists
+  /// the resolved id on `ActionScheduler.hex_card_id` at start time
+  /// so completion can re-resolve without walking the chain. Used
+  /// by hex-precondition recipes to route products to the panel of
+  /// the hex's owner. If the chain isn't on a hex (or the recipe
+  /// matched without a hex precondition), the destination falls
+  /// back to the actor's panel.
+  Hex,
 }
 
 #[derive(Debug, Clone)]
@@ -596,6 +757,29 @@ pub struct ProductGroup {
   /// Each entity in this list produces one output card on completion.
   /// `WeightedOr` entities pick one alternative at random.
   pub entities: Vec<Entity>,
+}
+
+/// What a recipe consumes on completion. Three kinds, all optional:
+///
+/// - `Root` — the chain root card. For stack recipes that's the
+///   submitted root (which isn't held by a `CardHold` today, so this
+///   is a no-op for stack types until chain context-at-completion
+///   lands). For `OnCreate`, root and actor are the same card, so
+///   this resolves to `action.card_id`.
+/// - `Hex` — the hex card the action is anchored to (recorded on
+///   `ActionScheduler.hex_card_id` at start time).
+/// - `Slot(N)` — the 1-indexed slot position. Slot 1 is always the
+///   actor (`action.card_id`); slot 2+ requires per-slot claim
+///   tracking that doesn't exist yet.
+///
+/// JSON form: strings `"root"` and `"hex"` for the named referents,
+/// integers `1..=255` for slot positions. Integer `0` is no longer
+/// accepted — use `"root"` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reagent {
+  Root,
+  Hex,
+  Slot(u8),
 }
 
 /// Recipe duration. Either fixed seconds or a list of `(seconds,
@@ -612,44 +796,91 @@ pub enum Duration {
 
 #[derive(Debug, Clone)]
 pub struct RecipeDef {
-  /// Stable ID from `recipes/id.json`. Stored in `Action.recipe` on the
-  /// wire and never reassigned — safe across recipe additions and reorders.
-  pub index: u32,
+  /// Packed stable ID. Layout (see [`crate::packing::pack_recipe`]):
+  /// `[recipe_type:u3][recipe_category:u3][recipe_id:u10]`. The
+  /// `recipe_id` (low 10 bits) comes from `recipes/id.json`; the
+  /// `recipe_type` and `recipe_category` (high 6 bits) come from
+  /// `recipe_types.json` and identify the bucket the recipe was
+  /// declared under. Stored in `Action.recipe` and
+  /// `MagneticAction.recipe` on the wire; never reassigned — safe
+  /// across recipe additions and reorders.
+  pub index: u16,
   /// Human-readable id from JSON, e.g. `"woodcutting"`.
   pub id: String,
   pub recipe_type: RecipeType,
-  /// For `OnCreate`: the actor card must satisfy this entity. For stack
-  /// types this is `None` unless the recipe wants to constrain the chain
-  /// root separately from the slot list.
+  /// For `OnCreate`: when set, the new card itself must satisfy this
+  /// entity (no shape constraint). At least one of `root` / `hex`
+  /// must be set for `OnCreate`. For stack types this is `None`
+  /// unless the recipe wants to constrain the chain root separately
+  /// from the slot list.
   pub root: Option<Entity>,
-  /// Optional condition on the hex tile under the stack. Matched against
-  /// the tile card's def (when world layer cards exist). Forward-looking:
-  /// today no recipe data sets this and the matcher always scores
-  /// `tile_weight = 0`. Top of the priority hierarchy: a satisfied
-  /// `tile` outranks any combination of `root` and `slots` weights.
-  pub tile: Option<Entity>,
-  /// Slot list. Slot 1 is the actor; slots 2.. fill in chain order from
-  /// the actor outward along the recipe's branch. Empty for `OnCreate`.
+  /// Optional hex tier. Semantics depend on `recipe_type`:
+  ///
+  /// - **Stack**: a condition on the hex card the chain root is
+  ///   attached to. A rectangle root with `stacked_state == 3` carries
+  ///   the hex card's id in `micro_location`; the matcher resolves
+  ///   that and scores this entity against the hex card's definition.
+  /// - **OnCreate**: a condition on the *new card itself* — it must
+  ///   be a hex-shaped type ([`is_hex_type`] returns `true`) and its
+  ///   def must satisfy the entity. Matching here installs the
+  ///   action / magnetic_action with the new card as the anchor.
+  ///
+  /// When `None`, the hex tier contributes 0. When `Some(_)`, it's
+  /// the top of the priority hierarchy — a satisfied `hex` outranks
+  /// any combination of `root` and `slots` weights.
+  pub hex: Option<Entity>,
+  /// Slot list. For `Stack(_)` recipes, slot 1 is the actor; slots 2..
+  /// fill in chain order from the actor outward along the recipe's
+  /// branch direction. Empty for non-magnetic `OnCreate`. **For
+  /// magnetic recipes** (`magnetic.is_some()`), the slots describe the
+  /// inputs the server pulls from the player's inventory — the actor
+  /// is *not* in this list — and `slots[0]` is the first magnetic
+  /// input, stacked on the actor (or attached as a hex root if the
+  /// actor is hex-shaped) and so on.
   pub slots: Vec<Entity>,
-  /// 1-indexed slot positions consumed on completion. `0` means "the
-  /// chain root", which is only meaningful when `root` is `Some`.
-  pub reagents: Vec<u8>,
+  /// What the recipe consumes on completion. See [`Reagent`] —
+  /// strings `"root"` / `"hex"` and 1-indexed slot integers in JSON.
+  pub reagents: Vec<Reagent>,
   pub products: Vec<ProductGroup>,
-  pub duration: Duration,
+  /// Action duration in seconds. Optional **only** for outer magnetic
+  /// recipes (where `magnetic.is_some()`), and there it acts as the
+  /// magnetic-phase loop-count cap (in ticks, not seconds). For
+  /// non-magnetic recipes this is the seconds-from-start the action
+  /// runs in `actions` before completion fires; the parser requires
+  /// it for those. `None` on a magnetic outer means "no terminator —
+  /// magnetic action runs until it queues an inner or is cancelled".
+  pub duration: Option<Duration>,
+  /// When set, this recipe is *magnetic*: `magnetic.rs` installs a
+  /// scheduled tick that pulls inventory cards into the action's
+  /// chain per the bucket's inner recipes, then queues an inner
+  /// action into `actions` once any inner's slot list is fully
+  /// filled. The outer recipe's `slots` / `reagents` / `products`
+  /// describe the magnetic *outer*: matched at install time, fired
+  /// at magnetic-action completion (queue or timeout). The inner
+  /// recipe's fields fire at the queued inner action's completion.
+  pub magnetic: Option<MagneticBucket>,
+  /// Tick cadence in seconds for the magnetic phase. Only meaningful
+  /// when `magnetic.is_some()`; ignored otherwise. The magnetic_action
+  /// schedules a tick every `interval` seconds; each tick attempts
+  /// one card pickup. Required for magnetic recipes.
+  pub interval: Option<u32>,
 }
 
 const RECIPES_FILES: &[(&str, &str)] = &[
   ("recipes/01.json", include_str!("../data/recipes/01.json")),
 ];
 const RECIPE_IDS_JSON: &str = include_str!("../data/recipes/id.json");
+const RECIPE_TYPES_JSON: &str = include_str!("../data/recipe_types.json");
 
 struct RecipeRegistry {
-  /// Stable ID → recipe definition.
-  by_id: BTreeMap<u32, RecipeDef>,
-  /// Human-readable name → stable ID.
-  id_by_name: BTreeMap<String, u32>,
-  /// `RecipeType` (encoded as u8) → stable IDs in declaration order.
-  by_type: BTreeMap<u8, Vec<u32>>,
+  /// Packed stable ID → recipe definition. Key is the same `u16`
+  /// `Action.recipe` carries on the wire (see
+  /// [`crate::packing::pack_recipe`]).
+  by_id: BTreeMap<u16, RecipeDef>,
+  /// Human-readable name → packed stable ID.
+  id_by_name: BTreeMap<String, u16>,
+  /// `(type_id, category_id)` → packed stable IDs in declaration order.
+  by_type: BTreeMap<(u8, u8), Vec<u16>>,
 }
 
 static RECIPES: OnceLock<Result<RecipeRegistry, String>> = OnceLock::new();
@@ -658,9 +889,9 @@ fn recipes_registry() -> Result<&'static RecipeRegistry, String> {
   RECIPES.get_or_init(build_recipes).as_ref().map_err(|e| e.clone())
 }
 
-/// Look up a recipe by its stable ID (what `Action.recipe` stores).
-/// Returns `Ok(None)` if no recipe with that ID is registered.
-pub fn recipe(index: u32) -> Result<Option<&'static RecipeDef>, String> {
+/// Look up a recipe by its packed stable ID (what `Action.recipe`
+/// stores). Returns `Ok(None)` if no recipe with that ID is registered.
+pub fn recipe(index: u16) -> Result<Option<&'static RecipeDef>, String> {
   Ok(recipes_registry()?.by_id.get(&index))
 }
 
@@ -676,37 +907,165 @@ pub fn find_recipe(id: &str) -> Result<Option<&'static RecipeDef>, String> {
 /// All recipes of a given type, in declaration order.
 pub fn recipes_of_type(rt: RecipeType) -> Result<Vec<&'static RecipeDef>, String> {
   let registry = recipes_registry()?;
-  let key = recipe_type_key(rt);
+  let key = recipe_type_pair(rt)?;
   let Some(ids) = registry.by_type.get(&key) else {
     return Ok(Vec::new());
   };
   Ok(ids.iter().filter_map(|id| registry.by_id.get(id)).collect())
 }
 
-fn recipe_type_key(rt: RecipeType) -> u8 {
+/// Resolve a `RecipeType` variant to its `(type_id, category_id)` pair
+/// from `recipe_types.json`. The pair is what `pack_recipe` puts in
+/// the high 6 bits of a packed recipe id.
+fn recipe_type_pair(rt: RecipeType) -> Result<(u8, u8), String> {
+  let registry = recipe_types_registry()?;
+  let (type_name, category_name) = recipe_type_names(rt);
+  let &type_id = registry.types.get(type_name).ok_or_else(|| {
+    format!("recipe_types.json: type {:?} missing — required by RecipeType variant", type_name)
+  })?;
+  let &category_id = registry.categories.get(category_name).ok_or_else(|| {
+    format!(
+      "recipe_types.json: category {:?} missing — required by RecipeType variant",
+      category_name
+    )
+  })?;
+  Ok((type_id, category_id))
+}
+
+/// JSON-side names of a `RecipeType` variant — the bucket type and
+/// direction key it was declared under.
+fn recipe_type_names(rt: RecipeType) -> (&'static str, &'static str) {
   match rt {
-    RecipeType::TopStack => 0,
-    RecipeType::BottomStack => 1,
-    RecipeType::OnCreate => 2,
+    RecipeType::Stack(StackDirection::Up) => ("stack", "up"),
+    RecipeType::Stack(StackDirection::Down) => ("stack", "down"),
+    RecipeType::OnCreate => ("on_create", "self"),
   }
 }
 
+// ---------- Recipe types registry ----------
+
+struct RecipeTypeRegistry {
+  /// `name → recipe_type_id` (3 bits, from `recipe_types.json`'s
+  /// `types` section).
+  types: BTreeMap<String, u8>,
+  /// `name → recipe_category_id` (3 bits, from `recipe_types.json`'s
+  /// `categories` section).
+  categories: BTreeMap<String, u8>,
+}
+
+static RECIPE_TYPES: OnceLock<Result<RecipeTypeRegistry, String>> = OnceLock::new();
+
+fn recipe_types_registry() -> Result<&'static RecipeTypeRegistry, String> {
+  RECIPE_TYPES
+    .get_or_init(build_recipe_types)
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
+fn build_recipe_types() -> Result<RecipeTypeRegistry, String> {
+  let root: Value = serde_json::from_str(RECIPE_TYPES_JSON)
+    .map_err(|e| format!("recipe_types.json: parse failed: {}", e))?;
+  let types = recipe_id_section(&root, "types")?;
+  let categories = recipe_id_section(&root, "categories")?;
+  Ok(RecipeTypeRegistry { types, categories })
+}
+
+/// Read a `name → id` map from one section of `recipe_types.json`.
+/// Skips reserved/comment keys (those starting with `_`); requires
+/// real entries to carry an integer `id` field that fits in 3 bits.
+fn recipe_id_section(root: &Value, section: &str) -> Result<BTreeMap<String, u8>, String> {
+  let section_obj = root
+    .get(section)
+    .and_then(Value::as_object)
+    .ok_or_else(|| format!("recipe_types.json: '{}' missing or not an object", section))?;
+  let mut result = BTreeMap::new();
+  for (name, info) in section_obj {
+    if name.starts_with('_') {
+      continue;
+    }
+    let id_value = info.get("id").ok_or_else(|| {
+      format!("recipe_types.json: '{}' entry {:?} missing 'id'", section, name)
+    })?;
+    let id_u64 = id_value.as_u64().ok_or_else(|| {
+      format!(
+        "recipe_types.json: '{}' entry {:?} 'id' not a non-negative integer",
+        section, name
+      )
+    })?;
+    if id_u64 > RECIPE_TYPE_OR_CATEGORY_MASK as u64 {
+      return Err(format!(
+        "recipe_types.json: '{}' entry {:?} id {} exceeds u3 max ({})",
+        section, name, id_u64, RECIPE_TYPE_OR_CATEGORY_MASK,
+      ));
+    }
+    result.insert(name.clone(), id_u64 as u8);
+  }
+  Ok(result)
+}
+
 fn build_recipes() -> Result<RecipeRegistry, String> {
-  // Load stable ID map — must exist (run gen-ids.py before building).
+  // Build the type+category id map first — we need it to pack each
+  // recipe's stable ID and to validate that a bucket's type/direction
+  // is actually declared in `recipe_types.json`.
+  let type_registry = recipe_types_registry()?;
+
+  // Walk `recipes/id.json` (`{ "<type>": { "<category>": { "<key>":
+  // <id>, … }, … }, … }`) and flatten it into a single `name →
+  // packed_u16` map. The packed value is what `Action.recipe` carries
+  // on the wire and what we'll store in `RecipeDef.index`.
   let ids_root: Value = serde_json::from_str(RECIPE_IDS_JSON)
     .map_err(|e| format!("recipes/id.json: parse failed: {}", e))?;
   let ids_obj = ids_root
     .as_object()
     .ok_or_else(|| "recipes/id.json: top-level not an object".to_string())?;
-  let stable_ids: BTreeMap<String, u32> = ids_obj
-    .iter()
-    .map(|(name, val)| {
-      let id = val
-        .as_u64()
-        .ok_or_else(|| format!("recipes/id.json: value for {:?} not an integer", name))?;
-      Ok((name.clone(), id as u32))
-    })
-    .collect::<Result<_, String>>()?;
+
+  let mut packed_ids: BTreeMap<String, u16> = BTreeMap::new();
+  for (type_name, type_val) in ids_obj {
+    let &type_id = type_registry.types.get(type_name).ok_or_else(|| {
+      format!(
+        "recipes/id.json: type {:?} not declared in recipe_types.json",
+        type_name
+      )
+    })?;
+    let type_obj = type_val.as_object().ok_or_else(|| {
+      format!("recipes/id.json: entry for type {:?} not an object", type_name)
+    })?;
+    for (category_name, cat_val) in type_obj {
+      let &category_id = type_registry.categories.get(category_name).ok_or_else(|| {
+        format!(
+          "recipes/id.json: category {:?} (under type {:?}) not declared in recipe_types.json",
+          category_name, type_name
+        )
+      })?;
+      let cat_obj = cat_val.as_object().ok_or_else(|| {
+        format!(
+          "recipes/id.json: entry for {:?}/{:?} not an object",
+          type_name, category_name
+        )
+      })?;
+      for (key, val) in cat_obj {
+        let n = val.as_u64().ok_or_else(|| {
+          format!(
+            "recipes/id.json: id for {:?}/{:?}/{:?} not an integer",
+            type_name, category_name, key
+          )
+        })?;
+        if n == 0 || n > RECIPE_ID_MASK as u64 {
+          return Err(format!(
+            "recipes/id.json: id {} for {:?}/{:?}/{:?} out of range (1..={})",
+            n, type_name, category_name, key, RECIPE_ID_MASK,
+          ));
+        }
+        let packed = pack_recipe(type_id, category_id, n as u16);
+        if let Some(prev) = packed_ids.insert(key.clone(), packed) {
+          return Err(format!(
+            "recipes/id.json: recipe key {:?} declared more than once (prev packed={:#06x}, new={:#06x})",
+            key, prev, packed,
+          ));
+        }
+      }
+    }
+  }
 
   // Pull `type_ids` from the cards registry — used by `parse_entity` to
   // resolve `"@<type_name>"` strings into `Entity::Type(<u8>)` at parse
@@ -714,153 +1073,483 @@ fn build_recipes() -> Result<RecipeRegistry, String> {
   // fails, recipe build fails too.
   let type_ids = cards_registry()?.type_ids.clone();
 
-  let mut by_id: BTreeMap<u32, RecipeDef> = BTreeMap::new();
-  let mut id_by_name: BTreeMap<String, u32> = BTreeMap::new();
-  let mut by_type: BTreeMap<u8, Vec<u32>> = BTreeMap::new();
+  let mut by_id: BTreeMap<u16, RecipeDef> = BTreeMap::new();
+  let mut id_by_name: BTreeMap<String, u16> = BTreeMap::new();
+  let mut by_type: BTreeMap<(u8, u8), Vec<u16>> = BTreeMap::new();
 
   for (filename, content) in RECIPES_FILES {
-    let recipes_value: Value = serde_json::from_str(content)
+    let buckets_value: Value = serde_json::from_str(content)
       .map_err(|e| format!("{}: parse failed: {}", filename, e))?;
-    let recipes_arr = recipes_value
+    let buckets = buckets_value
       .as_array()
-      .ok_or_else(|| format!("{}: top-level not an array", filename))?;
+      .ok_or_else(|| format!("{}: top-level not an array of buckets", filename))?;
 
-    for recipe_value in recipes_arr {
-      let id = recipe_value["id"]
-        .as_str()
-        .ok_or_else(|| format!("{}: recipe missing 'id'", filename))?
-        .to_string();
+    for bucket in buckets {
+      let bucket_type = bucket
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{}: bucket missing 'type'", filename))?;
 
-      let stable_id = stable_ids.get(&id).copied().ok_or_else(|| {
-        format!(
-          "{}: recipe {:?} not found in recipes/id.json — run gen-ids.py",
-          filename, id
-        )
-      })?;
-
-      if id_by_name.contains_key(&id) {
-        return Err(format!(
-          "{}: recipe id {:?} declared more than once",
-          filename, id
-        ));
-      }
-
-      let recipe_type = match recipe_value["type"].as_str() {
-        Some("top_stack") => RecipeType::TopStack,
-        Some("bottom_stack") => RecipeType::BottomStack,
-        Some("on_create") => RecipeType::OnCreate,
-        Some(other) => {
+      // Each bucket maps `type` to one or more direction-keyed arrays
+      // of recipes. The pairs below say "for each direction key the
+      // bucket's type allows, find the recipe array under that key
+      // and tag its entries with this RecipeType."
+      let direction_keys: &[(&str, RecipeType)] = match bucket_type {
+        "stack" => &[
+          ("up", RecipeType::Stack(StackDirection::Up)),
+          ("down", RecipeType::Stack(StackDirection::Down)),
+        ],
+        "on_create" => &[("self", RecipeType::OnCreate)],
+        other => {
           return Err(format!(
-            "{}: recipe {:?} unknown type {:?}",
-            filename, id, other
+            "{}: bucket has unknown type {:?}, expected \"stack\" or \"on_create\"",
+            filename, other,
           ));
         }
-        None => {
-          return Err(format!("{}: recipe {:?} missing 'type'", filename, id));
+      };
+
+      for &(direction_key, recipe_type) in direction_keys {
+        let Some(arr) = bucket.get(direction_key).and_then(Value::as_array) else {
+          continue;
+        };
+        let pair = recipe_type_pair(recipe_type)?;
+        for recipe_value in arr {
+          let (id, stable_id, def) = parse_recipe(
+            recipe_value,
+            recipe_type,
+            filename,
+            &type_ids,
+            &packed_ids,
+          )?;
+          if id_by_name.contains_key(&id) {
+            return Err(format!(
+              "{}: recipe id {:?} declared more than once",
+              filename, id
+            ));
+          }
+          by_type.entry(pair).or_default().push(stable_id);
+          id_by_name.insert(id, stable_id);
+          by_id.insert(stable_id, def);
         }
-      };
-
-      let root = if recipe_value.get("root").is_some() {
-        Some(parse_entity(&recipe_value["root"], &type_ids, filename, &id, "root")?)
-      } else {
-        None
-      };
-
-      let tile = if recipe_value.get("tile").is_some() {
-        Some(parse_entity(&recipe_value["tile"], &type_ids, filename, &id, "tile")?)
-      } else {
-        None
-      };
-
-      let slots = if let Some(slots_arr) = recipe_value.get("slots").and_then(Value::as_array) {
-        slots_arr
-          .iter()
-          .enumerate()
-          .map(|(i, v)| parse_entity(v, &type_ids, filename, &id, &format!("slots[{}]", i)))
-          .collect::<Result<Vec<_>, _>>()?
-      } else {
-        Vec::new()
-      };
-
-      let reagents = if let Some(arr) = recipe_value.get("reagents").and_then(Value::as_array) {
-        arr
-          .iter()
-          .map(|v| {
-            let n = v.as_u64().ok_or_else(|| {
-              format!("{}: recipe {:?} reagents has non-integer entry: {:?}", filename, id, v)
-            })?;
-            if n > u8::MAX as u64 {
-              return Err(format!(
-                "{}: recipe {:?} reagent index {} exceeds u8 max",
-                filename, id, n
-              ));
-            }
-            Ok(n as u8)
-          })
-          .collect::<Result<Vec<_>, _>>()?
-      } else {
-        Vec::new()
-      };
-
-      let products = if let Some(products_obj) = recipe_value
-        .get("products")
-        .and_then(Value::as_object)
-      {
-        let mut groups: Vec<ProductGroup> = Vec::new();
-        for (target_name, target_value) in products_obj {
-          let target = match target_name.as_str() {
-            "root_panel" => ProductTarget::RootPanel,
-            "actor_panel" => ProductTarget::ActorPanel,
-            other => {
-              return Err(format!(
-                "{}: recipe {:?} unknown product target {:?}",
-                filename, id, other
-              ));
-            }
-          };
-          let entities_arr = target_value.as_array().ok_or_else(|| {
-            format!(
-              "{}: recipe {:?} products[{}] not an array",
-              filename, id, target_name
-            )
-          })?;
-          let entities = entities_arr
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-              parse_entity(v, &type_ids, filename, &id, &format!("products[{}][{}]", target_name, i))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-          groups.push(ProductGroup { target, entities });
-        }
-        groups
-      } else {
-        Vec::new()
-      };
-
-      let duration = parse_duration(&recipe_value["duration"], &type_ids, filename, &id)?;
-
-      let def = RecipeDef {
-        index: stable_id,
-        id: id.clone(),
-        recipe_type,
-        root,
-        tile,
-        slots,
-        reagents,
-        products,
-        duration,
-      };
-      by_type
-        .entry(recipe_type_key(recipe_type))
-        .or_default()
-        .push(stable_id);
-      id_by_name.insert(id, stable_id);
-      by_id.insert(stable_id, def);
+      }
     }
   }
 
   Ok(RecipeRegistry { by_id, id_by_name, by_type })
+}
+
+/// Parse one recipe record from inside a direction-keyed bucket array
+/// (`up` / `down` for `stack`, `self` for `on_create`). The
+/// surrounding bucket has already supplied the `recipe_type`; the
+/// record itself no longer carries a `type` field. Returns
+/// `(id, stable_id, def)` for the caller to register. `stable_ids` is
+/// the packed-u16 map built by `build_recipes` from the nested
+/// `recipes/id.json` (see [`pack_recipe`] for the layout).
+fn parse_recipe(
+  recipe_value: &Value,
+  recipe_type: RecipeType,
+  filename: &str,
+  type_ids: &BTreeMap<String, u8>,
+  stable_ids: &BTreeMap<String, u16>,
+) -> Result<(String, u16, RecipeDef), String> {
+  let id = recipe_value["id"]
+    .as_str()
+    .ok_or_else(|| format!("{}: recipe missing 'id'", filename))?
+    .to_string();
+
+  let stable_id = stable_ids.get(&id).copied().ok_or_else(|| {
+    format!(
+      "{}: recipe {:?} not found in recipes/id.json — run gen-ids.py",
+      filename, id
+    )
+  })?;
+
+  // `magnetic` is a nested bucket-style sub-tree. Same shape as the
+  // top-level recipe file (a `type` plus direction-keyed inner-recipe
+  // arrays), parsed into a flat `MagneticBucket.inners` list with each
+  // inner's `recipe_type` baked from the bucket's direction key.
+  let magnetic = if let Some(mag_value) = recipe_value.get("magnetic") {
+    let mag_obj = mag_value.as_object().ok_or_else(|| {
+      format!(
+        "{}: recipe {:?} 'magnetic' not an object",
+        filename, id
+      )
+    })?;
+    Some(parse_magnetic_bucket(mag_obj, filename, &id, type_ids)?)
+  } else {
+    None
+  };
+
+  // `interval` (seconds) — required when `magnetic.is_some()`, ignored
+  // otherwise. Drives the magnetic_action's recurring schedule.
+  let interval = match recipe_value.get("interval") {
+    Some(v) => {
+      let n = v.as_u64().ok_or_else(|| {
+        format!(
+          "{}: recipe {:?} 'interval' not a non-negative integer: {:?}",
+          filename, id, v
+        )
+      })?;
+      Some(u32::try_from(n).map_err(|_| {
+        format!(
+          "{}: recipe {:?} 'interval' value {} exceeds u32 range",
+          filename, id, n
+        )
+      })?)
+    }
+    None => None,
+  };
+  if magnetic.is_some() && interval.is_none() {
+    return Err(format!(
+      "{}: magnetic recipe {:?} missing required 'interval' field",
+      filename, id
+    ));
+  }
+  if magnetic.is_none() && interval.is_some() {
+    return Err(format!(
+      "{}: non-magnetic recipe {:?} has 'interval' field with no 'magnetic' to consume it",
+      filename, id
+    ));
+  }
+
+  let root = if recipe_value.get("root").is_some() {
+    Some(parse_entity(&recipe_value["root"], type_ids, filename, &id, "root")?)
+  } else {
+    None
+  };
+
+  let hex = if recipe_value.get("hex").is_some() {
+    Some(parse_entity(&recipe_value["hex"], type_ids, filename, &id, "hex")?)
+  } else {
+    None
+  };
+
+  let slots = if let Some(slots_arr) = recipe_value.get("slots").and_then(Value::as_array) {
+    slots_arr
+      .iter()
+      .enumerate()
+      .map(|(i, v)| parse_entity(v, type_ids, filename, &id, &format!("slots[{}]", i)))
+      .collect::<Result<Vec<_>, _>>()?
+  } else {
+    Vec::new()
+  };
+
+  let reagents = if let Some(arr) = recipe_value.get("reagents").and_then(Value::as_array) {
+    arr
+      .iter()
+      .map(|v| parse_reagent(v, filename, &id))
+      .collect::<Result<Vec<_>, _>>()?
+  } else {
+    Vec::new()
+  };
+
+  let products = if let Some(products_obj) = recipe_value
+    .get("products")
+    .and_then(Value::as_object)
+  {
+    let mut groups: Vec<ProductGroup> = Vec::new();
+    for (place_name, place_value) in products_obj {
+      let place = match place_name.as_str() {
+        "inventory" => ProductPlace::Inventory,
+        other => {
+          return Err(format!(
+            "{}: recipe {:?} unknown product place {:?}, expected one of: \"inventory\"",
+            filename, id, other
+          ));
+        }
+      };
+      let place_obj = place_value.as_object().ok_or_else(|| {
+        format!(
+          "{}: recipe {:?} products[{}] not an object (expected `{{ owner: [entities…] }}`)",
+          filename, id, place_name
+        )
+      })?;
+      for (owner_name, entities_value) in place_obj {
+        let owner = match owner_name.as_str() {
+          "root" => ProductOwner::Root,
+          "actor" => ProductOwner::Actor,
+          "hex" => ProductOwner::Hex,
+          other => {
+            return Err(format!(
+              "{}: recipe {:?} unknown product owner {:?} under place {:?}, expected one of: \"root\", \"actor\", \"hex\"",
+              filename, id, other, place_name
+            ));
+          }
+        };
+        let entities_arr = entities_value.as_array().ok_or_else(|| {
+          format!(
+            "{}: recipe {:?} products[{}][{}] not an array",
+            filename, id, place_name, owner_name
+          )
+        })?;
+        let entities = entities_arr
+          .iter()
+          .enumerate()
+          .map(|(i, v)| {
+            parse_entity(
+              v,
+              type_ids,
+              filename,
+              &id,
+              &format!("products[{}][{}][{}]", place_name, owner_name, i),
+            )
+          })
+          .collect::<Result<Vec<_>, _>>()?;
+        groups.push(ProductGroup {
+          target: ProductTarget { place, owner },
+          entities,
+        });
+      }
+    }
+    groups
+  } else {
+    Vec::new()
+  };
+
+  // Duration is optional only for outer magnetic recipes (where it
+  // acts as the magnetic-phase loop-count cap; absent means "no
+  // terminator"). For everything else the recipe's action runs in
+  // `actions` for `duration` seconds, so it's required.
+  let duration = if recipe_value.get("duration").is_some() {
+    Some(parse_duration(&recipe_value["duration"], type_ids, filename, &id)?)
+  } else {
+    None
+  };
+  if duration.is_none() && magnetic.is_none() {
+    return Err(format!(
+      "{}: non-magnetic recipe {:?} missing required 'duration' field",
+      filename, id
+    ));
+  }
+
+  // OnCreate recipes match against the new card's def via either
+  // `hex` (must be a hex-shaped card matching the entity) or `root`
+  // (any card type matching the entity). At least one is required —
+  // an OnCreate recipe with neither has no way to identify what it
+  // fires on.
+  if recipe_type == RecipeType::OnCreate && root.is_none() && hex.is_none() {
+    return Err(format!(
+      "{}: on_create recipe {:?} must specify either 'root' or 'hex' to identify the target card",
+      filename, id
+    ));
+  }
+
+  let def = RecipeDef {
+    index: stable_id,
+    id: id.clone(),
+    recipe_type,
+    root,
+    hex,
+    slots,
+    reagents,
+    products,
+    duration,
+    magnetic,
+    interval,
+  };
+  Ok((id, stable_id, def))
+}
+
+/// Parse a `magnetic` field into a [`MagneticBucket`]. Same dispatch
+/// logic as the top-level recipe file: bucket type ("stack" or
+/// "on_create") plus direction-keyed arrays. Inner recipes are flattened
+/// into `MagneticBucket.inners` in directional order.
+///
+/// The order matters — sub-id (the index a queued inner action carries
+/// in its `flags`) is the inner's position in this flat list. Stable
+/// across deploys as long as the JSON's direction keys and inner array
+/// order don't change.
+///
+/// At most 16 inners per bucket (sub-id is 4 bits in `Action.flags`).
+fn parse_magnetic_bucket(
+  bucket: &serde_json::Map<String, Value>,
+  filename: &str,
+  parent_id: &str,
+  type_ids: &BTreeMap<String, u8>,
+) -> Result<MagneticBucket, String> {
+  let bucket_type = bucket
+    .get("type")
+    .and_then(Value::as_str)
+    .ok_or_else(|| format!("{}: recipe {:?} magnetic bucket missing 'type'", filename, parent_id))?;
+
+  let direction_keys: &[(&str, RecipeType)] = match bucket_type {
+    "stack" => &[
+      ("up", RecipeType::Stack(StackDirection::Up)),
+      ("down", RecipeType::Stack(StackDirection::Down)),
+    ],
+    "on_create" => &[("self", RecipeType::OnCreate)],
+    other => {
+      return Err(format!(
+        "{}: recipe {:?} magnetic bucket has unknown type {:?}, expected \"stack\" or \"on_create\"",
+        filename, parent_id, other,
+      ));
+    }
+  };
+
+  let mut inners: Vec<InnerRecipe> = Vec::new();
+  for &(direction_key, recipe_type) in direction_keys {
+    let Some(arr) = bucket.get(direction_key).and_then(Value::as_array) else {
+      continue;
+    };
+    for (idx, inner_value) in arr.iter().enumerate() {
+      let path = format!("magnetic.{}[{}]", direction_key, idx);
+      inners.push(parse_inner_recipe(inner_value, recipe_type, filename, parent_id, &path, type_ids)?);
+    }
+  }
+
+  if inners.len() > MAGNETIC_MAX_INNERS {
+    return Err(format!(
+      "{}: recipe {:?} magnetic bucket has {} inners (max {}, sub-id is 4 bits in Action.flags)",
+      filename, parent_id, inners.len(), MAGNETIC_MAX_INNERS,
+    ));
+  }
+
+  Ok(MagneticBucket { inners })
+}
+
+/// Hard cap on inner recipes per magnetic bucket. The queued inner
+/// action stores its sub-id in 4 bits of `Action.flags`, so 16 is
+/// the structural ceiling.
+pub const MAGNETIC_MAX_INNERS: usize = 16;
+
+/// Parse one inner recipe inside a magnetic bucket. Like
+/// [`parse_recipe`] but: no `id`, no nested `magnetic`, no `interval`,
+/// `recipe_type` is supplied by the caller from the bucket's direction
+/// key. `duration` is required (it's the queued inner action's
+/// duration). `path` is a JSON path fragment for error messages
+/// (`"magnetic.up[0]"` etc.).
+fn parse_inner_recipe(
+  recipe_value: &Value,
+  recipe_type: RecipeType,
+  filename: &str,
+  parent_id: &str,
+  path: &str,
+  type_ids: &BTreeMap<String, u8>,
+) -> Result<InnerRecipe, String> {
+  // Reject fields that don't apply to inner recipes — fail loud rather
+  // than silently dropping authorial intent.
+  for forbidden in ["id", "magnetic", "interval"] {
+    if recipe_value.get(forbidden).is_some() {
+      return Err(format!(
+        "{}: recipe {:?} {}: inner recipe must not have '{}' field",
+        filename, parent_id, path, forbidden
+      ));
+    }
+  }
+
+  let label = format!("{}/{}", parent_id, path);
+
+  let root = if recipe_value.get("root").is_some() {
+    Some(parse_entity(&recipe_value["root"], type_ids, filename, &label, "root")?)
+  } else {
+    None
+  };
+
+  let hex = if recipe_value.get("hex").is_some() {
+    Some(parse_entity(&recipe_value["hex"], type_ids, filename, &label, "hex")?)
+  } else {
+    None
+  };
+
+  let slots = if let Some(slots_arr) = recipe_value.get("slots").and_then(Value::as_array) {
+    slots_arr
+      .iter()
+      .enumerate()
+      .map(|(i, v)| parse_entity(v, type_ids, filename, &label, &format!("slots[{}]", i)))
+      .collect::<Result<Vec<_>, _>>()?
+  } else {
+    Vec::new()
+  };
+
+  let reagents = if let Some(arr) = recipe_value.get("reagents").and_then(Value::as_array) {
+    arr
+      .iter()
+      .map(|v| parse_reagent(v, filename, &label))
+      .collect::<Result<Vec<_>, _>>()?
+  } else {
+    Vec::new()
+  };
+
+  let products = if let Some(products_obj) = recipe_value.get("products").and_then(Value::as_object) {
+    let mut groups: Vec<ProductGroup> = Vec::new();
+    for (place_name, place_value) in products_obj {
+      let place = match place_name.as_str() {
+        "inventory" => ProductPlace::Inventory,
+        other => {
+          return Err(format!(
+            "{}: recipe {:?} {}: unknown product place {:?}, expected \"inventory\"",
+            filename, parent_id, path, other
+          ));
+        }
+      };
+      let place_obj = place_value.as_object().ok_or_else(|| {
+        format!(
+          "{}: recipe {:?} {}: products[{}] not an object",
+          filename, parent_id, path, place_name
+        )
+      })?;
+      for (owner_name, entities_value) in place_obj {
+        let owner = match owner_name.as_str() {
+          "root" => ProductOwner::Root,
+          "actor" => ProductOwner::Actor,
+          "hex" => ProductOwner::Hex,
+          other => {
+            return Err(format!(
+              "{}: recipe {:?} {}: unknown product owner {:?}, expected \"root\", \"actor\", \"hex\"",
+              filename, parent_id, path, other
+            ));
+          }
+        };
+        let entities_arr = entities_value.as_array().ok_or_else(|| {
+          format!(
+            "{}: recipe {:?} {}: products[{}][{}] not an array",
+            filename, parent_id, path, place_name, owner_name
+          )
+        })?;
+        let entities = entities_arr
+          .iter()
+          .enumerate()
+          .map(|(i, v)| {
+            parse_entity(
+              v,
+              type_ids,
+              filename,
+              &label,
+              &format!("products[{}][{}][{}]", place_name, owner_name, i),
+            )
+          })
+          .collect::<Result<Vec<_>, _>>()?;
+        groups.push(ProductGroup {
+          target: ProductTarget { place, owner },
+          entities,
+        });
+      }
+    }
+    groups
+  } else {
+    Vec::new()
+  };
+
+  // Inner duration is *required* — it becomes the queued inner action's
+  // duration in `actions`. Without it the queued action would have no
+  // end time.
+  let duration_value = recipe_value.get("duration").ok_or_else(|| {
+    format!(
+      "{}: recipe {:?} {}: inner recipe missing required 'duration' field",
+      filename, parent_id, path
+    )
+  })?;
+  let duration = parse_duration(duration_value, type_ids, filename, &label)?;
+
+  Ok(InnerRecipe {
+    recipe_type,
+    root,
+    hex,
+    slots,
+    reagents,
+    products,
+    duration,
+  })
 }
 
 /// Sentinel string parsed as `Entity::Any`. Reserved — a card with this
@@ -870,6 +1559,44 @@ const ENTITY_ANY_LITERAL: &str = "any";
 /// of the string after `@` is looked up in the card-type registry at
 /// recipe-build time.
 const ENTITY_TYPE_PREFIX: char = '@';
+
+/// Parse one entry from a recipe's `reagents` array. Strings `"root"`
+/// and `"hex"` map to the named referents; integers `1..=255` map to
+/// `Reagent::Slot`. Integer `0` is rejected with a hint to use
+/// `"root"` instead — the old numeric-only encoding overloaded `0`
+/// for "the chain root", and we want load-time errors when a recipe
+/// file is on the old format.
+fn parse_reagent(value: &Value, filename: &str, recipe_id: &str) -> Result<Reagent, String> {
+  if let Some(s) = value.as_str() {
+    return match s {
+      "root" => Ok(Reagent::Root),
+      "hex" => Ok(Reagent::Hex),
+      other => Err(format!(
+        "{}: recipe {:?} reagent string {:?} unknown — expected \"root\" or \"hex\"",
+        filename, recipe_id, other
+      )),
+    };
+  }
+  if let Some(n) = value.as_u64() {
+    if n == 0 {
+      return Err(format!(
+        "{}: recipe {:?} reagent index 0 not allowed — use \"root\" to consume the chain root",
+        filename, recipe_id
+      ));
+    }
+    if n > u8::MAX as u64 {
+      return Err(format!(
+        "{}: recipe {:?} reagent slot index {} exceeds u8 max",
+        filename, recipe_id, n
+      ));
+    }
+    return Ok(Reagent::Slot(n as u8));
+  }
+  Err(format!(
+    "{}: recipe {:?} reagent {:?} not a string or non-negative integer",
+    filename, recipe_id, value
+  ))
+}
 
 fn parse_entity(
   value: &Value,

@@ -13,7 +13,7 @@
 //!
 //! - [`process_top_branch`] — caller passes the submitted root +
 //!   up-branch; we iterate every potential actor along the chain,
-//!   evaluate `TopStack` recipes against each actor's visible window,
+//!   evaluate `Stack(Up)` recipes against each actor's visible window,
 //!   and apply the upgrade rules below.
 //! - [`process_bottom_branch`] — same shape for the down-branch.
 //! - [`try_start_on_create_action`] — caller passes a freshly-inserted
@@ -86,8 +86,8 @@
 //! 1. Verifies the call is legitimate (scheduler row exists in the
 //!    table, action's end-time has passed) — rejects spoofed early
 //!    completions.
-//! 2. Generates products into the configured targets (`root_panel`,
-//!    `actor_panel`).
+//! 2. Generates products into the configured targets (e.g.
+//!    `inventory.root` / `inventory.actor`).
 //! 3. Deletes the cards listed in `recipe.reagents`.
 //! 4. Tears down the action, scheduler row, and all its card holds.
 
@@ -97,9 +97,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::cards::cards as _;
 use crate::cards::{insert_card_row, Card, LAYER_INVENTORY};
 use crate::definitions::{
-  self, AspectId, CardDefinition, Duration as RecipeDuration, Entity, ProductTarget, RecipeDef,
-  RecipeType,
+  self, AspectId, CardDefinition, Duration as RecipeDuration, Entity, ProductGroup, ProductOwner,
+  ProductPlace, ProductTarget, Reagent, RecipeDef, RecipeType,
 };
+use crate::zones;
+use crate::zones::zones as _;
 
 // ─── Tables ──────────────────────────────────────────────────────────────────
 
@@ -116,8 +118,9 @@ pub struct Action {
   /// changes for the lifetime of the action.
   #[index(btree)]
   pub card_id: u32,
-  /// Recipe registry index (`RecipeDef.index`).
-  pub recipe: u32,
+  /// Packed recipe id (`RecipeDef.index`) — see
+  /// [`crate::packing::pack_recipe`] for the layout.
+  pub recipe: u16,
   /// Owner of the actor card.
   #[index(btree)]
   pub owner_id: u32,
@@ -131,15 +134,23 @@ pub struct Action {
   pub end: u32,
   /// Nibble-packed participant counts: `[up_length:u4][down_length:u4]`
   /// (bits 7..4 / bits 3..0). Both counts include the actor. For
-  /// `TopStack` the actor and all slot fillers are in `up_length`;
-  /// `down_length` is zero. For `BottomStack` the reverse. `OnCreate`
+  /// `Stack(Up)` the actor and all slot fillers are in `up_length`;
+  /// `down_length` is zero. For `Stack(Down)` the reverse. `OnCreate`
   /// always has `up_length = 1, down_length = 0`. Unpack with:
   /// `up = (participants >> 4) & 0x0F`, `down = participants & 0x0F`.
   pub participants: u8,
+  /// Bit flags for per-action state that doesn't fit anywhere else
+  /// (paused, accelerated, debug-tinted, …). Specific bit assignments
+  /// are added as features need them; freshly-started rows start at
+  /// `0`. Callers that don't need flags don't have to think about them
+  /// — `start_action` zero-initializes the field.
+  pub flags: u8,
 }
 
 /// Scheduled trigger for `complete_action`. Private — clients have no
-/// reason to subscribe; they read `Action.end` instead.
+/// reason to subscribe; they read `Action.end` instead. Also carries
+/// the action's `hex_card_id` (server-only routing detail, kept off
+/// the public row).
 #[spacetimedb::table(accessor = action_scheduler, scheduled(complete_action))]
 #[derive(Debug, Clone)]
 pub struct ActionScheduler {
@@ -149,6 +160,15 @@ pub struct ActionScheduler {
   pub scheduled_at: ScheduleAt,
   #[index(btree)]
   pub action_id: u32,
+  /// The hex card the action is anchored to, when the recipe has a
+  /// `hex` precondition. `0` means "no hex" (the recipe doesn't
+  /// require one, or the resolved hex was a `zones`-only cell with
+  /// no `Card` row). Persisted at `start_action` so completion
+  /// doesn't have to re-derive the hex from server state — inventory
+  /// rows hold `micro_zone = 0` and a chain walk would lose the
+  /// relationship, so the matcher's already-resolved id is the
+  /// authoritative source. Server-only — not on the public `Action`.
+  pub hex_card_id: u32,
 }
 
 /// Claim record. Each card claimed by an action gets one row keyed by
@@ -191,10 +211,14 @@ fn current_seconds(ctx: &ReducerContext) -> Result<u32, String> {
 
 // ─── Action lifecycle helpers ────────────────────────────────────────────────
 
-/// Single chokepoint for action removal. Releases card holds, deletes the
-/// scheduler row, and deletes the action row. Every cancel and complete
-/// path goes through here.
+/// Single chokepoint for action removal. Tears down magnetic state
+/// (clears `position_held` flags, deletes the magnetic schedule),
+/// releases card holds, deletes the scheduler row, and deletes the
+/// action row. Every cancel and complete path goes through here.
+/// Calling on a non-magnetic action_id is a no-op for the magnetic
+/// half — `magnetic::release` is idempotent.
 fn delete_action_rows(ctx: &ReducerContext, action_id: u32) {
+  crate::magnetic::release(ctx, action_id);
   release_holds_for_action(ctx, action_id);
   let scheduler_ids: Vec<u64> = ctx
     .db
@@ -269,7 +293,7 @@ const ENTITY_WEIGHT_ANY: u32 = 1;
 ///
 /// Used both for "does this fit?" yes/no checks (caller compares `> 0`)
 /// and for the priority weighting that picks the best recipe across a
-/// stack (caller sums slot weights, plus tile/root tier weights).
+/// stack (caller sums slot weights, plus hex/root tier weights).
 fn entity_match_weight(entity: &Entity, card_def: &CardDefinition) -> u32 {
   match entity {
     Entity::Card(name) => {
@@ -334,8 +358,10 @@ fn entity_match_weight(entity: &Entity, card_def: &CardDefinition) -> u32 {
 }
 
 /// Thin boolean wrapper over `entity_match_weight` for callers that don't
-/// care about specificity.
-fn entity_matches(entity: &Entity, card_def: &CardDefinition) -> bool {
+/// care about specificity. Exposed for `magnetic.rs` (slot-fill candidate
+/// matching) — the match shape (Card vs Aspect vs Type vs Any plus the
+/// composite combinators) is intentionally a single source of truth.
+pub fn entity_matches(entity: &Entity, card_def: &CardDefinition) -> bool {
   entity_match_weight(entity, card_def) > 0
 }
 
@@ -389,20 +415,20 @@ fn aspect_pool(defs: &[&CardDefinition]) -> BTreeMap<AspectId, i32> {
 
 /// Lexicographically-compared priority for a successful recipe match.
 ///
-/// Field order **is** the comparison order: `tile_weight` outranks
+/// Field order **is** the comparison order: `hex_weight` outranks
 /// `root_weight` outranks `slot_weight`. Within a tier, the value is the
 /// `entity_match_weight` of how that condition was satisfied — so
-/// `tile: "forest"` (Card → 4) outranks `tile: ["wood", 1]` (Aspect → 3)
-/// in the tile tier without ever consulting root or slots.
+/// `hex: "forest"` (Card → 4) outranks `hex: ["wood", 1]` (Aspect → 3)
+/// in the hex tier without ever consulting root or slots.
 ///
-/// Recipes with no `tile` field score `tile_weight = 0`; same for `root`.
+/// Recipes with no `hex` field score `hex_weight = 0`; same for `root`.
 /// `slot_weight` is the sum of per-slot weights, so a recipe with N
 /// card-key slots scores 4N — but no number of slot weights can defeat a
-/// recipe whose tile/root tier is non-zero, because comparison stops at
+/// recipe whose hex/root tier is non-zero, because comparison stops at
 /// the first non-equal tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 struct MatchWeight {
-  tile_weight: u32,
+  hex_weight: u32,
   root_weight: u32,
   slot_weight: u32,
 }
@@ -449,13 +475,14 @@ fn decode_chain(chain: &[Card]) -> Result<Vec<Option<&'static CardDefinition>>, 
 /// Score `recipe` for an actor at `branch_chain[actor_idx]` over the
 /// visible window `branch_chain[actor_idx..visible_end]`. The chain
 /// root is always `branch_chain[0]` (the submitted root) regardless of
-/// where the actor sits — for `top_stack` and `bottom_stack` recipes
+/// where the actor sits — for `Stack(Up)` and `Stack(Down)` recipes
 /// alike. Returns `None` if the slot list doesn't fit, any required
 /// entity fails to match, or any decode fails.
 fn score_recipe_for_actor(
   recipe: &RecipeDef,
   branch_chain: &[Card],
   branch_chain_defs: &[Option<&'static CardDefinition>],
+  hex_def: Option<&'static CardDefinition>,
   actor_idx: usize,
   visible_end: usize,
 ) -> Option<ActorMatch> {
@@ -476,6 +503,23 @@ fn score_recipe_for_actor(
     return None;
   }
 
+  // Hex tier — top of the priority hierarchy. When `recipe.hex` is set,
+  // the chain root must be a rectangle attached to a hex (`stacked_state
+  // == 3`) AND the hex card's def must satisfy `recipe.hex`. The hex
+  // card itself is pre-resolved by the caller and passed in as
+  // `hex_def`; if `hex_def` is `None` here while `recipe.hex` is `Some`,
+  // the chain isn't on a hex and the recipe doesn't match.
+  let hex_weight = if let Some(hex_entity) = &recipe.hex {
+    let def = hex_def?;
+    let w = entity_match_weight(hex_entity, def);
+    if w == 0 {
+      return None;
+    }
+    w
+  } else {
+    0
+  };
+
   // Root tier weight — constant across actor positions because the
   // chain root is always `branch_chain[0]`. For recipes without
   // `root`, contributes 0.
@@ -489,10 +533,6 @@ fn score_recipe_for_actor(
   } else {
     0
   };
-
-  // Tile tier — forward-looking. See note on tile resolution in
-  // `data/recipes/AGENT.md`. Today this is always 0.
-  let tile_weight = 0;
 
   let mut slot_weight: u32 = 0;
   for (i, slot_entity) in recipe.slots.iter().enumerate() {
@@ -513,7 +553,8 @@ fn score_recipe_for_actor(
 
   // Aspect pool for duration: every claimed card's def + the chain
   // root's def for rooted recipes (the root contributes its aspects
-  // to the pool even though it isn't held).
+  // to the pool even though it isn't held). Hex aspects don't
+  // contribute today — the hex is a precondition, not a participant.
   let mut claim_defs: Vec<&CardDefinition> = claimed
     .iter()
     .filter_map(|id| {
@@ -533,7 +574,7 @@ fn score_recipe_for_actor(
   let pool = aspect_pool(&claim_defs);
 
   Some(ActorMatch {
-    weight: MatchWeight { tile_weight, root_weight, slot_weight },
+    weight: MatchWeight { hex_weight, root_weight, slot_weight },
     claimed,
     pool,
   })
@@ -618,14 +659,28 @@ fn slot_fillers_unchanged(
 /// Process the top branch of a submitted stack. `branch_chain_ids` is
 /// `[root, stack_up[0], stack_up[1], …]`. For every card in the chain,
 /// the matcher evaluates that card as a potential actor over its
-/// visible chain, scores all `TopStack` recipes, and applies the
+/// visible chain, scores all `Stack(Up)` recipes, and applies the
 /// upgrade rules from the module docs.
+///
+/// `hex_card_id` is the chain-root → hex card_id relationship the
+/// client extracted from its local root row's `micro_location` when
+/// its `stacked_state == 3`. The server can't read this from its own
+/// row (inventory cards on the server hold `micro_zone = 0` by
+/// convention), so the client carries it on `InventoryStack.hex`.
+/// `None` means the chain isn't on a hex.
 pub fn process_top_branch(
   ctx: &ReducerContext,
   branch_chain_ids: &[u32],
+  hex_card_id: Option<u32>,
   owner_id: u32,
 ) -> Result<(), String> {
-  process_branch(ctx, branch_chain_ids, RecipeType::TopStack, owner_id)
+  process_branch(
+    ctx,
+    branch_chain_ids,
+    hex_card_id,
+    RecipeType::Stack(definitions::StackDirection::Up),
+    owner_id,
+  )
 }
 
 /// Same as [`process_top_branch`] for the bottom branch.
@@ -633,14 +688,22 @@ pub fn process_top_branch(
 pub fn process_bottom_branch(
   ctx: &ReducerContext,
   branch_chain_ids: &[u32],
+  hex_card_id: Option<u32>,
   owner_id: u32,
 ) -> Result<(), String> {
-  process_branch(ctx, branch_chain_ids, RecipeType::BottomStack, owner_id)
+  process_branch(
+    ctx,
+    branch_chain_ids,
+    hex_card_id,
+    RecipeType::Stack(definitions::StackDirection::Down),
+    owner_id,
+  )
 }
 
 fn process_branch(
   ctx: &ReducerContext,
   branch_chain_ids: &[u32],
+  hex_card_id: Option<u32>,
   recipe_type: RecipeType,
   owner_id: u32,
 ) -> Result<(), String> {
@@ -650,11 +713,24 @@ fn process_branch(
   let branch_chain = fetch_cards(ctx, branch_chain_ids)?;
   let branch_chain_defs = decode_chain(&branch_chain)?;
 
+  // The hex (if any) under the chain root is constant across actor
+  // positions in this branch — pre-resolve it once so the per-actor
+  // scoring loop doesn't re-do the lookup. `None` means the chain
+  // root isn't on a hex (or the resolved hex card / zone cell is
+  // missing). The resolved `card_id` (when non-zero) is passed all
+  // the way down to `start_action` so it can be persisted on the
+  // `Action` row for `complete_action` to re-use.
+  let hex_hit = resolve_hex_at_root(ctx, &branch_chain[0], hex_card_id)?;
+  let hex_def = hex_hit.map(|h| h.def);
+  let resolved_hex_card_id = hex_hit.map_or(0, |h| h.card_id);
+
   for actor_idx in 0..branch_chain.len() {
     process_actor_candidate(
       ctx,
       &branch_chain,
       &branch_chain_defs,
+      hex_def,
+      resolved_hex_card_id,
       actor_idx,
       recipe_type,
       owner_id,
@@ -663,12 +739,115 @@ fn process_branch(
   Ok(())
 }
 
+/// What both the matcher and the product router need to know about
+/// the hex below a chain root. Resolved by [`resolve_hex_at_root`]
+/// (or via the actor-side walker [`find_hex_under_actor_chain`]).
+#[derive(Debug, Clone, Copy)]
+struct HexHit {
+  /// The hex card's `card_id` when backed by a `Card` row, otherwise
+  /// `0`. Persisted on `ActionScheduler.hex_card_id` (server-only;
+  /// not on the public `Action`) so `complete_action` can re-resolve
+  /// via the override path even when the actor's chain walk would
+  /// lose the relationship (e.g. inventory chains, where rows hold
+  /// `micro_zone = 0`).
+  card_id: u32,
+  /// The hex card's definition. Always present when the hex resolves
+  /// — whether from a `Card` row in the `cards` table or by decoding
+  /// the corresponding cell from the `zones` table.
+  def: &'static CardDefinition,
+  /// The hex card's `owner_id` if the hex is backed by a `Card` row.
+  /// `0` when the hex was decoded from `zones` only — packed Zone
+  /// cells don't carry per-cell ownership, so `(Inventory, Hex)`
+  /// product targets fall back to the actor's panel in that case.
+  owner_id: u32,
+}
+
+/// Resolve the hex below `root`. Three paths, in priority order:
+///
+/// **1. Client override** (`override_card_id`, used by
+/// `submit_inventory_stacks`): inventory cards on the server hold
+/// `micro_zone = 0` regardless of the client's local stack state, so
+/// the rect-on-hex relationship can't be read from the row. The
+/// client carries it on [`crate::cards::InventoryStack::hex`]
+/// (extracted from its local root row's `micro_location` when
+/// `stacked_state == 3`); when set here, look that card up directly
+/// and use its def + `owner_id`. `None` falls through to the
+/// row-derived paths.
+///
+/// **2. `cards` lookup via `root.micro_location`** (rect-on-hex
+/// derived from the row's stack_state): when
+/// `root.micro_zone & 0b11 == 3` and `root.micro_location != 0`,
+/// treat micro_location as a hex card_id. Used by world-layer stacks
+/// where stack_state IS tracked server-side, and by magnetic
+/// placements that promoted a tile to a real `Card` row.
+///
+/// **3. `zones` decode** (rect-on-hex over a packed Zone cell):
+/// when the cards lookup misses, decode the corresponding cell from
+/// the `zones` row at `root.macro_zone`. Owner_id is `0` because
+/// packed Zone cells don't carry per-cell ownership.
+///
+/// Returns `Ok(None)` if no path resolves a hex.
+fn resolve_hex_at_root(
+  ctx: &ReducerContext,
+  root: &Card,
+  override_card_id: Option<u32>,
+) -> Result<Option<HexHit>, String> {
+  // Path 1: client override.
+  if let Some(hex_id) = override_card_id {
+    if hex_id != 0 {
+      if let Some(hex_card) = ctx.db.cards().card_id().find(&hex_id) {
+        let Some(def) = card_def_for(&hex_card)? else {
+          return Ok(None);
+        };
+        return Ok(Some(HexHit { card_id: hex_card.card_id, def, owner_id: hex_card.owner_id }));
+      }
+    }
+    // Override supplied but didn't resolve — fall through to the
+    // row-derived paths rather than failing outright.
+  }
+  // Paths 2 & 3 require the chain root's stack_state to indicate
+  // rect-on-hex — inventory chains hit `None` here (which is why
+  // path 1 exists).
+  if (root.micro_zone & 0b11) != 3 {
+    return Ok(None);
+  }
+  // Path 2: cards table via root.micro_location.
+  if root.micro_location != 0 {
+    if let Some(hex_card) = ctx.db.cards().card_id().find(&root.micro_location) {
+      let Some(def) = card_def_for(&hex_card)? else {
+        return Ok(None);
+      };
+      return Ok(Some(HexHit { card_id: hex_card.card_id, def, owner_id: hex_card.owner_id }));
+    }
+  }
+  // Path 3: zones table fallback.
+  let Some(zone) = ctx.db.zones().macro_zone().find(&root.macro_zone) else {
+    return Ok(None);
+  };
+  let coord = zones::LocalCoord::from_micro_zone(root.micro_zone);
+  let cell_id = zones::read_cell(&zone.cell_rows(), coord);
+  if cell_id == 0 {
+    return Ok(None);
+  }
+  let packed = zones::cell_packed_definition(zone.packed_definition, cell_id);
+  let Some(def) = definitions::decode_definition(packed)? else {
+    return Ok(None);
+  };
+  // Zones-resolved cells aren't backed by a Card row — card_id is
+  // `0`. The defense check at completion only inspects `def`, and
+  // products with `Hex` owner fall back to the actor's panel when
+  // owner_id is 0.
+  Ok(Some(HexHit { card_id: 0, def, owner_id: 0 }))
+}
+
 /// Apply the upgrade decision for one actor candidate. Single source of
 /// truth for the four-way table in the module docs.
 fn process_actor_candidate(
   ctx: &ReducerContext,
   branch_chain: &[Card],
   branch_chain_defs: &[Option<&'static CardDefinition>],
+  hex_def: Option<&'static CardDefinition>,
+  hex_card_id: u32,
   actor_idx: usize,
   recipe_type: RecipeType,
   owner_id: u32,
@@ -718,6 +897,7 @@ fn process_actor_candidate(
       recipe,
       branch_chain,
       branch_chain_defs,
+      hex_def,
       actor_idx,
       visible_end,
     ) else {
@@ -748,7 +928,7 @@ fn process_actor_candidate(
       Ok(())
     }
     (None, Some((recipe, m))) => {
-      start_action(ctx, recipe, actor, branch_chain, &m, owner_id)?;
+      start_action(ctx, recipe, actor, &m, hex_card_id, owner_id)?;
       Ok(())
     }
     (Some(a), Some((recipe, m))) => {
@@ -761,7 +941,7 @@ fn process_actor_candidate(
       } else {
         // Different recipe, or slot fillers moved — cancel and start.
         delete_action_rows(ctx, a.action_id);
-        start_action(ctx, recipe, actor, branch_chain, &m, owner_id)?;
+        start_action(ctx, recipe, actor, &m, hex_card_id, owner_id)?;
         Ok(())
       }
     }
@@ -769,8 +949,20 @@ fn process_actor_candidate(
 }
 
 /// `OnCreate` matcher. The freshly-created card is both root and
-/// actor; the visible chain is the card itself. Picks the highest-
-/// weight `OnCreate` recipe whose `root` entity matches the card.
+/// actor; the visible chain is the card itself. The recipe identifies
+/// the target via either `recipe.hex` (matches a hex-shaped card) or
+/// `recipe.root` (matches any card type) — both may be set. The
+/// matcher picks the highest-weight recipe whose specified entity (or
+/// entities) match the new card's def.
+///
+/// When the new card matches via `recipe.hex`, its id is also
+/// persisted on the started action's `hex_card_id` so completion can
+/// re-resolve the hex without walking the chain — relevant for
+/// non-magnetic on_create recipes that carry a hex precondition
+/// (the id lives on `ActionScheduler`, not `Action`).
+/// Magnetic recipes pivot to `magnetic::install` from `start_action`
+/// and don't write an `Action` row, so the persistence is only
+/// observable for the regular path.
 pub fn try_start_on_create_action(
   ctx: &ReducerContext,
   card_id: u32,
@@ -790,33 +982,58 @@ pub fn try_start_on_create_action(
     return Ok(None);
   }
 
-  let mut best: Option<(&'static RecipeDef, ActorMatch)> = None;
+  let mut best: Option<(&'static RecipeDef, ActorMatch, u32)> = None;
   for recipe in definitions::recipes_of_type(RecipeType::OnCreate)? {
-    let Some(root_entity) = &recipe.root else { continue };
-    let root_w = entity_match_weight(root_entity, card_def);
-    if root_w == 0 {
+    // Hex tier — when the recipe specifies `hex`, the new card must
+    // be a hex-shaped type AND match the entity. A rect-typed card
+    // can't satisfy a hex precondition even if its key/aspects line
+    // up.
+    let mut hex_weight: u32 = 0;
+    let mut hex_card_id_for_action: u32 = 0;
+    if let Some(hex_entity) = &recipe.hex {
+      if !definitions::is_hex_type(card_def.card_type)? {
+        continue;
+      }
+      let w = entity_match_weight(hex_entity, card_def);
+      if w == 0 {
+        continue;
+      }
+      hex_weight = w;
+      hex_card_id_for_action = card_id;
+    }
+
+    // Root tier — entity match against the new card's def with no
+    // shape constraint.
+    let mut root_weight: u32 = 0;
+    if let Some(root_entity) = &recipe.root {
+      let w = entity_match_weight(root_entity, card_def);
+      if w == 0 {
+        continue;
+      }
+      root_weight = w;
+    }
+
+    // Recipe with neither hex nor root has nothing to match against
+    // for `OnCreate`. The parser rejects these, but defense in depth.
+    if hex_weight == 0 && root_weight == 0 {
       continue;
     }
+
     let pool = aspect_pool(&[card_def]);
     let m = ActorMatch {
-      weight: MatchWeight {
-        tile_weight: 0,
-        root_weight: root_w,
-        slot_weight: 0,
-      },
+      weight: MatchWeight { hex_weight, root_weight, slot_weight: 0 },
       claimed: vec![card_id],
       pool,
     };
     match best.as_ref() {
-      None => best = Some((recipe, m)),
-      Some((_, b)) if m.weight > b.weight => best = Some((recipe, m)),
+      None => best = Some((recipe, m, hex_card_id_for_action)),
+      Some((_, b, _)) if m.weight > b.weight => best = Some((recipe, m, hex_card_id_for_action)),
       _ => {}
     }
   }
   match best {
-    Some((recipe, m)) => {
-      let branch_chain = vec![card.clone()];
-      let action_id = start_action(ctx, recipe, &card, &branch_chain, &m, card.owner_id)?;
+    Some((recipe, m, hex_card_id)) => {
+      let action_id = start_action(ctx, recipe, &card, &m, hex_card_id, card.owner_id)?;
       Ok(Some(action_id))
     }
     None => Ok(None),
@@ -827,15 +1044,38 @@ pub fn try_start_on_create_action(
 
 /// Insert an Action row, schedule its completion, and claim every card
 /// in the match window. Returns the new `action_id`.
+///
+/// `hex_card_id` is the hex anchor resolved by the matcher (0 when
+/// the recipe has no hex precondition, or the resolved hex was a
+/// `zones`-only cell with no `Card` row). Persisted on
+/// `ActionScheduler.hex_card_id` (private — kept off the public
+/// `Action` row) so `complete_action` doesn't need to re-derive it
+/// from server state — necessary for inventory chains where rows
+/// hold `micro_zone = 0`.
 fn start_action(
   ctx: &ReducerContext,
   recipe: &RecipeDef,
   actor: &Card,
-  branch_chain: &[Card],
   m: &ActorMatch,
+  hex_card_id: u32,
   owner_id: u32,
 ) -> Result<u32, String> {
-  let duration = resolve_duration(&recipe.duration, &m.pool);
+  // Magnetic recipes pivot here — instead of going into the actions
+  // table, the matched outer recipe installs a magnetic_action that
+  // ticks every `recipe.interval` and queues an inner action when an
+  // inner's slots fill. See `magnetic.rs`.
+  if recipe.magnetic.is_some() {
+    return crate::magnetic::install(ctx, recipe, actor, owner_id);
+  }
+
+  // Non-magnetic recipes: parser guarantees `duration.is_some()`.
+  let duration_def = recipe.duration.as_ref().ok_or_else(|| {
+    format!(
+      "non-magnetic recipe {:?} reached start_action without a duration — parser invariant broken",
+      recipe.id
+    )
+  })?;
+  let duration = resolve_duration(duration_def, &m.pool);
   let now = current_seconds(ctx)?;
   let end = now.saturating_add(duration);
 
@@ -854,9 +1094,12 @@ fn start_action(
     ));
   }
   let slot_count = slot_count as u8;
+  // Stack recipes include the actor as `slots[0]`. OnCreate has the
+  // actor implicitly as the new card with no slot list. Magnetic
+  // recipes pivoted away above so they don't reach this match.
   let participants = match recipe.recipe_type {
-    RecipeType::TopStack => pack_participants(slot_count, 0),
-    RecipeType::BottomStack => pack_participants(0, slot_count),
+    RecipeType::Stack(definitions::StackDirection::Up) => pack_participants(slot_count, 0),
+    RecipeType::Stack(definitions::StackDirection::Down) => pack_participants(0, slot_count),
     RecipeType::OnCreate => pack_participants(1, 0),
   };
 
@@ -869,11 +1112,13 @@ fn start_action(
     macro_zone: actor.macro_zone,
     end,
     participants,
+    flags: 0,
   });
   ctx.db.action_scheduler().insert(ActionScheduler {
     scheduled_id: 0,
     scheduled_at: ScheduleAt::Time(complete_at),
     action_id: inserted.action_id,
+    hex_card_id,
   });
   claim_cards(ctx, inserted.action_id, &m.claimed);
   Ok(inserted.action_id)
@@ -955,22 +1200,8 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
     .collect();
   let claimed_cards = fetch_cards(ctx, &claimed_ids)?;
 
-  // Defense-in-depth: re-check that every claimed card's current
-  // definition still satisfies the recipe shape. The upgrade path is
-  // supposed to cancel any action whose claim drifted, but a desync
-  // (mutated card def, lost hold, etc.) shouldn't be able to push a
-  // stale completion through. Refuse rather than produce mismatched
-  // products.
-  if !recipe_still_satisfies_claim(recipe, &claimed_cards)? {
-    delete_action_rows(ctx, action_id);
-    return Err(format!(
-      "complete_action: action {} no longer satisfies recipe {:?} — refused",
-      action_id, recipe.id,
-    ));
-  }
-
   // Find the actor inside the claim list (it always has a hold). Used
-  // for product-target resolution.
+  // for product-target resolution and as the start of the hex walk.
   let actor = claimed_cards
     .iter()
     .find(|c| c.card_id == action.card_id)
@@ -982,47 +1213,108 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
       )
     })?;
 
-  // Generate products before deleting reagents. The RNG seed is the
-  // scheduler id so the outcome is reproducible per-action.
-  if !recipe.products.is_empty() {
-    let mut rng_state: u32 = scheduler.scheduled_id as u32;
-    generate_products(ctx, recipe, &actor, &mut rng_state)?;
+  // Resolve the hex (if any) anchored under this action. Prefer the
+  // id the matcher persisted on the scheduler at start time —
+  // inventory chains hold `micro_zone = 0` server-side, so a chain
+  // walk would lose the relationship for stack-on-hex actions. Fall
+  // back to walking the actor's chain only when no anchor was
+  // recorded (OnCreate paths, and any future world-layer flow that
+  // hasn't plumbed `hex_card_id` through `start_action`). `None`
+  // means the recipe wasn't on a hex (or the hex has since
+  // vanished); the defense check below catches the "vanished" case.
+  let hex_hit = if real_scheduler.hex_card_id != 0 {
+    resolve_hex_at_root(ctx, &actor, Some(real_scheduler.hex_card_id))?
+  } else {
+    find_hex_under_actor_chain(ctx, &actor)?
+  };
+
+  // Defense-in-depth: re-check that every claimed card's current
+  // definition still satisfies the recipe shape, and that the hex
+  // precondition (if any) still holds. The upgrade path is supposed
+  // to cancel any action whose claim drifted, but a desync (mutated
+  // card def, hex moved, lost hold, etc.) shouldn't be able to push
+  // a stale completion through. Refuse rather than produce mismatched
+  // products.
+  if !recipe_still_satisfies_claim(recipe, &claimed_cards, hex_hit.as_ref().map(|h| h.def))? {
+    delete_action_rows(ctx, action_id);
+    return Err(format!(
+      "complete_action: action {} no longer satisfies recipe {:?} — refused",
+      action_id, recipe.id,
+    ));
   }
 
-  // Consume reagents. Reagent indices are 1-based against the recipe's
-  // slots (slot 1 = actor, slot 2 = next card outward, …); index `0`
-  // refers to the chain root.
+  // For actions queued from the magnetic phase (`flags & MAGNETIC`),
+  // the products/reagents come from the *inner* recipe (sub-id'd in
+  // the high 4 bits of `flags`), not the outer that lives at
+  // `action.recipe`. Resolve here so the rest of completion is
+  // source-stable.
+  let (products_to_fire, reagents_to_consume, completion_recipe_type) =
+    if (action.flags & crate::magnetic::FLAG_ACTION_MAGNETIC) != 0 {
+      let bucket = recipe.magnetic.as_ref().ok_or_else(|| {
+        format!(
+          "complete_action: action {} has MAGNETIC flag but recipe {:?} has no magnetic bucket",
+          action_id, recipe.id
+        )
+      })?;
+      let sub_id = crate::magnetic::unpack_action_subid(action.flags) as usize;
+      let inner = bucket.inners.get(sub_id).ok_or_else(|| {
+        format!(
+          "complete_action: sub_id {} out of range for recipe {:?} (have {} inners)",
+          sub_id, recipe.id, bucket.inners.len()
+        )
+      })?;
+      (
+        inner.products.as_slice(),
+        inner.reagents.as_slice(),
+        inner.recipe_type,
+      )
+    } else {
+      (
+        recipe.products.as_slice(),
+        recipe.reagents.as_slice(),
+        recipe.recipe_type,
+      )
+    };
+
+  // Generate products before deleting reagents. The RNG seed is the
+  // scheduler id so the outcome is reproducible per-action.
+  if !products_to_fire.is_empty() {
+    let mut rng_state: u32 = scheduler.scheduled_id as u32;
+    generate_products(ctx, products_to_fire, &actor, hex_hit.as_ref(), &mut rng_state)?;
+  }
+
+  // Consume reagents. Each entry is a `Reagent`:
   //
-  // For `OnCreate`, the actor *is* the chain root — `action.card_id`
-  // resolves both indices `0` and `1` to the same card. For stack
-  // recipes, the chain root isn't held (so multiple recipes can root
-  // on it concurrently) and isn't stored on the `Action` row, so
-  // reagent `0` is a no-op for stack recipes today; if a future
-  // recipe needs to consume the chain root of a stack, that's where
-  // chain-context-at-completion needs to come from. None of the
-  // current recipes use this for stack types.
-  //
-  // Reagents past slot 1 (`n >= 2`) need slot-position info that
-  // CardHold doesn't preserve — see TODO below.
-  for &reagent_idx in &recipe.reagents {
-    let card_id = match reagent_idx {
-      0 => match recipe.recipe_type {
+  // - `Reagent::Root` — the chain root. For `OnCreate`, the actor IS
+  //   the chain root, so this resolves to `action.card_id`. For stack
+  //   recipes the chain root isn't held (multiple recipes can root on
+  //   it concurrently) and isn't stored on the `Action` row, so this
+  //   is a no-op until chain context-at-completion lands.
+  // - `Reagent::Hex` — the hex card the action is anchored to,
+  //   recorded on `ActionScheduler.hex_card_id` at start time. `0`
+  //   (no anchor) is a no-op.
+  // - `Reagent::Slot(1)` — slot 1 is always the actor.
+  // - `Reagent::Slot(N)` for `N >= 2` — needs per-slot claim tracking
+  //   that doesn't exist yet; no-op for now.
+  for &reagent in reagents_to_consume {
+    let card_id = match reagent {
+      Reagent::Root => match completion_recipe_type {
         RecipeType::OnCreate => action.card_id,
-        RecipeType::TopStack | RecipeType::BottomStack => continue,
+        RecipeType::Stack(_) => continue,
       },
-      1 => {
-        // Slot 1 is always the actor.
-        action.card_id
+      Reagent::Hex => {
+        if real_scheduler.hex_card_id == 0 {
+          continue;
+        }
+        real_scheduler.hex_card_id
       }
-      _n => {
-        // TODO: reagents N >= 2 reference slot positions that aren't
-        // recoverable from `card_holds().action_id().filter()` alone
-        // (the iteration order is PK, not insertion). Fix by adding a
-        // `slot_index: u8` field to `CardHold` so we can look up the
-        // claim for a specific slot, or by storing the ordered claim
-        // list on the `Action` row. None of the recipes in
-        // `data/recipes/01.json` use this — every reagent there is 0
-        // or 1 — so this is forward-looking, not currently broken.
+      Reagent::Slot(1) => action.card_id,
+      Reagent::Slot(_n) => {
+        // TODO: slot N >= 2 references positions that aren't
+        // recoverable from `card_holds().action_id().filter()`
+        // alone (the iteration order is PK, not insertion). Fix
+        // by adding a `slot_index: u8` to `CardHold` or by
+        // storing the ordered claim list on the `Action` row.
         continue;
       }
     };
@@ -1039,19 +1331,29 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
     ctx.db.cards().card_id().delete(&card_id);
   }
 
+  // Tear down. For magnetic actions, this also clears `position_held`
+  // off any surviving slot cards (via `magnetic::release`) so the
+  // player can drag them again now that the action is over.
   delete_action_rows(ctx, action_id);
   Ok(())
 }
 
-/// Defense-in-depth: verify the claim window is still consistent with
-/// the recipe at completion time. The upgrade machinery is supposed to
-/// have cancelled any drifted action long before now; this is the
-/// belt-and-braces check that runs anyway.
+/// Defense-in-depth: verify the claim window and hex precondition are
+/// still consistent with the recipe at completion time. The upgrade
+/// machinery is supposed to have cancelled any drifted action long
+/// before now; this is the belt-and-braces check that runs anyway.
 ///
-/// Every claimed card must still match at least one slot entity in
-/// the recipe. This isn't a strict positional check (`CardHold` doesn't
-/// preserve slot index) but it catches a `packed_definition` that's
-/// drifted to something the recipe wouldn't accept at any position.
+/// - **Hex precondition**: when `recipe.hex.is_some()`, `hex_def` must
+///   be present and satisfy the hex entity. A hex that drifted to a
+///   different definition (or vanished entirely) fails the check.
+///   The upgrade machinery already refuses to keep the action running
+///   under those conditions, but a stale completion firing during the
+///   gap shouldn't be able to produce against a bad hex.
+/// - **Claim cards**: every claimed card must still match at least one
+///   slot entity. This isn't a strict positional check (`CardHold`
+///   doesn't preserve slot index) but it catches a `packed_definition`
+///   that's drifted to something the recipe wouldn't accept at any
+///   position.
 ///
 /// The chain root isn't held — so it isn't in `claimed_cards` and
 /// isn't checked here. The matcher re-validates `recipe.root` against
@@ -1061,15 +1363,41 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
 fn recipe_still_satisfies_claim(
   recipe: &RecipeDef,
   claimed_cards: &[Card],
+  hex_def: Option<&CardDefinition>,
 ) -> Result<bool, String> {
+  // Hex precondition re-check applies regardless of recipe shape —
+  // magnetic, on_create, or stack. If the recipe says "this fires on
+  // a despair hex", we want to refuse if the chain isn't on a despair
+  // hex anymore, even for magnetic where we trust the tick for the
+  // slot/actor invariants.
+  if let Some(hex_entity) = &recipe.hex {
+    let Some(def) = hex_def else {
+      return Ok(false);
+    };
+    if !entity_matches(hex_entity, def) {
+      return Ok(false);
+    }
+  }
+
+  // Magnetic recipes' `slots` enumerate inputs only — the actor isn't
+  // listed there but is still in `claimed_cards`, so a positional
+  // slot-match check would always reject the actor and fail. The
+  // magnetic tick maintains its own claim invariants every interval;
+  // trust them here for the slot side.
+  if recipe.magnetic.is_some() {
+    return Ok(true);
+  }
   for c in claimed_cards {
     let Some(def) = card_def_for(c)? else {
       return Ok(false);
     };
-    // OnCreate has empty `slots`; its claim is the actor / root, which
-    // we instead check against `recipe.root`.
+    // OnCreate has empty `slots`; its claim is the actor itself,
+    // which the recipe identified via either `root` or `hex` (both
+    // may be set). Either matching is sufficient.
     let matches = if recipe.slots.is_empty() {
-      recipe.root.as_ref().map_or(false, |r| entity_matches(r, def))
+      let by_root = recipe.root.as_ref().map_or(false, |r| entity_matches(r, def));
+      let by_hex = recipe.hex.as_ref().map_or(false, |h| entity_matches(h, def));
+      by_root || by_hex
     } else {
       recipe.slots.iter().any(|e| entity_matches(e, def))
     };
@@ -1078,6 +1406,52 @@ fn recipe_still_satisfies_claim(
     }
   }
   Ok(true)
+}
+
+/// Walk from `start` toward the chain root via `micro_location`,
+/// returning the hex below the chain (if any). The walk stops at the
+/// first card it finds with `stacked_state == 3` (HEX_ROOT — defer to
+/// [`resolve_hex_at_root`] which handles both `Card`-backed and
+/// `Zone`-only hexes) or `stacked_state == 0` (LOOSE — chain isn't on
+/// a hex). Mid-chain cards (`stacked_state == 1` or `2`) walk through
+/// to their parent via `micro_location`.
+///
+/// `Ok(None)` means the chain isn't on a hex; an actor whose chain
+/// dangles (broken `micro_location` link mid-walk) also returns
+/// `None`. `Err` surfaces only on a registry-build failure during the
+/// hex resolution.
+///
+/// Used by `complete_action` to route `(Inventory, Hex)` products and
+/// re-check the recipe's `hex` precondition. Mid-chain rectangles
+/// (`stacked_state` 1 or 2) are still expected to have `Card` rows —
+/// only the hex itself can live in `zones` without a `Card`.
+fn find_hex_under_actor_chain(
+  ctx: &ReducerContext,
+  start: &Card,
+) -> Result<Option<HexHit>, String> {
+  // Bound the walk so a corrupted `micro_location` cycle can't spin
+  // forever. Real chains are short (under 16 typically); 64 is
+  // generous.
+  const MAX_DEPTH: u32 = 64;
+  let mut current = start.clone();
+  for _ in 0..MAX_DEPTH {
+    let stack_state = current.micro_zone & 0b11;
+    match stack_state {
+      0 => return Ok(None), // loose root
+      // No client override at completion time — the magnetic
+      // placement or world-layer stack_state on the row is the
+      // source of truth here.
+      3 => return resolve_hex_at_root(ctx, &current, None),
+      _ => {
+        // Mid-chain: follow micro_location to parent and continue.
+        let Some(parent) = ctx.db.cards().card_id().find(&current.micro_location) else {
+          return Ok(None);
+        };
+        current = parent;
+      }
+    }
+  }
+  Ok(None)
 }
 
 // ─── Product generation ──────────────────────────────────────────────────────
@@ -1094,12 +1468,13 @@ enum ProductDestination {
 
 fn generate_products(
   ctx: &ReducerContext,
-  recipe: &RecipeDef,
+  products: &[ProductGroup],
   actor: &Card,
+  hex: Option<&HexHit>,
   rng: &mut u32,
 ) -> Result<(), String> {
-  for group in &recipe.products {
-    let dest = resolve_product_destination(&group.target, actor);
+  for group in products {
+    let dest = resolve_product_destination(&group.target, actor, hex);
     for entity in &group.entities {
       generate_entity_products(ctx, entity, &dest, rng)?;
     }
@@ -1110,24 +1485,34 @@ fn generate_products(
 fn resolve_product_destination(
   target: &ProductTarget,
   actor: &Card,
+  hex: Option<&HexHit>,
 ) -> ProductDestination {
-  // The destination panel is identified by `macro_zone` — the player
-  // whose inventory holds the relevant card — *not* by `owner_id`. For
-  // inventory cards `macro_zone == panel_player_id` by definition.
+  // For an inventory destination, the panel is identified by
+  // `macro_zone` — the player whose inventory holds the relevant card.
   //
-  // `RootPanel` would ideally route to the chain root's holder, but
-  // the chain root isn't held by the action and isn't recoverable
-  // from server state at completion (server doesn't track inventory
-  // stack composition). For the inventory POC every claimed card is
-  // in the same player's panel anyway, so falling back to the actor's
-  // panel is a no-op there. When world layers land and a stack can
-  // span panels, the chain root will need a server-side
-  // representation (likely passed at submission and snapshotted onto
-  // the `Action` row).
-  match target {
-    ProductTarget::ActorPanel | ProductTarget::RootPanel => ProductDestination::Panel {
+  // - `Actor` uses the actor's panel directly.
+  // - `Root` would ideally route to the chain root's holder, but the
+  //   chain root isn't held by the action and isn't recoverable from
+  //   server state at completion; fall back to the actor's panel (a
+  //   no-op for the inventory POC where every claimed card sits in
+  //   the same player's panel anyway).
+  // - `Hex` routes to the hex card's `owner_id` panel — useful for
+  //   recipes that produce items "for" the hex's owner. Falls back to
+  //   the actor's panel when the chain isn't on a hex, the hex is
+  //   unowned (`owner_id == 0`), or the hex resolved from a `Zone`
+  //   cell (which doesn't carry an `owner_id`).
+  match (target.place, target.owner) {
+    (ProductPlace::Inventory, ProductOwner::Actor)
+    | (ProductPlace::Inventory, ProductOwner::Root) => ProductDestination::Panel {
       panel_player_id: actor.macro_zone,
     },
+    (ProductPlace::Inventory, ProductOwner::Hex) => {
+      let panel_player_id = match hex {
+        Some(h) if h.owner_id != 0 => h.owner_id,
+        _ => actor.macro_zone,
+      };
+      ProductDestination::Panel { panel_player_id }
+    }
   }
 }
 
