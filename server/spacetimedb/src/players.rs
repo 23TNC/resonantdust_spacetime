@@ -39,6 +39,11 @@ pub struct Player {
   /// parent `card_id` (if the soul is attached to another card) or packed
   /// `(i16 x, i16 y)` pixel coords (if loose). `0` while unplaced.
   pub micro_location: u32,
+  /// Scheduled-reducer lag at the time of this row write, in 16-ms
+  /// steps (saturating at 255). `0` for client-driven writes;
+  /// non-zero only inside a scheduled reducer fire that's running
+  /// late. See [`crate::delta_t`].
+  pub delta_t: u8,
 }
 
 /// Maps a connection's current `Identity` to the persistent `player_id`.
@@ -151,7 +156,7 @@ pub fn delete_player(ctx: &ReducerContext, player_id: u32) {
     card_ids.insert(c.card_id);
   }
   for card_id in card_ids {
-    ctx.db.cards().card_id().delete(&card_id);
+    crate::cards::mark_card_dead(ctx, card_id);
   }
 
   ctx.db.players().player_id().delete(&player_id);
@@ -200,6 +205,7 @@ pub fn claim_or_login(ctx: &ReducerContext, name: String) -> Result<(), String> 
         macro_zone: 0,
         micro_zone: 0,
         micro_location: 0,
+        delta_t: crate::delta_t::current(),
       });
       row.player_id
     }

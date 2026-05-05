@@ -145,6 +145,11 @@ pub struct Action {
   /// `0`. Callers that don't need flags don't have to think about them
   /// — `start_action` zero-initializes the field.
   pub flags: u8,
+  /// Scheduled-reducer lag at the time of this row write, in 16-ms
+  /// steps (saturating at 255). `0` for client-driven writes;
+  /// non-zero only inside a scheduled reducer fire that's running
+  /// late. See [`crate::delta_t`].
+  pub delta_t: u8,
 }
 
 /// Scheduled trigger for `complete_action`. Private — clients have no
@@ -211,13 +216,67 @@ fn current_seconds(ctx: &ReducerContext) -> Result<u32, String> {
 
 // ─── Action lifecycle helpers ────────────────────────────────────────────────
 
+/// `dead` flag bit on `Action.flags` (mirrors `data/flags.json`'s
+/// `actions.dead`). Set as an UPDATE — rather than the row being
+/// deleted directly — so the write carries `delta_t` and the
+/// client can back-date its end animation by `16 * delta_t` ms.
+/// Mirrors `cards.dead` at bit 7 so the client can use one mask
+/// across both tables.
+pub const FLAG_ACTION_DEAD: u8 = 1 << 7;
+
+/// `canceled` flag bit on `Action.flags` (mirrors
+/// `data/flags.json`'s `actions.canceled`). Set together with
+/// [`FLAG_ACTION_DEAD`] when the action ended for a reason *other*
+/// than normal recipe completion (matcher upgrade, claim drift,
+/// reagent stolen by another action, etc.). Lets the client play
+/// a different animation for cancellation vs. successful
+/// completion. Always set in the same UPDATE as `dead`, never on
+/// its own.
+pub const FLAG_ACTION_CANCELED: u8 = 1 << 1;
+
+/// How long a dead-flagged action lingers before its actual delete
+/// fires. Matches `cards::CARD_REAP_DELAY_SECS` so the client sees
+/// dead cards and dead actions vanish on the same cadence.
+pub const ACTION_REAP_DELAY_SECS: u32 = 10;
+
+/// Scheduled-deletion queue for actions flagged
+/// [`FLAG_ACTION_DEAD`]. Private — clients have no reason to
+/// subscribe; the end animation is driven by the `dead` bit flip
+/// on the public `Action` row, not by this table. One row per dead
+/// action.
+///
+/// Inserted by [`mark_action_dead`] at the time the action is
+/// flagged; `scheduled_at` is `now + ACTION_REAP_DELAY_SECS`.
+/// SpacetimeDB fires [`reap_dead_action`] when the time arrives
+/// and removes the row from this table after the reducer returns.
+#[spacetimedb::table(accessor = pending_action_deletions, scheduled(reap_dead_action))]
+#[derive(Debug, Clone)]
+pub struct PendingActionDeletion {
+  #[primary_key]
+  #[auto_inc]
+  pub scheduled_id: u64,
+  pub scheduled_at: ScheduleAt,
+  /// PK of the `Action` row to delete when this fires.
+  pub action_id: u32,
+}
+
 /// Single chokepoint for action removal. Tears down magnetic state
 /// (clears `position_held` flags, deletes the magnetic schedule),
-/// releases card holds, deletes the scheduler row, and deletes the
-/// action row. Every cancel and complete path goes through here.
-/// Calling on a non-magnetic action_id is a no-op for the magnetic
-/// half — `magnetic::release` is idempotent.
-fn delete_action_rows(ctx: &ReducerContext, action_id: u32) {
+/// releases card holds, deletes the scheduler row, and marks the
+/// public `Action` row dead — the actual delete is scheduled via
+/// the reaper so the dead-event UPDATE can carry `delta_t` for
+/// client latency compensation. Every cancel and complete path
+/// goes through here. Calling on a non-magnetic action_id is a
+/// no-op for the magnetic half — `magnetic::release` is
+/// idempotent.
+///
+/// `canceled` distinguishes "ended without producing products"
+/// (matcher upgrade, claim drift, reagent stolen, etc.) from
+/// normal recipe completion. Cancel paths pass `true`; the normal
+/// completion path at the end of `complete_action` passes `false`.
+/// The flag rides along with `dead` in the same UPDATE so the
+/// client can branch its animation on it.
+fn delete_action_rows(ctx: &ReducerContext, action_id: u32, canceled: bool) {
   crate::magnetic::release(ctx, action_id);
   release_holds_for_action(ctx, action_id);
   let scheduler_ids: Vec<u64> = ctx
@@ -230,7 +289,77 @@ fn delete_action_rows(ctx: &ReducerContext, action_id: u32) {
   for id in scheduler_ids {
     ctx.db.action_scheduler().scheduled_id().delete(&id);
   }
-  ctx.db.actions().action_id().delete(&action_id);
+  mark_action_dead(ctx, action_id, canceled);
+}
+
+/// Mark an action as dead — sets [`FLAG_ACTION_DEAD`] (and
+/// optionally [`FLAG_ACTION_CANCELED`]), stamps `delta_t` (so the
+/// client can back-date its end animation), and schedules the
+/// actual row deletion for `now + ACTION_REAP_DELAY_SECS`.
+///
+/// `canceled = true` means the action ended for a reason other
+/// than normal recipe completion (matcher upgrade, drift, reagent
+/// stolen, etc.). The cancel and dead bits are set in the same
+/// UPDATE so the client receives them together.
+///
+/// Idempotent — calling twice on the same action is a no-op the
+/// second time (the dead bit's already set; we don't re-stamp the
+/// canceled bit or schedule another reap). Missing action is also
+/// a no-op.
+///
+/// Caller responsibility: the matching `action_scheduler` and
+/// `card_holds` rows are private state and should be deleted
+/// eagerly *before* this call — once the action is dead the
+/// matcher must not see those private rows. `delete_action_rows`
+/// does this in the right order.
+pub fn mark_action_dead(ctx: &ReducerContext, action_id: u32, canceled: bool) {
+  let Some(action) = ctx.db.actions().action_id().find(&action_id) else {
+    return;
+  };
+  if (action.flags & FLAG_ACTION_DEAD) != 0 {
+    return;
+  }
+  let mut updated = action;
+  updated.flags |= FLAG_ACTION_DEAD;
+  if canceled {
+    updated.flags |= FLAG_ACTION_CANCELED;
+  }
+  updated.delta_t = crate::delta_t::current();
+  ctx.db.actions().action_id().update(updated);
+
+  let reap_at = Timestamp::from_micros_since_unix_epoch(
+    ctx
+      .timestamp
+      .to_micros_since_unix_epoch()
+      .saturating_add((ACTION_REAP_DELAY_SECS as i64).saturating_mul(1_000_000)),
+  );
+  ctx.db.pending_action_deletions().insert(PendingActionDeletion {
+    scheduled_id: 0,
+    scheduled_at: ScheduleAt::Time(reap_at),
+    action_id,
+  });
+}
+
+/// Scheduled reducer — fires `ACTION_REAP_DELAY_SECS` after an
+/// action is flagged dead and removes the row. Defended against
+/// client-spoofed invocation: the scheduler row must still exist
+/// (legitimate fires see it; SpacetimeDB deletes it after this
+/// returns). The `Action` row itself may already be gone if some
+/// other path removed it directly — `delete` on a missing PK is a
+/// silent no-op, which is the right behavior here.
+#[reducer]
+pub fn reap_dead_action(ctx: &ReducerContext, deletion: PendingActionDeletion) -> Result<(), String> {
+  if ctx
+    .db
+    .pending_action_deletions()
+    .scheduled_id()
+    .find(&deletion.scheduled_id)
+    .is_none()
+  {
+    return Ok(());
+  }
+  ctx.db.actions().action_id().delete(&deletion.action_id);
+  Ok(())
 }
 
 /// Insert a CardHold per claimed card_id, all keyed to `action_id`. If a
@@ -919,7 +1048,7 @@ fn process_actor_candidate(
   match (&current_action, best) {
     (None, None) => Ok(()),
     (Some(a), None) => {
-      delete_action_rows(ctx, a.action_id);
+      delete_action_rows(ctx, a.action_id, /* canceled = */ true);
       Ok(())
     }
     (None, Some((recipe, m))) => {
@@ -935,7 +1064,7 @@ fn process_actor_candidate(
         Ok(())
       } else {
         // Different recipe, or slot fillers moved — cancel and start.
-        delete_action_rows(ctx, a.action_id);
+        delete_action_rows(ctx, a.action_id, /* canceled = */ true);
         start_action(ctx, recipe, actor, &m, hex_card_id, owner_id)?;
         Ok(())
       }
@@ -1108,6 +1237,7 @@ fn start_action(
     end,
     participants,
     flags: 0,
+    delta_t: crate::delta_t::current(),
   });
   ctx.db.action_scheduler().insert(ActionScheduler {
     scheduled_id: 0,
@@ -1182,6 +1312,15 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
     ));
   }
 
+  // Stamp every public-table row write below with the
+  // scheduled-reducer lag so the client can back-date animations.
+  // `action.end` is the scheduled fire time in unix seconds; the
+  // gap between that and `ctx.timestamp` is the lag.
+  let _delta_guard = crate::delta_t::enter(crate::delta_t::compute(
+    (action.end as i64).saturating_mul(1_000_000),
+    ctx.timestamp.to_micros_since_unix_epoch(),
+  ));
+
   let recipe = definitions::recipe(action.recipe)?
     .ok_or_else(|| format!("complete_action: recipe {} not in registry", action.recipe))?;
 
@@ -1231,7 +1370,7 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
   // a stale completion through. Refuse rather than produce mismatched
   // products.
   if !recipe_still_satisfies_claim(recipe, &claimed_cards, hex_hit.as_ref().map(|h| h.def))? {
-    delete_action_rows(ctx, action_id);
+    delete_action_rows(ctx, action_id, /* canceled = */ true);
     return Err(format!(
       "complete_action: action {} no longer satisfies recipe {:?} — refused",
       action_id, recipe.id,
@@ -1314,22 +1453,23 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
       }
     };
 
-    // Cancel any *other* action holding this card before we delete it,
-    // so we don't strand a CardHold pointing at a vanished card. (The
-    // current action's hold is fine — it'll be released when
-    // `delete_action_rows` runs at the end.)
+    // Cancel any *other* action holding this card before we mark
+    // it dead, so we don't strand a CardHold pointing at a row
+    // that's about to be reaped. (The current action's hold is
+    // fine — it'll be released when `delete_action_rows` runs at
+    // the end.)
     if let Some(hold) = ctx.db.card_holds().card_id().find(&card_id) {
       if hold.action_id != action_id {
-        delete_action_rows(ctx, hold.action_id);
+        delete_action_rows(ctx, hold.action_id, /* canceled = */ true);
       }
     }
-    ctx.db.cards().card_id().delete(&card_id);
+    crate::cards::mark_card_dead(ctx, card_id);
   }
 
   // Tear down. For magnetic actions, this also clears `position_held`
   // off any surviving slot cards (via `magnetic::release`) so the
   // player can drag them again now that the action is over.
-  delete_action_rows(ctx, action_id);
+  delete_action_rows(ctx, action_id, /* canceled = */ false);
   Ok(())
 }
 

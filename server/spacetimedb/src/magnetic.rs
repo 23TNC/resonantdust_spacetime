@@ -77,10 +77,12 @@ const FLAG_DROP_HOLD: u8 = 1 << 3;
 /// Action flag — set on actions queued from the magnetic phase. The
 /// completion path checks this to walk the chain and release
 /// `position_hold` + `drop_hold`. Mirrors `data/flags.json`'s
-/// `actions.magnetic_inputs` (low bit; high 4 bits hold the sub-id).
+/// `actions.magnetic_inputs` (bit 0; bits 4..6 hold the sub-id).
 pub const FLAG_ACTION_MAGNETIC: u8 = 1 << 0;
+/// Sub-id occupies bits 4..6 of `Action.flags` (3 bits, 0..7). Bit
+/// 7 is reserved for [`crate::actions::FLAG_ACTION_DEAD`].
 const FLAG_ACTION_SUBID_SHIFT: u8 = 4;
-const FLAG_ACTION_SUBID_MASK: u8 = 0xF0;
+const FLAG_ACTION_SUBID_MASK: u8 = 0x70;
 
 #[inline]
 pub fn pack_action_flags(magnetic: bool, sub_id: u8) -> u8 {
@@ -92,6 +94,32 @@ pub fn pack_action_flags(magnetic: bool, sub_id: u8) -> u8 {
 pub fn unpack_action_subid(flags: u8) -> u8 {
   (flags & FLAG_ACTION_SUBID_MASK) >> FLAG_ACTION_SUBID_SHIFT
 }
+
+/// `dead` flag bit on `MagneticAction.flags` (mirrors
+/// `data/flags.json`'s `magnetic_actions.dead`). Set as an UPDATE —
+/// rather than the row being deleted directly — so the write
+/// carries `delta_t` and the client can back-date its end
+/// animation by `16 * delta_t` ms. Mirrors `cards.dead` and
+/// `actions.dead` at bit 7 so client-side flag handling can use
+/// one mask across all three tables.
+pub const FLAG_MAGNETIC_ACTION_DEAD: u8 = 1 << 7;
+
+/// `canceled` flag bit on `MagneticAction.flags` (mirrors
+/// `data/flags.json`'s `magnetic_actions.canceled`). Set together
+/// with [`FLAG_MAGNETIC_ACTION_DEAD`] when the magnetic phase
+/// ended for a reason *other* than queueing an inner action or
+/// timing out — typically an explicit `cancel()` call (anchor
+/// gone, recipe vanished from the registry, etc.). Lets the
+/// client play a different animation for cancellation vs.
+/// successful completion. Always set in the same UPDATE as
+/// `dead`, never on its own.
+pub const FLAG_MAGNETIC_ACTION_CANCELED: u8 = 1 << 1;
+
+/// How long a dead-flagged magnetic action lingers before its
+/// actual delete fires. Matches `cards::CARD_REAP_DELAY_SECS` and
+/// `actions::ACTION_REAP_DELAY_SECS` so the client sees all dead
+/// rows vanish on the same cadence.
+pub const MAGNETIC_ACTION_REAP_DELAY_SECS: u32 = 10;
 
 // ─── Tables ─────────────────────────────────────────────────────────────────
 
@@ -141,6 +169,17 @@ pub struct MagneticAction {
   /// compares this against the outer recipe's duration (interpreted
   /// as loop count).
   pub loop_count: u8,
+  /// Bit flags for per-row state visible to clients. See
+  /// `data/flags.json`'s `magnetic_actions` section. Bit 7 is
+  /// [`FLAG_MAGNETIC_ACTION_DEAD`] — set when the magnetic phase
+  /// ends (queued an inner / timed out / canceled) so the client
+  /// can animate the disappearance before the row is reaped.
+  pub flags: u8,
+  /// Scheduled-reducer lag at the time of this row write, in 16-ms
+  /// steps (saturating at 255). `0` at install (client-driven);
+  /// non-zero on tick updates when `magnetic_tick` fires late. See
+  /// [`crate::delta_t`].
+  pub delta_t: u8,
 }
 
 /// Private scheduler / state for a magnetic action. Holds the
@@ -173,6 +212,113 @@ pub struct MagneticActionScheduler {
   pub slot_3: u32,
   pub slot_4: u32,
   pub slot_5: u32,
+}
+
+// ─── Dead-magnetic-action reaper ────────────────────────────────────────────
+
+/// Scheduled-deletion queue for magnetic_actions flagged
+/// [`FLAG_MAGNETIC_ACTION_DEAD`]. Private — clients have no reason
+/// to subscribe; the end animation is driven by the `dead` bit
+/// flip on the public `MagneticAction` row, not by this table.
+/// One row per dead magnetic action.
+///
+/// Inserted by [`mark_magnetic_action_dead`] at the time the
+/// public row is flagged; `scheduled_at` is
+/// `now + MAGNETIC_ACTION_REAP_DELAY_SECS`. SpacetimeDB fires
+/// [`reap_dead_magnetic_action`] when the time arrives and removes
+/// the row from this table after the reducer returns.
+#[spacetimedb::table(accessor = pending_magnetic_action_deletions, scheduled(reap_dead_magnetic_action))]
+#[derive(Debug, Clone)]
+pub struct PendingMagneticActionDeletion {
+  #[primary_key]
+  #[auto_inc]
+  pub scheduled_id: u64,
+  pub scheduled_at: ScheduleAt,
+  /// PK of the `MagneticAction` row to delete when this fires.
+  pub magnetic_action_id: u32,
+}
+
+/// Mark a magnetic_action's public row as dead — sets
+/// [`FLAG_MAGNETIC_ACTION_DEAD`] (and optionally
+/// [`FLAG_MAGNETIC_ACTION_CANCELED`]), stamps `delta_t` (so the
+/// client can back-date its end animation), and schedules the
+/// actual row deletion for
+/// `now + MAGNETIC_ACTION_REAP_DELAY_SECS`.
+///
+/// `canceled = true` means the phase ended for a reason other
+/// than queueing an inner / timeout — typically an explicit
+/// `cancel()` (anchor gone, recipe vanished). Both bits are set
+/// in the same UPDATE so the client receives them together.
+///
+/// Idempotent — calling twice is a no-op the second time (the
+/// dead bit's already set; we don't re-stamp the canceled bit or
+/// schedule another reap). Missing row is also a no-op.
+///
+/// Caller responsibility: the matching
+/// `magnetic_action_scheduler` row is private and must be deleted
+/// eagerly *before* this call so no further ticks fire. The
+/// `complete_outer` and `cancel` paths handle that.
+pub fn mark_magnetic_action_dead(ctx: &ReducerContext, magnetic_action_id: u32, canceled: bool) {
+  let Some(public) = ctx
+    .db
+    .magnetic_actions()
+    .magnetic_action_id()
+    .find(&magnetic_action_id)
+  else {
+    return;
+  };
+  if (public.flags & FLAG_MAGNETIC_ACTION_DEAD) != 0 {
+    return;
+  }
+  let mut updated = public;
+  updated.flags |= FLAG_MAGNETIC_ACTION_DEAD;
+  if canceled {
+    updated.flags |= FLAG_MAGNETIC_ACTION_CANCELED;
+  }
+  updated.delta_t = crate::delta_t::current();
+  ctx.db.magnetic_actions().magnetic_action_id().update(updated);
+
+  let reap_at = Timestamp::from_micros_since_unix_epoch(
+    ctx
+      .timestamp
+      .to_micros_since_unix_epoch()
+      .saturating_add((MAGNETIC_ACTION_REAP_DELAY_SECS as i64).saturating_mul(1_000_000)),
+  );
+  ctx.db.pending_magnetic_action_deletions().insert(PendingMagneticActionDeletion {
+    scheduled_id: 0,
+    scheduled_at: ScheduleAt::Time(reap_at),
+    magnetic_action_id,
+  });
+}
+
+/// Scheduled reducer — fires `MAGNETIC_ACTION_REAP_DELAY_SECS`
+/// after a magnetic_action is flagged dead and removes the row.
+/// Defended against client-spoofed invocation: the scheduler row
+/// must still exist (legitimate fires see it; SpacetimeDB deletes
+/// it after this returns). The `MagneticAction` row itself may
+/// already be gone if some other path removed it directly —
+/// `delete` on a missing PK is a silent no-op, which is the right
+/// behavior here.
+#[reducer]
+pub fn reap_dead_magnetic_action(
+  ctx: &ReducerContext,
+  deletion: PendingMagneticActionDeletion,
+) -> Result<(), String> {
+  if ctx
+    .db
+    .pending_magnetic_action_deletions()
+    .scheduled_id()
+    .find(&deletion.scheduled_id)
+    .is_none()
+  {
+    return Ok(());
+  }
+  ctx
+    .db
+    .magnetic_actions()
+    .magnetic_action_id()
+    .delete(&deletion.magnetic_action_id);
+  Ok(())
 }
 
 // ─── install ────────────────────────────────────────────────────────────────
@@ -220,6 +366,8 @@ pub fn install(
     layer: actor.layer,
     macro_zone: actor.macro_zone,
     loop_count: 0,
+    flags: 0,
+    delta_t: crate::delta_t::current(),
   });
 
   let interval = ScheduleAt::Interval(TimeDuration::from_micros(
@@ -339,6 +487,16 @@ pub fn magnetic_tick(
     return Ok(());
   };
 
+  // Stamp every public-table row write below with the
+  // scheduled-reducer lag so the client can back-date animations.
+  // `public.end` is the unix-seconds the previous tick set as the
+  // *next* fire time — i.e. when SpacetimeDB was supposed to invoke
+  // us. The gap between that and `ctx.timestamp` is the lag.
+  let _delta_guard = crate::delta_t::enter(crate::delta_t::compute(
+    (public.end as i64).saturating_mul(1_000_000),
+    ctx.timestamp.to_micros_since_unix_epoch(),
+  ));
+
   // Guard 2: anchor must still exist. If gone, cancel.
   let Some(anchor) = ctx.db.cards().card_id().find(&public.card_id) else {
     cancel(ctx, scheduler.scheduled_id);
@@ -436,6 +594,7 @@ pub fn magnetic_tick(
         // restarts.
         let mut updated_public = public.clone();
         updated_public.end = next_tick_end;
+        updated_public.delta_t = crate::delta_t::current();
         ctx.db.magnetic_actions().magnetic_action_id().update(updated_public);
         return Ok(());
       }
@@ -457,6 +616,7 @@ pub fn magnetic_tick(
   }
 
   // Persist updated loop_count + end to the public row.
+  updated_public.delta_t = crate::delta_t::current();
   ctx.db.magnetic_actions().magnetic_action_id().update(updated_public);
   Ok(())
 }
@@ -576,6 +736,7 @@ fn place_card(
   updated.micro_zone = new_micro_zone;
   updated.micro_location = parent_id;
   updated.flags |= FLAG_POSITION_HOLD | FLAG_DROP_HOLD;
+  updated.delta_t = crate::delta_t::current();
   ctx.db.cards().card_id().update(updated);
   Ok(card_id)
 }
@@ -591,6 +752,7 @@ fn hold_for_slot(ctx: &ReducerContext, card_id: u32) -> Result<(), String> {
   };
   let mut updated = card;
   updated.flags |= FLAG_POSITION_HOLD | FLAG_DROP_HOLD;
+  updated.delta_t = crate::delta_t::current();
   ctx.db.cards().card_id().update(updated);
   Ok(())
 }
@@ -654,16 +816,23 @@ fn complete_outer(
       }
     }
   }
-  ctx.db.magnetic_actions().magnetic_action_id().delete(&public.magnetic_action_id);
+  // Scheduler row goes immediately so no further ticks fire;
+  // public row gets marked dead instead of deleted so the dead
+  // UPDATE can carry `delta_t` for client latency compensation.
+  // Not a cancel — `complete_outer` only fires when the magnetic
+  // phase ended naturally (queued an inner, or hit the loop cap).
   ctx.db.magnetic_action_scheduler().scheduled_id().delete(&scheduler.scheduled_id);
+  mark_magnetic_action_dead(ctx, public.magnetic_action_id, /* canceled = */ false);
   Ok(())
 }
 
 /// Cancel a magnetic_action by its scheduler `scheduled_id`. Looks
 /// up the scheduler + matching public row, clears `position_hold` /
-/// `drop_hold` on every recorded slot card, and deletes both rows.
-/// Does NOT fire outer products (cancellation is distinct from
-/// completion). Idempotent — missing scheduler / public is a no-op.
+/// `drop_hold` on every recorded slot card, deletes the scheduler,
+/// and marks the public row dead (the reaper removes it after
+/// `MAGNETIC_ACTION_REAP_DELAY_SECS`). Does NOT fire outer products
+/// (cancellation is distinct from completion). Idempotent —
+/// missing scheduler is a no-op.
 pub fn cancel(ctx: &ReducerContext, scheduled_id: u64) {
   let Some(scheduler) = ctx.db.magnetic_action_scheduler().scheduled_id().find(&scheduled_id) else {
     return;
@@ -673,8 +842,8 @@ pub fn cancel(ctx: &ReducerContext, scheduled_id: u64) {
       clear_hold_flags(ctx, slot);
     }
   }
-  ctx.db.magnetic_actions().magnetic_action_id().delete(&scheduler.magnetic_action_id);
   ctx.db.magnetic_action_scheduler().scheduled_id().delete(&scheduled_id);
+  mark_magnetic_action_dead(ctx, scheduler.magnetic_action_id, /* canceled = */ true);
 }
 
 /// Glue between "an inner is filled" and "complete the outer's
@@ -817,6 +986,7 @@ fn queue_inner_action(
     end,
     participants,
     flags: pack_action_flags(true, sub_id),
+    delta_t: crate::delta_t::current(),
   });
   ctx.db.action_scheduler().insert(ActionScheduler {
     scheduled_id: 0,
@@ -1006,5 +1176,6 @@ fn clear_hold_flags(ctx: &ReducerContext, card_id: u32) {
   }
   let mut updated = card;
   updated.flags &= !(FLAG_POSITION_HOLD | FLAG_DROP_HOLD);
+  updated.delta_t = crate::delta_t::current();
   ctx.db.cards().card_id().update(updated);
 }

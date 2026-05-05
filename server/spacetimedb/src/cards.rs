@@ -1,4 +1,4 @@
-use spacetimedb::{reducer, ReducerContext, SpacetimeType, Table};
+use spacetimedb::{reducer, ReducerContext, ScheduleAt, SpacetimeType, Table, Timestamp};
 use std::collections::BTreeSet;
 
 use crate::actions;
@@ -44,6 +44,20 @@ pub const FLAG_CARD_POSITION_HOLD: u8 = 1 << 0;
 /// `position_hold` — held alongside it by magnetic placements.
 pub const FLAG_CARD_DROP_HOLD: u8 = 1 << 3;
 
+/// `dead` flag bit on `Card.flags` (mirrors `data/flags.json`'s
+/// `cards.dead`). Set as an UPDATE — rather than the row being
+/// deleted directly — so the write carries `delta_t` and the
+/// client can back-date its dying animation by `16 * delta_t` ms.
+/// Cards-only: actions and magnetic_actions delete immediately
+/// and have no equivalent bit.
+pub const FLAG_CARD_DEAD: u8 = 1 << 7;
+
+/// How long a dead-flagged card lingers before its actual delete
+/// fires. Long enough for the client's death animation to play out
+/// (~0.5–2 s) plus headroom for late subscribers; short enough that
+/// the row doesn't keep client-side trackers stuck on it.
+pub const CARD_REAP_DELAY_SECS: u32 = 10;
+
 /// Safety belt: clear `position_hold` + `drop_hold` on `card_id`
 /// when it lands on `LAYER_INVENTORY`. Idempotent — safe to call
 /// when the card doesn't exist, isn't on inventory, or already has
@@ -70,6 +84,7 @@ pub fn clear_hold_flags_on_inventory_landing(ctx: &ReducerContext, card_id: u32)
   }
   let mut updated = card;
   updated.flags &= !(FLAG_CARD_POSITION_HOLD | FLAG_CARD_DROP_HOLD);
+  updated.delta_t = crate::delta_t::current();
   ctx.db.cards().card_id().update(updated);
 }
 
@@ -116,6 +131,95 @@ pub struct Card {
   /// start at `0`. Callers that don't need flags don't have to think
   /// about them — `insert_card_row` zero-initializes the field.
   pub flags: u8,
+  /// Scheduled-reducer lag at the time of this row write, in 16-ms
+  /// steps (saturating at 255). `0` for client-driven writes;
+  /// non-zero only inside a scheduled reducer fire that's running
+  /// late. See [`crate::delta_t`].
+  pub delta_t: u8,
+}
+
+// ---------- Dead-card reaper ----------
+
+/// Scheduled-deletion queue for cards flagged [`FLAG_CARD_DEAD`].
+/// Private — clients have no reason to subscribe; the dying
+/// animation is driven by the `dead` bit flip on the public `Card`
+/// row, not by this table. One row per dead card.
+///
+/// Inserted by [`mark_card_dead`] at the time the card is flagged;
+/// `scheduled_at` is `now + CARD_REAP_DELAY_SECS`. SpacetimeDB
+/// fires [`reap_dead_card`] when the time arrives and removes the
+/// row from this table after the reducer returns.
+#[spacetimedb::table(accessor = pending_card_deletions, scheduled(reap_dead_card))]
+#[derive(Debug, Clone)]
+pub struct PendingCardDeletion {
+  #[primary_key]
+  #[auto_inc]
+  pub scheduled_id: u64,
+  pub scheduled_at: ScheduleAt,
+  /// PK of the `Card` row to delete when this fires.
+  pub card_id: u32,
+}
+
+/// Mark a card as dead — sets [`FLAG_CARD_DEAD`], stamps
+/// `delta_t` (so the client can back-date its dying animation),
+/// and schedules the actual row deletion for
+/// `now + CARD_REAP_DELAY_SECS`. Replaces direct
+/// `ctx.db.cards().card_id().delete(...)` calls everywhere in the
+/// module.
+///
+/// Idempotent — calling twice on the same card is a no-op the
+/// second time (the bit's already set; we don't schedule another
+/// reap). Missing card is also a no-op.
+///
+/// Caller responsibility: any private bookkeeping that referenced
+/// this card (today: `card_holds` keyed by `card_id`) is the
+/// caller's to clean up. The `dead` UPDATE doesn't disturb private
+/// rows.
+pub fn mark_card_dead(ctx: &ReducerContext, card_id: u32) {
+  let Some(card) = ctx.db.cards().card_id().find(&card_id) else {
+    return;
+  };
+  if (card.flags & FLAG_CARD_DEAD) != 0 {
+    return;
+  }
+  let mut updated = card;
+  updated.flags |= FLAG_CARD_DEAD;
+  updated.delta_t = crate::delta_t::current();
+  ctx.db.cards().card_id().update(updated);
+
+  let reap_at = Timestamp::from_micros_since_unix_epoch(
+    ctx
+      .timestamp
+      .to_micros_since_unix_epoch()
+      .saturating_add((CARD_REAP_DELAY_SECS as i64).saturating_mul(1_000_000)),
+  );
+  ctx.db.pending_card_deletions().insert(PendingCardDeletion {
+    scheduled_id: 0,
+    scheduled_at: ScheduleAt::Time(reap_at),
+    card_id,
+  });
+}
+
+/// Scheduled reducer — fires `CARD_REAP_DELAY_SECS` after a card is
+/// flagged dead and removes the row. Defended against
+/// client-spoofed invocation: the scheduler row must still exist
+/// (legitimate fires see it; SpacetimeDB deletes it after this
+/// returns). The `Card` row itself may already be gone if some
+/// other path deleted it directly — `delete` on a missing PK is a
+/// silent no-op, which is the right behavior here.
+#[reducer]
+pub fn reap_dead_card(ctx: &ReducerContext, deletion: PendingCardDeletion) -> Result<(), String> {
+  if ctx
+    .db
+    .pending_card_deletions()
+    .scheduled_id()
+    .find(&deletion.scheduled_id)
+    .is_none()
+  {
+    return Ok(());
+  }
+  ctx.db.cards().card_id().delete(&deletion.card_id);
+  Ok(())
 }
 
 // ---------- Card creation ----------
@@ -233,6 +337,7 @@ fn insert_card_row_inner(
     owner_id,
     packed_definition,
     flags: 0,
+    delta_t: crate::delta_t::current(),
   });
   // Trigger on_create recipe matching for the freshly-created card.
   // Errors propagate (registry-build failures, card lookup failures);
@@ -516,6 +621,7 @@ fn mirror_stack(
     if stack.layer == LAYER_INVENTORY {
       root.flags &= !(FLAG_CARD_POSITION_HOLD | FLAG_CARD_DROP_HOLD);
     }
+    root.delta_t = crate::delta_t::current();
     ctx.db.cards().card_id().update(root);
   }
 
@@ -562,6 +668,7 @@ fn update_chain_member(
   if target_layer == LAYER_INVENTORY {
     card.flags &= !(FLAG_CARD_POSITION_HOLD | FLAG_CARD_DROP_HOLD);
   }
+  card.delta_t = crate::delta_t::current();
   ctx.db.cards().card_id().update(card);
   Ok(())
 }
@@ -586,6 +693,7 @@ fn return_chain_to_inventory(
       card.micro_zone = STACK_STATE_LOOSE;
       card.micro_location = 0;
       card.flags &= !(FLAG_CARD_POSITION_HOLD | FLAG_CARD_DROP_HOLD);
+      card.delta_t = crate::delta_t::current();
       ctx.db.cards().card_id().update(card);
     }
   }

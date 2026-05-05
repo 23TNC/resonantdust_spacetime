@@ -1409,7 +1409,7 @@ fn parse_magnetic_bucket(
 
   if inners.len() > MAGNETIC_MAX_INNERS {
     return Err(format!(
-      "{}: recipe {:?} magnetic bucket has {} inners (max {}, sub-id is 4 bits in Action.flags)",
+      "{}: recipe {:?} magnetic bucket has {} inners (max {}, sub-id is 3 bits in Action.flags)",
       filename, parent_id, inners.len(), MAGNETIC_MAX_INNERS,
     ));
   }
@@ -1418,9 +1418,10 @@ fn parse_magnetic_bucket(
 }
 
 /// Hard cap on inner recipes per magnetic bucket. The queued inner
-/// action stores its sub-id in 4 bits of `Action.flags`, so 16 is
-/// the structural ceiling.
-pub const MAGNETIC_MAX_INNERS: usize = 16;
+/// action stores its sub-id in 3 bits (bits 4..6) of `Action.flags`
+/// — bit 7 is reserved for [`crate::actions::FLAG_ACTION_DEAD`] —
+/// so 8 is the structural ceiling.
+pub const MAGNETIC_MAX_INNERS: usize = 8;
 
 /// Parse one inner recipe inside a magnetic bucket. Like
 /// [`parse_recipe`] but: no `id`, no nested `magnetic`, no `interval`,

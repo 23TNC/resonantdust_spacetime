@@ -206,6 +206,7 @@ fn ensure_bootstrap_zone(ctx: &ReducerContext, entry: &Value) -> Result<(), Stri
     macro_zone,
     packed_definition,
     t0, t1, t2, t3, t4, t5, t6, t7,
+    delta_t: crate::delta_t::current(),
   });
   Ok(())
 }

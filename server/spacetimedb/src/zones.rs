@@ -122,6 +122,11 @@ pub struct Zone {
   pub t5: u64,
   pub t6: u64,
   pub t7: u64,
+  /// Scheduled-reducer lag at the time of this row write, in 16-ms
+  /// steps (saturating at 255). `0` for client-driven writes;
+  /// non-zero only inside a scheduled reducer fire that's running
+  /// late. See [`crate::delta_t`].
+  pub delta_t: u8,
 }
 
 impl Zone {
@@ -253,6 +258,7 @@ pub fn insert_empty_zone(
     macro_zone,
     packed_definition,
     t0: 0, t1: 0, t2: 0, t3: 0, t4: 0, t5: 0, t6: 0, t7: 0,
+    delta_t: crate::delta_t::current(),
   })
 }
 
@@ -297,6 +303,7 @@ pub fn set_cell(
   let mut rows = zone.cell_rows();
   write_cell(&mut rows, coord, cell_definition_id);
   zone.set_cell_rows(rows);
+  zone.delta_t = crate::delta_t::current();
   ctx.db.zones().zone_id().update(zone);
   Ok(())
 }
