@@ -645,7 +645,7 @@ fn complete_outer(
       return Ok(());
     };
     let mut rng_state: u32 = scheduler.scheduled_id as u32;
-    generate_outer_products(ctx, outer, &anchor, &mut rng_state)?;
+    generate_outer_products(ctx, outer, &anchor, scheduler.owner_id, &mut rng_state)?;
   }
   if clear_flags {
     for &slot in &[scheduler.slot_1, scheduler.slot_2, scheduler.slot_3, scheduler.slot_4, scheduler.slot_5] {
@@ -880,41 +880,47 @@ fn ctx_seconds(ctx: &ReducerContext) -> Result<u32, String> {
 }
 
 /// Generate outer products for a magnetic_action's "complete" event
-/// (queue or timeout). Owner routing differs from non-magnetic
-/// completion:
+/// (queue or timeout). Mirrors the [`ProductOwner`] semantics from
+/// `actions::resolve_product_destination`, but the anchor stands in
+/// for the actor (a magnetic outer doesn't have a queued
+/// `Action.card_id`):
 ///
-/// - `Hex` → the **anchor itself** is the hex (for hex-anchored
-///   magnetic recipes); products go to `anchor.owner_id`'s panel.
-///   Unowned anchors skip products with that destination.
-/// - `Actor` / `Root` → magnetic outer doesn't have a chain-rooted
-///   actor in the same sense; for now both fall back to the anchor's
-///   `owner_id`. Refine when a non-hex magnetic pattern needs
-///   different semantics.
+/// - `Actor` → `anchor.owner_id`. The anchor is the magnetic
+///   action's "card."
+/// - `Action` → `action_owner_id` (= `MagneticActionScheduler.owner_id`,
+///   the inventory owner we pull from).
+/// - `Hex` → for hex-anchored magnetic recipes the anchor IS the
+///   hex, so this resolves to `anchor.owner_id`. Falls back to
+///   `action_owner_id` for non-hex anchors or unowned anchors.
+/// - `Root` → falls back to `action_owner_id` (chain root isn't
+///   tracked by the magnetic_action_scheduler today).
+///
+/// Groups whose resolved panel is `0` are skipped silently.
 fn generate_outer_products(
   ctx: &ReducerContext,
   recipe: &RecipeDef,
   anchor: &Card,
+  action_owner_id: u32,
   rng: &mut u32,
 ) -> Result<(), String> {
   for group in &recipe.products {
-    // Resolve panel based on owner.
-    let panel_player_id = match group.target.owner {
-      ProductOwner::Hex => {
-        if anchor.owner_id == 0 {
-          // Unowned anchor → no panel to route to. Skip the group.
-          continue;
-        }
-        anchor.owner_id
-      }
-      ProductOwner::Actor | ProductOwner::Root => {
-        if anchor.owner_id == 0 {
-          continue;
-        }
-        anchor.owner_id
-      }
-    };
     if !matches!(group.target.place, ProductPlace::Inventory) {
       // Only inventory destinations supported today.
+      continue;
+    }
+    let panel_player_id = match group.target.owner {
+      ProductOwner::Actor => anchor.owner_id,
+      ProductOwner::Action => action_owner_id,
+      ProductOwner::Hex => {
+        if anchor.owner_id != 0 {
+          anchor.owner_id
+        } else {
+          action_owner_id
+        }
+      }
+      ProductOwner::Root => action_owner_id,
+    };
+    if panel_player_id == 0 {
       continue;
     }
     for entity in &group.entities {

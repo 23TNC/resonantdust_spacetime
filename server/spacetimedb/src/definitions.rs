@@ -731,24 +731,33 @@ pub enum ProductPlace {
   Inventory,
 }
 
-/// Which action-relative referent the product is attached to.
+/// Which action-relative referent the product is attached to. Each
+/// variant resolves to a player_id (the panel owner) at completion
+/// time; the destination is always the inventory at `LAYER_INVENTORY`.
+///
+/// JSON keys: `"root"`, `"actor"`, `"hex"`, `"action"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductOwner {
-  /// The chain root for stack/magnetic recipes; the actor for OnCreate
-  /// (where actor == root). For the inventory POC where every claimed
-  /// card is in the same player's panel, this resolves identically to
-  /// `Actor`.
+  /// Chain root's owner. For `OnCreate` (root == actor), resolves to
+  /// the actor's `owner_id`. For stack recipes the chain root isn't
+  /// held by the action and isn't recoverable from server state at
+  /// completion, so this currently falls back to the action owner —
+  /// distinct from `Actor` only when a future change persists the
+  /// root id on `ActionScheduler`.
   Root,
-  /// The action's actor card.
+  /// Actor card's owner — `Card.owner_id` of `action.card_id`.
   Actor,
-  /// The hex card the action is anchored to. The matcher persists
-  /// the resolved id on `ActionScheduler.hex_card_id` at start time
-  /// so completion can re-resolve without walking the chain. Used
-  /// by hex-precondition recipes to route products to the panel of
-  /// the hex's owner. If the chain isn't on a hex (or the recipe
-  /// matched without a hex precondition), the destination falls
-  /// back to the actor's panel.
+  /// Hex card's owner. The matcher persists the resolved hex id on
+  /// `ActionScheduler.hex_card_id` at start time; completion looks
+  /// it up and reads `hex_card.owner_id`. Falls back to the action
+  /// owner when the chain isn't on a hex, the hex is unowned
+  /// (`owner_id == 0`), or the hex resolved from a `Zone` cell
+  /// (which doesn't carry an `owner_id`).
   Hex,
+  /// Action's owner — `Action.owner_id`, set by `start_action`.
+  /// Always present; the most reliable fallback when the
+  /// card-relative owners can't be resolved.
+  Action,
 }
 
 #[derive(Debug, Clone)]
@@ -1269,9 +1278,10 @@ fn parse_recipe(
           "root" => ProductOwner::Root,
           "actor" => ProductOwner::Actor,
           "hex" => ProductOwner::Hex,
+          "action" => ProductOwner::Action,
           other => {
             return Err(format!(
-              "{}: recipe {:?} unknown product owner {:?} under place {:?}, expected one of: \"root\", \"actor\", \"hex\"",
+              "{}: recipe {:?} unknown product owner {:?} under place {:?}, expected one of: \"root\", \"actor\", \"hex\", \"action\"",
               filename, id, other, place_name
             ));
           }
@@ -1493,9 +1503,10 @@ fn parse_inner_recipe(
           "root" => ProductOwner::Root,
           "actor" => ProductOwner::Actor,
           "hex" => ProductOwner::Hex,
+          "action" => ProductOwner::Action,
           other => {
             return Err(format!(
-              "{}: recipe {:?} {}: unknown product owner {:?}, expected \"root\", \"actor\", \"hex\"",
+              "{}: recipe {:?} {}: unknown product owner {:?}, expected \"root\", \"actor\", \"hex\", \"action\"",
               filename, parent_id, path, other
             ));
           }

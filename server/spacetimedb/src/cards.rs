@@ -15,7 +15,7 @@ pub const LAYER_INVENTORY: u8 = 1;
 /// World layer. Cards with `layer == LAYER_WORLD` live on the world board.
 /// `macro_zone` stores packed `(zone_q:i16, zone_r:i16)` axial coords for
 /// these cards rather than a `player_id`.
-pub const LAYER_WORLD: u8 = 2;
+pub const LAYER_WORLD: u8 = 64;
 
 /// `local_q = 1` packed into the high 3 bits of `micro_zone` — the
 /// "server is asserting this position; trust it" signal. Any non-zero
@@ -252,39 +252,77 @@ pub const MAX_STACK_BRANCH: usize = 16;
 /// call. Keeps the per-call work bounded against malicious or buggy clients.
 pub const MAX_STACKS_PER_SUBMISSION: usize = 256;
 
-/// One stack the client is asserting as a current arrangement. The card_ids
-/// describe composition only; pixel position and stacking layout are
-/// client-side state and are not communicated through this struct.
+/// One stack the client is asserting as a current arrangement. The
+/// position fields (`layer`, `macro_zone`, `micro_zone`,
+/// `micro_location`) describe **the root's** placement; chain
+/// children inherit the chain's `(layer, macro_zone)` and have their
+/// `micro_zone` set to the appropriate stack-state bits with
+/// `micro_location` pointing at their immediate parent.
 ///
-/// `hex` carries the chain-root → hex relationship for inventory stacks
-/// placed on a hex card. The client extracts this from its local root
-/// row's `micro_location` when its `stacked_state == 3` and forwards it
-/// here. The server can't read that relationship from its own row —
-/// inventory cards on the server hold `micro_zone = 0` by convention
-/// (see `DataManager.applyServerUpdate`'s "server doesn't track
-/// inventory positions" branch). `None` for chains not on a hex.
+/// The root's `micro_zone` low 2 bits are the stack-state:
+///
+/// - `0` (LOOSE) — root is loose. `micro_location` carries
+///   pixel coords (world) or is unused (inventory).
+/// - `1` / `2` (TOP / BOTTOM) — root is stacked on another card not
+///   in this submission. `micro_location` must point to that parent.
+///   (E.g. when this submission is one of multiple chains a player
+///   submits in tandem after a drag.)
+/// - `3` (HEX_ROOT) — root is anchored on a hex.
+///   `micro_location` must point to that hex card.
+///
+/// Inventory layouts stay client-owned: the client ignores
+/// inventory `local_q`/`local_r` unless the server forces a
+/// placement via `local_q != 0`, which `submit_inventory_stacks`
+/// deliberately doesn't. World layouts are server-authoritative;
+/// the client mirrors whatever the server writes.
 #[derive(SpacetimeType, Debug, Clone)]
 pub struct InventoryStack {
   pub root: u32,
+  pub layer: u8,
+  pub macro_zone: u32,
+  pub micro_zone: u8,
+  pub micro_location: u32,
   pub stack_up: Vec<u32>,
   pub stack_down: Vec<u32>,
-  pub hex: Option<u32>,
 }
 
-/// Client-driven inventory stack submission. The server validates every
-/// card_id in every submitted stack belongs to the caller's inventory,
-/// then walks each branch through the action upgrade machinery:
+/// Client-driven stack submission. Mirrors every chain into per-card
+/// row state and runs the action upgrade machinery against it.
 ///
-/// 1. **Top branch.** For each submitted stack, build the up-chain
-///    `[root, stack_up[0], …]` and call
-///    [`actions::process_top_branch`]. The branch processor iterates
-///    every potential actor along the chain and applies the upgrade
-///    rules (start, keep, refresh, or cancel) — no blanket pre-cancel.
-///    A no-op submission whose stack composition didn't actually
-///    change leaves any running action *running*, with its timer
-///    untouched.
-/// 2. **Bottom branch.** Same shape for `[root, stack_down[0], …]` via
-///    [`actions::process_bottom_branch`].
+/// Per-card validation: each chain card must be either in the
+/// caller's inventory (`layer == LAYER_INVENTORY` and
+/// `macro_zone == player_id`) or on a world layer (`layer >= LAYER_WORLD`,
+/// any caller — future work will add zone proximity / permission
+/// rules). Mixed-layer chains are legal — `mirror_stack` migrates
+/// every member to the chain's effective location.
+///
+/// The chain's effective `(layer, macro_zone)` is the **hex's**
+/// when `stack.hex` is set, otherwise the **root's**. This supports
+/// inventory↔world transitions in either direction with no extra
+/// API surface — drag a card from inventory onto a world hex to
+/// migrate it up; drag it off back into a chain rooted on an
+/// inventory card to migrate it down. Inventory positions stay
+/// client-owned (`micro_zone` high bits zeroed; the client ignores
+/// inventory positions unless the server forces a placement via
+/// `local_q != 0`, which `submit_inventory_stacks` deliberately
+/// doesn't).
+///
+/// If a stack fails server-side validation (hex set but doesn't
+/// exist, or hex is in another player's inventory), the chain
+/// members are returned to the caller's inventory and that stack
+/// skips action processing — defensive: the client should be
+/// sending valid stacks; if it isn't, we recover rather than leave
+/// cards stranded.
+///
+/// Then per stack:
+///
+/// 1. **Top branch.** Build `[root, stack_up[0], …]` and call
+///    [`actions::process_top_branch`]. The branch processor
+///    iterates every potential actor and applies the four-way
+///    upgrade decision (start / keep / refresh / cancel) — no
+///    blanket pre-cancel.
+/// 2. **Bottom branch.** Same shape for `[root, stack_down[0], …]`
+///    via [`actions::process_bottom_branch`].
 ///
 /// `OnCreate` triggers fire from [`insert_card_row`], not from here.
 #[reducer]
@@ -341,39 +379,214 @@ pub fn submit_inventory_stacks(
         .find(&card_id)
         .ok_or_else(|| format!("card {} not found", card_id))?;
 
-      if card.layer != LAYER_INVENTORY {
+      // Caller authority. Mixed-layer chains are legal — `mirror_stack`
+      // migrates every member to the chain's target location below.
+      // Inventory cards must be in the caller's inventory; world
+      // cards are interactable by anyone (future: zone proximity).
+      if card.layer == LAYER_INVENTORY {
+        if card.macro_zone != player_id {
+          return Err(format!(
+            "card {} is not in caller's inventory",
+            card_id,
+          ));
+        }
+      } else if card.layer >= LAYER_WORLD {
+        // OK — world layer, any caller.
+      } else {
         return Err(format!(
-          "card {} is not on the inventory layer (layer={})",
-          card_id, card.layer,
-        ));
-      }
-
-      if card.macro_zone != player_id {
-        return Err(format!(
-          "card {} is not in caller's inventory",
-          card_id,
+          "card {} on unsupported layer {}", card_id, card.layer,
         ));
       }
     }
   }
 
-  // ─── Action orchestration ──────────────────────────────────────────
-  // Validation passed. Walk each branch through the upgrade machinery.
-  // No blanket pre-cancel — `process_*_branch` cancels exactly the
-  // actions that are actually disturbed.
+  // ─── Row sync + action orchestration ───────────────────────────────
+  // For each stack: mirror the chain to row state (migrating layer +
+  // macro_zone to wherever the chain effectively lives), then run the
+  // upgrade machinery. A stack that fails server-side validation gets
+  // its members pulled back to the caller's inventory and skips
+  // action processing.
   for stack in &stacks {
+    if !mirror_stack(ctx, stack, player_id)? {
+      // Validation failed; chain returned to inventory. Skip this
+      // stack's action machinery — there's nothing left to match.
+      continue;
+    }
+
     // Top branch chain: [root, stack_up[0], stack_up[1], …]
     let mut top_chain: Vec<u32> = Vec::with_capacity(1 + stack.stack_up.len());
     top_chain.push(stack.root);
     top_chain.extend(stack.stack_up.iter().copied());
-    actions::process_top_branch(ctx, &top_chain, stack.hex, player_id)?;
+    actions::process_top_branch(ctx, &top_chain, player_id)?;
 
     // Bottom branch chain: [root, stack_down[0], stack_down[1], …]
     let mut bottom_chain: Vec<u32> = Vec::with_capacity(1 + stack.stack_down.len());
     bottom_chain.push(stack.root);
     bottom_chain.extend(stack.stack_down.iter().copied());
-    actions::process_bottom_branch(ctx, &bottom_chain, stack.hex, player_id)?;
+    actions::process_bottom_branch(ctx, &bottom_chain, player_id)?;
   }
 
   Ok(())
+}
+
+/// Mirror a submitted stack into per-card row state. Returns
+/// `Ok(true)` if mirrored cleanly; `Ok(false)` if the stack failed
+/// server-side validation and the chain was returned to the caller's
+/// inventory instead.
+///
+/// The submission carries the **root's** full row state
+/// (`layer`, `macro_zone`, `micro_zone`, `micro_location`); we copy
+/// it verbatim onto the root's row. Children inherit the chain's
+/// `(layer, macro_zone)` and get their `micro_zone` set to the
+/// appropriate stack-state bits with `micro_location` pointing at
+/// their immediate parent.
+///
+/// **Validation**:
+///
+/// - Target authority — when `stack.layer == LAYER_INVENTORY`,
+///   `stack.macro_zone` must be the caller's `player_id`.
+///   World-layer targets are open to any caller (future: zone
+///   proximity / permission rules). Failures route the chain to
+///   caller's inventory.
+/// - Stack-state normalization — when the root's `micro_zone` low
+///   2 bits indicate a parent (`1`/`2`/`3`) but `micro_location`
+///   doesn't resolve, the state bits are cleared and
+///   `micro_location` is zeroed. Stale client-local state (e.g.
+///   the parent vanished after the player last touched the card)
+///   gets cleaned up rather than rejected — the matcher's hex
+///   resolver handles missing-hex chains gracefully on its own.
+fn mirror_stack(
+  ctx: &ReducerContext,
+  stack: &InventoryStack,
+  player_id: u32,
+) -> Result<bool, String> {
+  use crate::magnetic::{STACK_STATE_BOTTOM, STACK_STATE_TOP};
+
+  // Target authority. Inventory targets must be the caller's; world
+  // targets are open to anyone; other layers are nonsense.
+  let target_authorized = match stack.layer {
+    LAYER_INVENTORY => stack.macro_zone == player_id,
+    l if l >= LAYER_WORLD => true,
+    _ => false,
+  };
+  if !target_authorized {
+    return_chain_to_inventory(ctx, stack, player_id);
+    return Ok(false);
+  }
+
+  // Stack-state normalization. States 1/2/3 imply `micro_location`
+  // points at a real card (parent rect or hex); when it doesn't —
+  // typically a stale client-local state bit after the parent
+  // vanished — clamp the state to LOOSE rather than bail. The
+  // alternative (returning the chain to inventory) was too eager,
+  // killing recipe processing for chains the client otherwise
+  // matched cleanly.
+  let raw_state = stack.micro_zone & 0b11;
+  let parent_resolves = stack.micro_location != 0
+    && ctx
+      .db
+      .cards()
+      .card_id()
+      .find(&stack.micro_location)
+      .is_some();
+  // State 3 (HEX_ROOT) with micro_location == 0 on a world layer is the
+  // valid "bare tile" convention — position is encoded in micro_zone's high
+  // bits, not via a parent card. Do not treat this as a dangling reference.
+  let bare_world_tile =
+    raw_state == 3 && stack.micro_location == 0 && stack.layer >= LAYER_WORLD;
+  let (root_micro_zone, root_micro_location) = if raw_state != 0 && !parent_resolves && !bare_world_tile {
+    // Parent card referenced but doesn't exist — strip dangling state bits.
+    (stack.micro_zone & !0b11, 0)
+  } else {
+    (stack.micro_zone, stack.micro_location)
+  };
+
+  // Root: write the (normalized) client-supplied row state.
+  {
+    let mut root = ctx
+      .db
+      .cards()
+      .card_id()
+      .find(&stack.root)
+      .ok_or_else(|| format!("mirror_stack: root {} missing", stack.root))?;
+    root.layer = stack.layer;
+    root.macro_zone = stack.macro_zone;
+    root.micro_zone = root_micro_zone;
+    root.micro_location = root_micro_location;
+    if stack.layer == LAYER_INVENTORY {
+      root.flags &= !(FLAG_CARD_POSITION_HOLD | FLAG_CARD_DROP_HOLD);
+    }
+    ctx.db.cards().card_id().update(root);
+  }
+
+  // Up branch.
+  let mut parent_id = stack.root;
+  for &child_id in &stack.stack_up {
+    update_chain_member(ctx, child_id, parent_id, stack.layer, stack.macro_zone, STACK_STATE_TOP)?;
+    parent_id = child_id;
+  }
+
+  // Down branch.
+  let mut parent_id = stack.root;
+  for &child_id in &stack.stack_down {
+    update_chain_member(ctx, child_id, parent_id, stack.layer, stack.macro_zone, STACK_STATE_BOTTOM)?;
+    parent_id = child_id;
+  }
+  Ok(true)
+}
+
+/// Migrate one chain member's row to the chain's target location and
+/// parent. Stacked cards have no meaningful `local_q`/`local_r`
+/// (their visual position is derived from the parent), so the high
+/// `micro_zone` bits go to zero. Inventory landings clear the
+/// magnetic hold flags — the card is "back in inventory" and any
+/// previous placement-bound holds are stale.
+fn update_chain_member(
+  ctx: &ReducerContext,
+  card_id: u32,
+  parent_id: u32,
+  target_layer: u8,
+  target_macro_zone: u32,
+  stack_state: u8,
+) -> Result<(), String> {
+  let mut card = ctx
+    .db
+    .cards()
+    .card_id()
+    .find(&card_id)
+    .ok_or_else(|| format!("mirror_stack: chain card {} missing", card_id))?;
+  card.layer = target_layer;
+  card.macro_zone = target_macro_zone;
+  card.micro_zone = stack_state;
+  card.micro_location = parent_id;
+  if target_layer == LAYER_INVENTORY {
+    card.flags &= !(FLAG_CARD_POSITION_HOLD | FLAG_CARD_DROP_HOLD);
+  }
+  ctx.db.cards().card_id().update(card);
+  Ok(())
+}
+
+/// Recovery path for invalid stacks — pulls every chain member back
+/// to the caller's inventory at a known-good loose state and clears
+/// magnetic hold flags. The hex card (if any) is left alone; only
+/// chain members are touched.
+fn return_chain_to_inventory(
+  ctx: &ReducerContext,
+  stack: &InventoryStack,
+  player_id: u32,
+) {
+  use crate::magnetic::STACK_STATE_LOOSE;
+  let cards_in_stack = std::iter::once(stack.root)
+    .chain(stack.stack_up.iter().copied())
+    .chain(stack.stack_down.iter().copied());
+  for card_id in cards_in_stack {
+    if let Some(mut card) = ctx.db.cards().card_id().find(&card_id) {
+      card.layer = LAYER_INVENTORY;
+      card.macro_zone = player_id;
+      card.micro_zone = STACK_STATE_LOOSE;
+      card.micro_location = 0;
+      card.flags &= !(FLAG_CARD_POSITION_HOLD | FLAG_CARD_DROP_HOLD);
+      ctx.db.cards().card_id().update(card);
+    }
+  }
 }

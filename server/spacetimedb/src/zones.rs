@@ -79,14 +79,32 @@ pub const EMPTY_CELL: u8 = 0;
 
 // ─── Table ───────────────────────────────────────────────────────────────────
 
-/// One world chunk. Public — clients subscribe by `macro_zone` to
-/// render the world around them.
+/// One world chunk. Public — clients subscribe by
+/// `(layer, macro_zone)` to render the world around them.
+///
+/// The natural identity of a chunk is the `(layer, macro_zone)`
+/// pair: two zones with the same `macro_zone` on different layers
+/// (overworld / dream / underworld / …) coexist as distinct rows.
+/// Lookups that already have a Card in hand should pass
+/// `(card.layer, card.macro_zone)` via [`find_zone`]; the
+/// `macro_zone` btree index keeps the filter cheap.
 #[spacetimedb::table(accessor = zones, public)]
 #[derive(Debug, Clone)]
 pub struct Zone {
-  /// World chunk identifier. Matches `Card.macro_zone` for any world
-  /// card occupying a cell in this chunk.
+  /// Synthetic auto-incrementing PK. Identity is logically
+  /// `(layer, macro_zone)`; this column exists only because
+  /// SpacetimeDB tables need a single-field primary key. Clients
+  /// shouldn't subscribe on this — filter by `(layer, macro_zone)`.
   #[primary_key]
+  #[auto_inc]
+  pub zone_id: u32,
+  /// World layer this chunk lives on. Matches `Card.layer` for any
+  /// world card occupying a cell in this chunk.
+  #[index(btree)]
+  pub layer: u8,
+  /// World chunk identifier within the layer. Matches
+  /// `Card.macro_zone` for any world card occupying a cell here.
+  #[index(btree)]
   pub macro_zone: u32,
   /// `[card_type:u4][card_category:u4]` shared by every cell in the
   /// zone. Combined with a cell's `definition_id` to form the full
@@ -203,24 +221,44 @@ pub fn write_cell(packed_ids: &mut [u64], coord: LocalCoord, definition_id: u8) 
 
 // ─── Public table helpers ────────────────────────────────────────────────────
 
+/// Look up the [`Zone`] at `(layer, macro_zone)`. Filters the
+/// `macro_zone` btree match by `layer` — multiple zones can share a
+/// `macro_zone` value across layers, so we can't go directly through
+/// a unique index. Returns the first matching row (uniqueness
+/// across the pair is a soft invariant maintained by
+/// [`insert_empty_zone`]).
+pub fn find_zone(
+  ctx: &ReducerContext,
+  layer: u8,
+  macro_zone: u32,
+) -> Option<Zone> {
+  ctx.db.zones().macro_zone().filter(&macro_zone).find(|z| z.layer == layer)
+}
+
 /// Insert (or replace) a [`Zone`] row with all cells empty. Returns
-/// the inserted row. Idempotent — calling twice with the same
-/// `macro_zone` overwrites whatever was there.
+/// the inserted row. Idempotent on `(layer, macro_zone)` — calling
+/// twice with the same pair overwrites whatever was there.
 pub fn insert_empty_zone(
   ctx: &ReducerContext,
+  layer: u8,
   macro_zone: u32,
   packed_definition: u8,
 ) -> Zone {
-  ctx.db.zones().macro_zone().delete(&macro_zone);
+  if let Some(existing) = find_zone(ctx, layer, macro_zone) {
+    ctx.db.zones().zone_id().delete(&existing.zone_id);
+  }
   ctx.db.zones().insert(Zone {
+    zone_id: 0,
+    layer,
     macro_zone,
     packed_definition,
     t0: 0, t1: 0, t2: 0, t3: 0, t4: 0, t5: 0, t6: 0, t7: 0,
   })
 }
 
-/// Look up the cell at `coord` in zone `macro_zone`, returning the
-/// full `u16 packed_definition` of whatever tile is sitting in it.
+/// Look up the cell at `coord` in zone `(layer, macro_zone)`,
+/// returning the full `u16 packed_definition` of whatever tile is
+/// sitting in it.
 ///
 /// - `Ok(None)` — the zone doesn't exist, or the cell is empty
 ///                (`definition_id == 0`).
@@ -228,10 +266,11 @@ pub fn insert_empty_zone(
 ///                `packed_definition_ids` length (data corruption).
 pub fn lookup_cell(
   ctx: &ReducerContext,
+  layer: u8,
   macro_zone: u32,
   coord: LocalCoord,
 ) -> Result<Option<u16>, String> {
-  let Some(zone) = ctx.db.zones().macro_zone().find(&macro_zone) else {
+  let Some(zone) = find_zone(ctx, layer, macro_zone) else {
     return Ok(None);
   };
   let rows = zone.cell_rows();
@@ -242,26 +281,23 @@ pub fn lookup_cell(
   Ok(Some(cell_packed_definition(zone.packed_definition, id)))
 }
 
-/// Set the cell at `coord` in zone `macro_zone` to
+/// Set the cell at `coord` in zone `(layer, macro_zone)` to
 /// `cell_definition_id`. Pass `0` ([`EMPTY_CELL`]) to clear a cell.
 /// Errors if the zone row doesn't exist — callers that want lazy
 /// creation should call [`insert_empty_zone`] first.
 pub fn set_cell(
   ctx: &ReducerContext,
+  layer: u8,
   macro_zone: u32,
   coord: LocalCoord,
   cell_definition_id: u8,
 ) -> Result<(), String> {
-  let mut zone = ctx
-    .db
-    .zones()
-    .macro_zone()
-    .find(&macro_zone)
-    .ok_or_else(|| format!("zone {} does not exist", macro_zone))?;
+  let mut zone = find_zone(ctx, layer, macro_zone)
+    .ok_or_else(|| format!("zone (layer={}, macro_zone={}) does not exist", layer, macro_zone))?;
   let mut rows = zone.cell_rows();
   write_cell(&mut rows, coord, cell_definition_id);
   zone.set_cell_rows(rows);
-  ctx.db.zones().macro_zone().update(zone);
+  ctx.db.zones().zone_id().update(zone);
   Ok(())
 }
 

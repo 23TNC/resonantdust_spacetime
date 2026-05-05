@@ -16,9 +16,9 @@
 //! [`bootstrap`] reads `data/bootstrap/bootstrap.json` (embedded at
 //! compile time) and populates:
 //!
-//! - the `zones` table with each entry under `"zones"`, packing
-//!   `(zone_q, zone_r)` into the zone's `macro_zone` and
-//!   `(card_type, category)` into its shared `packed_definition` byte;
+//! - the `zones` table with each entry under `"zones"` (layer is always
+//!   `LAYER_WORLD = 64`), packing `(zone_q, zone_r)` into the zone's
+//!   `macro_zone` and `(card_type, category)` into its `packed_definition`;
 //! - the inventory of player_id `1` with one card per entry in `"card"`.
 //!   Players are created via `claim_or_login`; bootstrap assumes the
 //!   first player to log in gets id 1.
@@ -33,7 +33,7 @@ use spacetimedb::{reducer, ReducerContext, Table};
 use crate::cards::{insert_card_row, insert_card_row_at_position, Card, LAYER_INVENTORY, LAYER_WORLD, MICRO_ZONE_LOCAL_Q_ONE};
 use crate::definitions::find_packed_by_key;
 use crate::packing::pack_world_macro_zone;
-use crate::zones::{zones, LocalCoord, Zone, ZONE_SIDE};
+use crate::zones::{self, zones as _, LocalCoord, Zone, ZONE_SIDE};
 
 const BOOTSTRAP_JSON: &str = include_str!("../data/bootstrap/bootstrap.json");
 
@@ -165,14 +165,15 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
 ///
 /// Expected fields: `zone_q`, `zone_r`, `card_type`, `category`, and
 /// eight cell rows `t0..t7` (each a `u64` packing eight `u8`
-/// `definition_id`s low-byte-first). The optional `layer` is read but
-/// not stored — the Zone schema today identifies a chunk by
-/// `macro_zone` alone, so multi-layer worlds need a schema bump first.
+/// `definition_id`s low-byte-first). Layer is always `LAYER_WORLD`.
+/// Replace-on-insert keyed on `(layer, macro_zone)` — re-running with
+/// the same pair overwrites whatever was there.
 fn ensure_bootstrap_zone(ctx: &ReducerContext, entry: &Value) -> Result<(), String> {
   let entry_obj = entry
     .as_object()
     .ok_or_else(|| format!("bootstrap.json: zone entry not an object: {:?}", entry))?;
 
+  let layer = LAYER_WORLD;
   let zone_q = json_i16(entry_obj.get("zone_q"), "zone_q")?;
   let zone_r = json_i16(entry_obj.get("zone_r"), "zone_r")?;
   let card_type = json_nibble(entry_obj.get("card_type"), "card_type")?;
@@ -195,9 +196,13 @@ fn ensure_bootstrap_zone(ctx: &ReducerContext, entry: &Value) -> Result<(), Stri
   let t6 = read_row("t6")?;
   let t7 = read_row("t7")?;
 
-  // Replace any existing Zone at this macro_zone. Idempotent.
-  ctx.db.zones().macro_zone().delete(&macro_zone);
+  // Replace any existing Zone at (layer, macro_zone). Idempotent.
+  if let Some(existing) = zones::find_zone(ctx, layer, macro_zone) {
+    ctx.db.zones().zone_id().delete(&existing.zone_id);
+  }
   ctx.db.zones().insert(Zone {
+    zone_id: 0,
+    layer,
     macro_zone,
     packed_definition,
     t0, t1, t2, t3, t4, t5, t6, t7,

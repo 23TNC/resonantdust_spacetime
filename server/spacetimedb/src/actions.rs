@@ -662,22 +662,20 @@ fn slot_fillers_unchanged(
 /// visible chain, scores all `Stack(Up)` recipes, and applies the
 /// upgrade rules from the module docs.
 ///
-/// `hex_card_id` is the chain-root → hex card_id relationship the
-/// client extracted from its local root row's `micro_location` when
-/// its `stacked_state == 3`. The server can't read this from its own
-/// row (inventory cards on the server hold `micro_zone = 0` by
-/// convention), so the client carries it on `InventoryStack.hex`.
-/// `None` means the chain isn't on a hex.
+/// The chain's hex relationship (when the root is rect-on-hex) is
+/// read directly from the row state — `submit_inventory_stacks`
+/// mirrors the client's submitted `(layer, macro_zone, micro_zone,
+/// micro_location)` onto the root's row before reaching here, so
+/// `resolve_hex_at_root`'s row-derived path picks it up without an
+/// override.
 pub fn process_top_branch(
   ctx: &ReducerContext,
   branch_chain_ids: &[u32],
-  hex_card_id: Option<u32>,
   owner_id: u32,
 ) -> Result<(), String> {
   process_branch(
     ctx,
     branch_chain_ids,
-    hex_card_id,
     RecipeType::Stack(definitions::StackDirection::Up),
     owner_id,
   )
@@ -688,13 +686,11 @@ pub fn process_top_branch(
 pub fn process_bottom_branch(
   ctx: &ReducerContext,
   branch_chain_ids: &[u32],
-  hex_card_id: Option<u32>,
   owner_id: u32,
 ) -> Result<(), String> {
   process_branch(
     ctx,
     branch_chain_ids,
-    hex_card_id,
     RecipeType::Stack(definitions::StackDirection::Down),
     owner_id,
   )
@@ -703,7 +699,6 @@ pub fn process_bottom_branch(
 fn process_branch(
   ctx: &ReducerContext,
   branch_chain_ids: &[u32],
-  hex_card_id: Option<u32>,
   recipe_type: RecipeType,
   owner_id: u32,
 ) -> Result<(), String> {
@@ -718,9 +713,9 @@ fn process_branch(
   // scoring loop doesn't re-do the lookup. `None` means the chain
   // root isn't on a hex (or the resolved hex card / zone cell is
   // missing). The resolved `card_id` (when non-zero) is passed all
-  // the way down to `start_action` so it can be persisted on the
-  // `Action` row for `complete_action` to re-use.
-  let hex_hit = resolve_hex_at_root(ctx, &branch_chain[0], hex_card_id)?;
+  // the way down to `start_action` so it can be persisted on
+  // `ActionScheduler.hex_card_id` for `complete_action` to re-use.
+  let hex_hit = resolve_hex_at_root(ctx, &branch_chain[0], None)?;
   let hex_def = hex_hit.map(|h| h.def);
   let resolved_hex_card_id = hex_hit.map_or(0, |h| h.card_id);
 
@@ -821,7 +816,7 @@ fn resolve_hex_at_root(
     }
   }
   // Path 3: zones table fallback.
-  let Some(zone) = ctx.db.zones().macro_zone().find(&root.macro_zone) else {
+  let Some(zone) = zones::find_zone(ctx, root.layer, root.macro_zone) else {
     return Ok(None);
   };
   let coord = zones::LocalCoord::from_micro_zone(root.micro_zone);
@@ -1280,7 +1275,7 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
   // scheduler id so the outcome is reproducible per-action.
   if !products_to_fire.is_empty() {
     let mut rng_state: u32 = scheduler.scheduled_id as u32;
-    generate_products(ctx, products_to_fire, &actor, hex_hit.as_ref(), &mut rng_state)?;
+    generate_products(ctx, products_to_fire, &actor, action.owner_id, hex_hit.as_ref(), &mut rng_state)?;
   }
 
   // Consume reagents. Each entry is a `Reagent`:
@@ -1470,11 +1465,12 @@ fn generate_products(
   ctx: &ReducerContext,
   products: &[ProductGroup],
   actor: &Card,
+  action_owner_id: u32,
   hex: Option<&HexHit>,
   rng: &mut u32,
 ) -> Result<(), String> {
   for group in products {
-    let dest = resolve_product_destination(&group.target, actor, hex);
+    let dest = resolve_product_destination(&group.target, actor, action_owner_id, hex);
     for entity in &group.entities {
       generate_entity_products(ctx, entity, &dest, rng)?;
     }
@@ -1482,37 +1478,50 @@ fn generate_products(
   Ok(())
 }
 
+/// Resolve a product target's `(place, owner)` pair to a concrete
+/// destination. Today every place is `Inventory` (`LAYER_INVENTORY`);
+/// the owner picks which player's panel.
+///
+/// Each [`ProductOwner`] variant resolves to a `player_id` via a
+/// distinct source — no `macro_zone` ambiguity (which only equals
+/// `player_id` on the inventory layer):
+///
+/// - `Actor` → `actor.owner_id`.
+/// - `Action` → `action_owner_id` (= `Action.owner_id`).
+/// - `Hex` → `hex.owner_id` (when set and non-zero); otherwise
+///   falls back to `action_owner_id`.
+/// - `Root` → today, falls back to `action_owner_id` because the
+///   chain root isn't held by the action and isn't recoverable from
+///   server state at completion. A future change can persist
+///   `chain_root_card_id` on `ActionScheduler` (parallel to
+///   `hex_card_id`) so this resolves to the chain root's actual
+///   `owner_id`.
+///
+/// `panel_player_id == 0` means "no panel to route to" (world-owned
+/// actor, unresolved hex with no fallback) and is handled by
+/// [`insert_product`] as a silent skip.
 fn resolve_product_destination(
   target: &ProductTarget,
   actor: &Card,
+  action_owner_id: u32,
   hex: Option<&HexHit>,
 ) -> ProductDestination {
-  // For an inventory destination, the panel is identified by
-  // `macro_zone` — the player whose inventory holds the relevant card.
-  //
-  // - `Actor` uses the actor's panel directly.
-  // - `Root` would ideally route to the chain root's holder, but the
-  //   chain root isn't held by the action and isn't recoverable from
-  //   server state at completion; fall back to the actor's panel (a
-  //   no-op for the inventory POC where every claimed card sits in
-  //   the same player's panel anyway).
-  // - `Hex` routes to the hex card's `owner_id` panel — useful for
-  //   recipes that produce items "for" the hex's owner. Falls back to
-  //   the actor's panel when the chain isn't on a hex, the hex is
-  //   unowned (`owner_id == 0`), or the hex resolved from a `Zone`
-  //   cell (which doesn't carry an `owner_id`).
-  match (target.place, target.owner) {
-    (ProductPlace::Inventory, ProductOwner::Actor)
-    | (ProductPlace::Inventory, ProductOwner::Root) => ProductDestination::Panel {
-      panel_player_id: actor.macro_zone,
+  let panel_player_id = match target.owner {
+    ProductOwner::Actor => actor.owner_id,
+    ProductOwner::Action => action_owner_id,
+    ProductOwner::Hex => match hex {
+      Some(h) if h.owner_id != 0 => h.owner_id,
+      _ => action_owner_id,
     },
-    (ProductPlace::Inventory, ProductOwner::Hex) => {
-      let panel_player_id = match hex {
-        Some(h) if h.owner_id != 0 => h.owner_id,
-        _ => actor.macro_zone,
-      };
-      ProductDestination::Panel { panel_player_id }
-    }
+    // TODO: persist chain root card_id on `ActionScheduler` (like
+    // `hex_card_id`) so we can resolve the actual root owner here
+    // instead of falling back to the action initiator. The fallback
+    // is correct for the inventory POC where every claimed card is
+    // in the same player's panel.
+    ProductOwner::Root => action_owner_id,
+  };
+  match target.place {
+    ProductPlace::Inventory => ProductDestination::Panel { panel_player_id },
   }
 }
 
@@ -1582,6 +1591,14 @@ fn insert_product(
 ) -> Result<(), String> {
   match dest {
     ProductDestination::Panel { panel_player_id } => {
+      // World-owned actors (`owner_id == 0`) resolve to panel 0 —
+      // there's no player 0, so `insert_card_row` would reject. Skip
+      // the product silently rather than aborting the whole
+      // completion. Future destinations (loose-on-tile, shared world
+      // stash) belong as new `ProductDestination` variants here.
+      if *panel_player_id == 0 {
+        return Ok(());
+      }
       // Inventory product: the new card sits in `panel_player_id`'s
       // inventory and is owned by them. `insert_card_row` itself
       // triggers the on_create recipe check, which is how
