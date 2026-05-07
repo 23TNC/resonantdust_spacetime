@@ -48,6 +48,18 @@
 //! `Card`-side reservation in `cards/id.json`). A freshly-inserted
 //! [`Zone`] has all eight `u64`s zeroed and represents an empty chunk.
 //!
+//! # Per-cell elevation
+//!
+//! There's no per-cell height stored in this layout — terrain
+//! elevation comes from the cell's card definition (the `height`
+//! aspect on the resolved `CardDefinition`), so two cells holding
+//! the same `definition_id` will always render at the same
+//! elevation. If per-cell height ever needs to vary independently
+//! of the def, materialize a per-cell `Card` row at that
+//! micro_zone (the same escape hatch documented under "Why no
+//! per-cell `Card` rows?" below) — its `flags` byte has room for
+//! a height nibble.
+//!
 //! # Why no per-cell `Card` rows?
 //!
 //! World tiles don't move, don't carry per-tile mutable state in this
@@ -203,8 +215,7 @@ pub fn cell_packed_definition(zone_packed_definition: u8, cell_definition_id: u8
 /// Read a single cell's `definition_id` from the byte-packed array.
 /// Returns [`EMPTY_CELL`] (`0`) for an empty cell.
 ///
-/// Caller is responsible for `packed_ids.len() == ZONE_U64_COUNT`;
-/// use the [`read_cell_checked`] wrapper if you can't guarantee that.
+/// Caller is responsible for `packed_ids.len() == ZONE_U64_COUNT`.
 #[inline]
 pub fn read_cell(packed_ids: &[u64], coord: LocalCoord) -> u8 {
   let cell_idx = coord.index();

@@ -47,7 +47,7 @@ pub const FLAG_CARD_DROP_HOLD: u8 = 1 << 3;
 /// `dead` flag bit on `Card.flags` (mirrors `data/flags.json`'s
 /// `cards.dead`). Set as an UPDATE — rather than the row being
 /// deleted directly — so the write carries `delta_t` and the
-/// client can back-date its dying animation by `16 * delta_t` ms.
+/// client can back-date its dying animation by `32 * delta_t` ms.
 /// Cards-only: actions and magnetic_actions delete immediately
 /// and have no equivalent bit.
 pub const FLAG_CARD_DEAD: u8 = 1 << 7;
@@ -57,6 +57,25 @@ pub const FLAG_CARD_DEAD: u8 = 1 << 7;
 /// (~0.5–2 s) plus headroom for late subscribers; short enough that
 /// the row doesn't keep client-side trackers stuck on it.
 pub const CARD_REAP_DELAY_SECS: u32 = 10;
+
+/// Clear `position_hold` + `drop_hold` on `card_id`. Called by
+/// `actions::release_holds_for_action` on every claimed card at action
+/// completion — magnetic or not — so the player can drag those cards
+/// again once the action ends. The locked variants (`position_locked`,
+/// `drop_locked`) are never touched here. Idempotent — no-op if the
+/// card doesn't exist or the bits are already clear.
+pub fn clear_action_hold_flags(ctx: &ReducerContext, card_id: u32) {
+  let Some(card) = ctx.db.cards().card_id().find(&card_id) else {
+    return;
+  };
+  if (card.flags & (FLAG_CARD_POSITION_HOLD | FLAG_CARD_DROP_HOLD)) == 0 {
+    return;
+  }
+  let mut updated = card;
+  updated.flags &= !(FLAG_CARD_POSITION_HOLD | FLAG_CARD_DROP_HOLD);
+  updated.delta_t = crate::delta_t::current();
+  ctx.db.cards().card_id().update(updated);
+}
 
 /// Safety belt: clear `position_hold` + `drop_hold` on `card_id`
 /// when it lands on `LAYER_INVENTORY`. Idempotent — safe to call

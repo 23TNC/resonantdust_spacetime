@@ -1,10 +1,10 @@
 //! Scheduled-reducer lag, surfaced to clients on public tables.
 //!
 //! Public-table rows (`Card`, `Action`, `MagneticAction`, `Player`,
-//! `Zone`) carry a `delta_t: u8` column. Each unit is **16 ms**. The
+//! `Zone`) carry a `delta_t: u8` column. Each unit is **32 ms**. The
 //! value is the gap between when a scheduled reducer was supposed to
 //! fire and when it actually ran — so the client can back-date its
-//! animations by `16 * delta_t` ms instead of treating the row update
+//! animations by `32 * delta_t` ms instead of treating the row update
 //! as "happening now."
 //!
 //! Default `0` for client-driven writes (the call stack is outside
@@ -15,7 +15,7 @@
 //! scheduled fires (which SpacetimeDB doesn't currently produce, but
 //! defensively) round-trip correctly.
 //!
-//! Saturating semantics: lag larger than `u8::MAX * 16 ms` (~4.08 s)
+//! Saturating semantics: lag larger than `u8::MAX * 32 ms` (~8.16 s)
 //! clamps. A clamp event means the client-side compensation buffer
 //! was overrun anyway; logging it is the client's job.
 
@@ -25,7 +25,7 @@ thread_local! {
   static CURRENT: Cell<u8> = const { Cell::new(0) };
 }
 
-/// Current scheduled-reducer lag in 16-ms units. `0` outside any
+/// Current scheduled-reducer lag in 32-ms units. `0` outside any
 /// [`Guard`] scope, which is the right answer for client-driven
 /// writes.
 pub fn current() -> u8 {
@@ -57,7 +57,7 @@ impl Drop for Guard {
   }
 }
 
-/// Lag in 16-ms units, rounded to nearest, saturating at `u8::MAX`.
+/// Lag in 32-ms units, rounded to nearest, saturating at `u8::MAX`.
 /// `scheduled_micros` is when the reducer was supposed to fire;
 /// `now_micros` is `ctx.timestamp.to_micros_since_unix_epoch()`.
 /// Negative or zero deltas (early/exact) return `0`.
@@ -67,8 +67,8 @@ pub fn compute(scheduled_micros: i64, now_micros: i64) -> u8 {
     return 0;
   }
   let delta_ms = delta_us / 1_000;
-  // Round to nearest 16-ms step.
-  let steps = (delta_ms + 8) / 16;
+  // Round to nearest 32-ms step.
+  let steps = (delta_ms + 16) / 32;
   if steps > u8::MAX as i64 {
     u8::MAX
   } else {
@@ -87,20 +87,20 @@ mod tests {
   }
 
   #[test]
-  fn compute_rounds_to_nearest_16ms() {
-    // 8 ms late -> rounds to 1 step
-    assert_eq!(compute(0, 8_000), 1);
-    // 7 ms late -> rounds to 0 steps
-    assert_eq!(compute(0, 7_000), 0);
-    // 16 ms late -> 1 step
+  fn compute_rounds_to_nearest_32ms() {
+    // 16 ms late -> rounds to 1 step
     assert_eq!(compute(0, 16_000), 1);
-    // 24 ms late -> rounds to 2 steps
-    assert_eq!(compute(0, 24_000), 2);
+    // 15 ms late -> rounds to 0 steps
+    assert_eq!(compute(0, 15_000), 0);
+    // 32 ms late -> 1 step
+    assert_eq!(compute(0, 32_000), 1);
+    // 48 ms late -> rounds to 2 steps
+    assert_eq!(compute(0, 48_000), 2);
   }
 
   #[test]
   fn compute_saturates_at_u8_max() {
-    // Far past saturating threshold (~4.08 s)
+    // Far past saturating threshold (~8.16 s)
     assert_eq!(compute(0, 10_000_000), u8::MAX);
   }
 

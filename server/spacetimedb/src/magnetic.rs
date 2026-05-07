@@ -16,15 +16,17 @@
 //!   anchor, find any live inner whose next slot is satisfied by a
 //!   card in the owner's inventory, place it (`position_hold` +
 //!   `drop_hold` + the placement's `local_q = 1`).
-//! - **Inner complete** → queue the inner action into `actions`, fire
-//!   the **outer** recipe's `products` / `reagents` (its
-//!   "complete" event), remove magnetic_action.
+//! - **Inner queued** → queue the inner action into `actions`, fire
+//!   the **outer** recipe's `output_success` / `reagents` (its
+//!   success event — we successfully started a child action),
+//!   remove magnetic_action.
 //! - **Timeout** → outer's `duration` is the magnetic-phase loop cap
-//!   in *ticks*. When `loop_count > cap`, fire outer products,
-//!   release `position_hold` + `drop_hold` on every card we placed
-//!   (`slot_1..slot_5`), remove magnetic_action.
+//!   in *ticks*. When `loop_count > cap`, fire the outer's
+//!   `output_failure` (we failed to start any inner within the
+//!   budget), release `position_hold` + `drop_hold` on every card we
+//!   placed (`slot_1..slot_5`), remove magnetic_action.
 //! - **Cancel** (e.g. anchor removed) → release flags, remove. No
-//!   products fire — cancellation is distinct from completion.
+//!   outputs fire — cancellation is distinct from completion.
 //! - **Inner action completes in `actions`** → because the action's
 //!   `flags & MAGNETIC` is set, the completion path walks the chain
 //!   from `action.card_id` and clears `position_hold` + `drop_hold`
@@ -47,8 +49,8 @@ use crate::actions::{
 };
 use crate::cards::{cards, Card, LAYER_INVENTORY, MICRO_ZONE_LOCAL_Q_MASK};
 use crate::definitions::{
-  self, AspectId, Duration as RecipeDuration, Entity, InnerRecipe, ProductOwner, ProductPlace,
-  RecipeDef, RecipeType, StackDirection,
+  self, AspectId, Duration as RecipeDuration, Entity, InnerRecipe, ProductGroup, ProductOwner,
+  ProductPlace, RecipeDef, RecipeType, StackDirection,
 };
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -69,10 +71,6 @@ const STACK_STATE_MASK: u8 = 0b11;
 /// "trust this position" signal the client uses to accept inbound
 /// position updates instead of treating them as stale.
 const MICRO_ZONE_LOCAL_Q_ONE: u8 = 0x20;
-
-// Card flag bits — mirrors `data/flags.json`.
-const FLAG_POSITION_HOLD: u8 = 1 << 0;
-const FLAG_DROP_HOLD: u8 = 1 << 3;
 
 /// Action flag — set on actions queued from the magnetic phase. The
 /// completion path checks this to walk the chain and release
@@ -99,7 +97,7 @@ pub fn unpack_action_subid(flags: u8) -> u8 {
 /// `data/flags.json`'s `magnetic_actions.dead`). Set as an UPDATE —
 /// rather than the row being deleted directly — so the write
 /// carries `delta_t` and the client can back-date its end
-/// animation by `16 * delta_t` ms. Mirrors `cards.dead` and
+/// animation by `32 * delta_t` ms. Mirrors `cards.dead` and
 /// `actions.dead` at bit 7 so client-side flag handling can use
 /// one mask across all three tables.
 pub const FLAG_MAGNETIC_ACTION_DEAD: u8 = 1 << 7;
@@ -114,6 +112,14 @@ pub const FLAG_MAGNETIC_ACTION_DEAD: u8 = 1 << 7;
 /// successful completion. Always set in the same UPDATE as
 /// `dead`, never on its own.
 pub const FLAG_MAGNETIC_ACTION_CANCELED: u8 = 1 << 1;
+
+/// `complete` flag bit on `MagneticAction.flags` (mirrors
+/// `data/flags.json`'s `magnetic_actions.complete`). Set together
+/// with [`FLAG_MAGNETIC_ACTION_DEAD`] when the magnetic phase ended
+/// naturally — either an inner was queued or the loop cap was
+/// reached. Mutually exclusive with [`FLAG_MAGNETIC_ACTION_CANCELED`]:
+/// exactly one of the two is set on every dead magnetic action.
+pub const FLAG_MAGNETIC_ACTION_COMPLETE: u8 = 1 << 2;
 
 /// How long a dead-flagged magnetic action lingers before its
 /// actual delete fires. Matches `cards::CARD_REAP_DELAY_SECS` and
@@ -180,6 +186,11 @@ pub struct MagneticAction {
   /// non-zero on tick updates when `magnetic_tick` fires late. See
   /// [`crate::delta_t`].
   pub delta_t: u8,
+  /// Debug timing field. Written on each tick that persists `end`:
+  /// seconds between the scheduled fire time (`end` at tick entry)
+  /// and when the reducer actually ran (`ctx.timestamp`). Zero when
+  /// the tick fires on time; positive when it fires late.
+  pub debug: u32,
 }
 
 /// Private scheduler / state for a magnetic action. Holds the
@@ -270,12 +281,16 @@ pub fn mark_magnetic_action_dead(ctx: &ReducerContext, magnetic_action_id: u32, 
   if (public.flags & FLAG_MAGNETIC_ACTION_DEAD) != 0 {
     return;
   }
+  let now_secs = (ctx.timestamp.to_micros_since_unix_epoch() / 1_000_000) as u32;
   let mut updated = public;
   updated.flags |= FLAG_MAGNETIC_ACTION_DEAD;
   if canceled {
     updated.flags |= FLAG_MAGNETIC_ACTION_CANCELED;
+  } else {
+    updated.flags |= FLAG_MAGNETIC_ACTION_COMPLETE;
   }
   updated.delta_t = crate::delta_t::current();
+  updated.debug = now_secs.saturating_sub(updated.debug);
   ctx.db.magnetic_actions().magnetic_action_id().update(updated);
 
   let reap_at = Timestamp::from_micros_since_unix_epoch(
@@ -358,6 +373,18 @@ pub fn install(
   let now_secs = ctx_seconds(ctx)?;
   let end = now_secs.saturating_add(interval_secs);
 
+  // Apply outer set_start flags to the anchor card. The `hex` sub-key
+  // targets the anchor (which IS the hex for hex-anchored recipes);
+  // `root` is also ORed in for future rect-anchored use.
+  let anchor_flags = recipe.set_start.hex | recipe.set_start.root;
+  if anchor_flags != 0 {
+    if let Some(mut anchor_card) = ctx.db.cards().card_id().find(&actor.card_id) {
+      anchor_card.flags |= anchor_flags;
+      anchor_card.delta_t = crate::delta_t::current();
+      ctx.db.cards().card_id().update(anchor_card);
+    }
+  }
+
   let public = ctx.db.magnetic_actions().insert(MagneticAction {
     magnetic_action_id: 0,
     card_id: actor.card_id,
@@ -368,6 +395,7 @@ pub fn install(
     loop_count: 0,
     flags: 0,
     delta_t: crate::delta_t::current(),
+    debug: 0,
   });
 
   let interval = ScheduleAt::Interval(TimeDuration::from_micros(
@@ -463,6 +491,7 @@ pub fn magnetic_tick(
   ctx: &ReducerContext,
   scheduler: MagneticActionScheduler,
 ) -> Result<(), String> {
+  let tick_start_secs = ctx.timestamp.to_micros_since_unix_epoch() / 1_000_000;
   // Guard 1: the scheduler row must still exist (legitimate fires
   // see it; spoofed/replayed calls don't).
   if ctx
@@ -555,6 +584,7 @@ pub fn magnetic_tick(
           anchor.card_id,
           anchor.layer,
           placed_state,
+          inner.set_start.root,
         )?;
         record_placement(ctx, &scheduler, placed_card_id, /* slot_index = */ 0);
         return queue_and_complete_outer(ctx, &public, &scheduler, &outer, inner, sub_id as u8, anchor_is_hex);
@@ -571,7 +601,7 @@ pub fn magnetic_tick(
 
       let next_entity = &inner.slots[filled];
       if let Some(candidate) = find_inventory_candidate(ctx, scheduler.owner_id, next_entity)? {
-        hold_for_slot(ctx, candidate.card_id)?;
+        hold_for_slot(ctx, candidate.card_id, inner.set_start.slot)?;
         record_placement(ctx, &scheduler, candidate.card_id, filled);
         // Mirror the write into a local copy so
         // `find_inner_actor_card_id` (which reads `slot_1` for the
@@ -595,6 +625,7 @@ pub fn magnetic_tick(
         let mut updated_public = public.clone();
         updated_public.end = next_tick_end;
         updated_public.delta_t = crate::delta_t::current();
+        updated_public.debug = (tick_start_secs - public.end as i64).max(0) as u32;
         ctx.db.magnetic_actions().magnetic_action_id().update(updated_public);
         return Ok(());
       }
@@ -608,15 +639,24 @@ pub fn magnetic_tick(
   updated_public.end = next_tick_end;
 
   // Timeout? Outer.duration as loop-count cap. None means no
-  // terminator — magnetic action runs until cancel.
+  // terminator — magnetic action runs until cancel. Fires
+  // `output_failure` (failed to start any inner within the budget),
+  // not `output_success`.
   if let Some(cap) = outer_loop_cap(&outer) {
     if updated_public.loop_count > cap {
-      return complete_outer(ctx, &updated_public, &scheduler, &outer, /* fire_products = */ true, /* clear_flags = */ true);
+      return complete_outer(
+        ctx,
+        &updated_public,
+        &scheduler,
+        outer.output_failure.as_slice(),
+        /* clear_flags = */ true,
+      );
     }
   }
 
   // Persist updated loop_count + end to the public row.
   updated_public.delta_t = crate::delta_t::current();
+  updated_public.debug = (tick_start_secs - public.end as i64).max(0) as u32;
   ctx.db.magnetic_actions().magnetic_action_id().update(updated_public);
   Ok(())
 }
@@ -679,20 +719,17 @@ fn find_filling_child(
   Ok(None)
 }
 
-/// Walk the action owner's inventory for the first card matching
-/// `entity`. Skips cards held by another action's `CardHold`, the
-/// actor itself shouldn't be in inventory, and cards already with
-/// `position_hold` set.
+/// Walk all cards owned by `owner_id` for the first matching `entity`.
+/// Skips cards held by another action's `CardHold` and cards already
+/// with `position_hold` set. Layer is not filtered — staged world
+/// cards are valid pickup targets alongside inventory cards.
 fn find_inventory_candidate(
   ctx: &ReducerContext,
   owner_id: u32,
   entity: &Entity,
 ) -> Result<Option<Card>, String> {
   for card in ctx.db.cards().owner_id().filter(&owner_id) {
-    if card.layer != LAYER_INVENTORY {
-      continue;
-    }
-    if (card.flags & FLAG_POSITION_HOLD) != 0 {
+    if (card.flags & crate::cards::FLAG_CARD_POSITION_HOLD) != 0 {
       continue;
     }
     if ctx.db.card_holds().card_id().find(&card.card_id).is_some() {
@@ -713,15 +750,17 @@ fn find_inventory_candidate(
 /// Force `card_id` to be stacked on `parent_id` with the given
 /// `stack_state`. Sets `local_q = 1` so the client trusts the
 /// inbound position update, promotes the card to `dest_layer` (so
-/// inventory cards end up on the world layer alongside their
-/// anchor), and stamps `position_hold` + `drop_hold`. Returns the
-/// placed card_id for the caller to record.
+/// inventory cards end up on the world layer alongside their anchor),
+/// and ORs `card_flags` onto the card's `flags` field. Returns the
+/// placed card_id for the caller to record. Pass
+/// `inner.set_start.root` as `card_flags`; zero means set nothing.
 fn place_card(
   ctx: &ReducerContext,
   card_id: u32,
   parent_id: u32,
   dest_layer: u8,
   stack_state: u8,
+  card_flags: u8,
 ) -> Result<u32, String> {
   let Some(card) = ctx.db.cards().card_id().find(&card_id) else {
     return Err(format!("place_card: card {} missing", card_id));
@@ -735,23 +774,24 @@ fn place_card(
   updated.layer = dest_layer;
   updated.micro_zone = new_micro_zone;
   updated.micro_location = parent_id;
-  updated.flags |= FLAG_POSITION_HOLD | FLAG_DROP_HOLD;
+  updated.flags |= card_flags;
   updated.delta_t = crate::delta_t::current();
   ctx.db.cards().card_id().update(updated);
   Ok(card_id)
 }
 
-/// Mark `card_id` as magnetically held in place — sets
-/// `position_hold` + `drop_hold` without changing the card's parent,
-/// layer, or position. Used by slot-based inners where the pulled
-/// card should stay visually in inventory but become un-draggable.
+/// Mark `card_id` as magnetically held in place — ORs `card_flags`
+/// onto `Card.flags` without changing the card's parent, layer, or
+/// position. Used by slot-based inners where the pulled card should
+/// stay visually in inventory but become un-draggable. Pass
+/// `inner.set_start.slot` as `card_flags`; zero means set nothing.
 /// Idempotent — already-set flags are left alone.
-fn hold_for_slot(ctx: &ReducerContext, card_id: u32) -> Result<(), String> {
+fn hold_for_slot(ctx: &ReducerContext, card_id: u32, card_flags: u8) -> Result<(), String> {
   let Some(card) = ctx.db.cards().card_id().find(&card_id) else {
     return Err(format!("hold_for_slot: card {} missing", card_id));
   };
   let mut updated = card;
-  updated.flags |= FLAG_POSITION_HOLD | FLAG_DROP_HOLD;
+  updated.flags |= card_flags;
   updated.delta_t = crate::delta_t::current();
   ctx.db.cards().card_id().update(updated);
   Ok(())
@@ -781,19 +821,21 @@ fn record_placement(
 
 // ─── completion / cancellation ──────────────────────────────────────────────
 
-/// Outer-completion sequence used both by "queue" (success) and
-/// "timeout" branches. Fires outer products if `fire_products`,
-/// clears placed-card flags if `clear_flags`, and deletes both the
-/// public and scheduler rows.
+/// Outer-completion sequence used by both "queue" (success) and
+/// "timeout" (failure) branches. `outputs` is the list of product
+/// groups to fire — the caller passes `outer.output_success` for
+/// the queue path and `outer.output_failure` for the timeout path.
+/// An empty slice fires nothing. `clear_flags` releases position /
+/// drop holds on every recorded slot card; the queue path leaves
+/// them set because the queued inner action now owns the chain.
 fn complete_outer(
   ctx: &ReducerContext,
   public: &MagneticAction,
   scheduler: &MagneticActionScheduler,
-  outer: &RecipeDef,
-  fire_products: bool,
+  outputs: &[ProductGroup],
   clear_flags: bool,
 ) -> Result<(), String> {
-  if fire_products && !outer.products.is_empty() {
+  if !outputs.is_empty() {
     // For magnetic outer products, the "actor" referent is the anchor
     // (the card the magnetic action is on). Hex resolution walks from
     // the anchor — for hex-anchored magnetic, the anchor IS the hex
@@ -807,7 +849,7 @@ fn complete_outer(
       return Ok(());
     };
     let mut rng_state: u32 = scheduler.scheduled_id as u32;
-    generate_outer_products(ctx, outer, &anchor, scheduler.owner_id, &mut rng_state)?;
+    generate_outer_products(ctx, outputs, &anchor, scheduler.owner_id, &mut rng_state)?;
   }
   if clear_flags {
     for &slot in &[scheduler.slot_1, scheduler.slot_2, scheduler.slot_3, scheduler.slot_4, scheduler.slot_5] {
@@ -873,8 +915,15 @@ fn queue_and_complete_outer(
   // queued actor's chain on inventory rows holds `micro_zone = 0`).
   let inner_hex_card_id = if anchor_is_hex { public.card_id } else { 0 };
   queue_inner_action(ctx, scheduler, outer, inner, sub_id, actor_card_id, inner_hex_card_id)?;
-  // Don't clear flags — inner action now owns the chain.
-  complete_outer(ctx, public, scheduler, outer, /* fire_products = */ true, /* clear_flags = */ false)
+  // Don't clear flags — inner action now owns the chain. Fires
+  // `output_success` (we successfully started a child action).
+  complete_outer(
+    ctx,
+    public,
+    scheduler,
+    outer.output_success.as_slice(),
+    /* clear_flags = */ false,
+  )
 }
 
 /// For a freshly-completed inner, find the chain card that becomes
@@ -1049,8 +1098,10 @@ fn ctx_seconds(ctx: &ReducerContext) -> Result<u32, String> {
   u32::try_from(secs).map_err(|_| "ReducerContext timestamp exceeds u32 seconds range".to_string())
 }
 
-/// Generate outer products for a magnetic_action's "complete" event
-/// (queue or timeout). Mirrors the [`ProductOwner`] semantics from
+/// Generate outer products for a magnetic_action's "complete" event.
+/// `groups` is either `outer.output_success` (queue path) or
+/// `outer.output_failure` (timeout path) — the caller picks. Mirrors
+/// the [`ProductOwner`] semantics from
 /// `actions::resolve_product_destination`, but the anchor stands in
 /// for the actor (a magnetic outer doesn't have a queued
 /// `Action.card_id`):
@@ -1068,12 +1119,12 @@ fn ctx_seconds(ctx: &ReducerContext) -> Result<u32, String> {
 /// Groups whose resolved panel is `0` are skipped silently.
 fn generate_outer_products(
   ctx: &ReducerContext,
-  recipe: &RecipeDef,
+  groups: &[ProductGroup],
   anchor: &Card,
   action_owner_id: u32,
   rng: &mut u32,
 ) -> Result<(), String> {
-  for group in &recipe.products {
+  for group in groups {
     if !matches!(group.target.place, ProductPlace::Inventory) {
       // Only inventory destinations supported today.
       continue;
@@ -1168,14 +1219,5 @@ fn outer_loop_cap(outer: &RecipeDef) -> Option<u8> {
 /// completion. Position/drop-locked variants stay set (those are
 /// permanent locks).
 fn clear_hold_flags(ctx: &ReducerContext, card_id: u32) {
-  let Some(card) = ctx.db.cards().card_id().find(&card_id) else {
-    return;
-  };
-  if (card.flags & (FLAG_POSITION_HOLD | FLAG_DROP_HOLD)) == 0 {
-    return;
-  }
-  let mut updated = card;
-  updated.flags &= !(FLAG_POSITION_HOLD | FLAG_DROP_HOLD);
-  updated.delta_t = crate::delta_t::current();
-  ctx.db.cards().card_id().update(updated);
+  crate::cards::clear_action_hold_flags(ctx, card_id);
 }

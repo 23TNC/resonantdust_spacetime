@@ -219,7 +219,7 @@ fn current_seconds(ctx: &ReducerContext) -> Result<u32, String> {
 /// `dead` flag bit on `Action.flags` (mirrors `data/flags.json`'s
 /// `actions.dead`). Set as an UPDATE — rather than the row being
 /// deleted directly — so the write carries `delta_t` and the
-/// client can back-date its end animation by `16 * delta_t` ms.
+/// client can back-date its end animation by `32 * delta_t` ms.
 /// Mirrors `cards.dead` at bit 7 so the client can use one mask
 /// across both tables.
 pub const FLAG_ACTION_DEAD: u8 = 1 << 7;
@@ -233,6 +233,15 @@ pub const FLAG_ACTION_DEAD: u8 = 1 << 7;
 /// completion. Always set in the same UPDATE as `dead`, never on
 /// its own.
 pub const FLAG_ACTION_CANCELED: u8 = 1 << 1;
+
+/// `complete` flag bit on `Action.flags` (mirrors
+/// `data/flags.json`'s `actions.complete`). Set together with
+/// [`FLAG_ACTION_DEAD`] when the action ended via normal recipe
+/// completion — outputs generated, reagents consumed. Mutually
+/// exclusive with [`FLAG_ACTION_CANCELED`]: exactly one of the two
+/// is set on every dead action. Lets the client distinguish
+/// "finished successfully" from "interrupted/canceled".
+pub const FLAG_ACTION_COMPLETE: u8 = 1 << 2;
 
 /// How long a dead-flagged action lingers before its actual delete
 /// fires. Matches `cards::CARD_REAP_DELAY_SECS` so the client sees
@@ -323,6 +332,8 @@ pub fn mark_action_dead(ctx: &ReducerContext, action_id: u32, canceled: bool) {
   updated.flags |= FLAG_ACTION_DEAD;
   if canceled {
     updated.flags |= FLAG_ACTION_CANCELED;
+  } else {
+    updated.flags |= FLAG_ACTION_COMPLETE;
   }
   updated.delta_t = crate::delta_t::current();
   ctx.db.actions().action_id().update(updated);
@@ -372,8 +383,11 @@ fn claim_cards(ctx: &ReducerContext, action_id: u32, card_ids: &[u32]) {
   }
 }
 
-/// Wipe every CardHold belonging to `action_id`. O(claims) via the
-/// `action_id` btree index.
+/// Wipe every CardHold belonging to `action_id` and clear
+/// `position_hold` + `drop_hold` on each formerly-held card. O(claims)
+/// via the `action_id` btree index. The hold-flag clear covers both
+/// magnetic and non-magnetic actions so held cards always unblock the
+/// player's hand when the action ends.
 fn release_holds_for_action(ctx: &ReducerContext, action_id: u32) {
   let card_ids: Vec<u32> = ctx
     .db
@@ -383,6 +397,7 @@ fn release_holds_for_action(ctx: &ReducerContext, action_id: u32) {
     .map(|h| h.card_id)
     .collect();
   for id in card_ids {
+    crate::cards::clear_action_hold_flags(ctx, id);
     ctx.db.card_holds().card_id().delete(&id);
   }
 }
@@ -983,13 +998,22 @@ fn process_actor_candidate(
   // this card is a slot filler in someone else's action and we leave
   // it alone (its actor will reach the same conclusion when *its*
   // candidate iteration runs).
+  //
+  // Dead actions (`flags & FLAG_ACTION_DEAD`) are filtered out — a
+  // dead action is "ended, just lingering for the client animation."
+  // `delete_action_rows` deletes its `card_holds` eagerly so this
+  // path *should* never see one, but the explicit filter makes the
+  // matcher's intent clear and survives any future divergence in
+  // teardown order.
   let actor_action_id = ctx
     .db
     .card_holds()
     .card_id()
     .find(&actor.card_id)
     .map(|h| h.action_id);
-  let current_action = actor_action_id.and_then(|id| ctx.db.actions().action_id().find(&id));
+  let current_action = actor_action_id
+    .and_then(|id| ctx.db.actions().action_id().find(&id))
+    .filter(|a| (a.flags & FLAG_ACTION_DEAD) == 0);
   if let Some(ref a) = current_action {
     if a.card_id != actor.card_id {
       return Ok(());
@@ -1398,13 +1422,13 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
         )
       })?;
       (
-        inner.products.as_slice(),
+        inner.output_success.as_slice(),
         inner.reagents.as_slice(),
         inner.recipe_type,
       )
     } else {
       (
-        recipe.products.as_slice(),
+        recipe.output_success.as_slice(),
         recipe.reagents.as_slice(),
         recipe.recipe_type,
       )
@@ -1428,8 +1452,18 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
   //   recorded on `ActionScheduler.hex_card_id` at start time. `0`
   //   (no anchor) is a no-op.
   // - `Reagent::Slot(1)` — slot 1 is always the actor.
-  // - `Reagent::Slot(N)` for `N >= 2` — needs per-slot claim tracking
-  //   that doesn't exist yet; no-op for now.
+  // - `Reagent::Slot(N)` for `N >= 2` — walk N-1 steps along
+  //   micro_location from the actor within the claimed card set.
+  //   Slot 1 is the actor; slot 2 is the claimed card whose
+  //   micro_location == actor; slot 3 is the claimed card whose
+  //   micro_location == slot2; and so on.
+  let claimed_ids: Vec<u32> = ctx
+    .db
+    .card_holds()
+    .action_id()
+    .filter(&action_id)
+    .map(|h| h.card_id)
+    .collect();
   for &reagent in reagents_to_consume {
     let card_id = match reagent {
       Reagent::Root => match completion_recipe_type {
@@ -1443,13 +1477,22 @@ pub fn complete_action(ctx: &ReducerContext, scheduler: ActionScheduler) -> Resu
         real_scheduler.hex_card_id
       }
       Reagent::Slot(1) => action.card_id,
-      Reagent::Slot(_n) => {
-        // TODO: slot N >= 2 references positions that aren't
-        // recoverable from `card_holds().action_id().filter()`
-        // alone (the iteration order is PK, not insertion). Fix
-        // by adding a `slot_index: u8` to `CardHold` or by
-        // storing the ordered claim list on the `Action` row.
-        continue;
+      Reagent::Slot(n) => {
+        // Walk claimed cards n-1 steps from the actor via
+        // micro_location. Missing link → silently skip.
+        let mut current = action.card_id;
+        let mut found = true;
+        for _ in 1..n {
+          match claimed_ids.iter().find(|&&cid| {
+            ctx.db.cards().card_id().find(&cid)
+              .map_or(false, |c| c.micro_location == current)
+          }) {
+            Some(&cid) => current = cid,
+            None => { found = false; break; }
+          }
+        }
+        if !found { continue; }
+        current
       }
     };
 

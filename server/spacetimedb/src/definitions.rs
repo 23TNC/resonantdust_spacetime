@@ -688,21 +688,28 @@ pub struct InnerRecipe {
   pub hex: Option<Entity>,
   pub slots: Vec<Entity>,
   pub reagents: Vec<Reagent>,
-  pub products: Vec<ProductGroup>,
+  pub output_success: Vec<ProductGroup>,
   pub duration: Duration,
+  /// Flags to set on pulled cards when this inner's magnetic phase
+  /// acquires them. See [`SetStartFlags`].
+  pub set_start: SetStartFlags,
 }
 
-/// Where products from a completed action go. Two independent axes:
+/// Where the output cards from a completed action go. Two independent
+/// axes:
 ///
 /// - `place` — what *kind* of destination (an inventory panel today;
 ///   future: a hex tile, a loose world spot, a player's pile, …).
 /// - `owner` — which referent of the action defines that destination
 ///   (the chain root, the actor, future: the underlying tile, …).
 ///
-/// The recipe JSON encodes this as a nested map:
+/// The recipe JSON encodes this as a nested map under
+/// `output_success` (the action completed normally) or `output_fail`
+/// (a magnetic outer ran out of loop budget without queueing an
+/// inner):
 ///
 /// ```json
-/// "products": {
+/// "output_success": {
 ///   "inventory": {
 ///     "root":  [/* entities */],
 ///     "actor": [/* entities */]
@@ -766,6 +773,40 @@ pub struct ProductGroup {
   /// Each entity in this list produces one output card on completion.
   /// `WeightedOr` entities pick one alternative at random.
   pub entities: Vec<Entity>,
+}
+
+/// Flags to set on specific cards when a magnetic action pulls them
+/// at the start of an inner recipe, or on the anchor card when a
+/// magnetic action is first installed. Field values are bitmasks built
+/// from the named-flag arrays in the JSON `"set_start"` key. Zero
+/// means "set nothing on that card role."
+///
+/// The clearing counterpart is always `position_hold + drop_hold`
+/// (the two temporary-hold bits) and is not controlled by this struct.
+/// Locked variants (`position_locked`, `drop_locked`) set via
+/// `set_start` persist until explicitly cleared by admin/migration code.
+///
+/// JSON form under an inner recipe:
+/// ```json
+/// "set_start": {
+///   "root": ["position_hold", "drop_hold"],
+///   "slot": ["position_hold", "drop_hold"],
+///   "hex":  []
+/// }
+/// ```
+/// Under an outer recipe the `hex` key sets flags on the anchor card at
+/// install time; `root` / `slot` are parsed but unused at that point.
+#[derive(Debug, Clone, Default)]
+pub struct SetStartFlags {
+  /// Bitmask ORed onto the root card (root-based inners: the card
+  /// placed as a child of the anchor; outer recipe: the anchor).
+  pub root: u8,
+  /// Bitmask ORed onto each slot card (slot-based inners: cards pulled
+  /// from inventory into numbered slot positions).
+  pub slot: u8,
+  /// Bitmask ORed onto the hex anchor card (outer recipe: applied at
+  /// install; inner recipe: parsed but not yet applied).
+  pub hex: u8,
 }
 
 /// What a recipe consumes on completion. Three kinds, all optional:
@@ -850,7 +891,14 @@ pub struct RecipeDef {
   /// What the recipe consumes on completion. See [`Reagent`] —
   /// strings `"root"` / `"hex"` and 1-indexed slot integers in JSON.
   pub reagents: Vec<Reagent>,
-  pub products: Vec<ProductGroup>,
+  /// Cards produced when the recipe's action completes normally —
+  /// the inner queued for a magnetic outer, the standard end-of-action
+  /// fire for everything else. JSON key: `output_success`.
+  pub output_success: Vec<ProductGroup>,
+  /// Cards produced when a magnetic outer's loop budget runs out
+  /// without ever queueing an inner. JSON key: `output_fail`. Empty
+  /// for non-magnetic recipes (no failure path).
+  pub output_failure: Vec<ProductGroup>,
   /// Action duration in seconds. Optional **only** for outer magnetic
   /// recipes (where `magnetic.is_some()`), and there it acts as the
   /// magnetic-phase loop-count cap (in ticks, not seconds). For
@@ -863,16 +911,25 @@ pub struct RecipeDef {
   /// scheduled tick that pulls inventory cards into the action's
   /// chain per the bucket's inner recipes, then queues an inner
   /// action into `actions` once any inner's slot list is fully
-  /// filled. The outer recipe's `slots` / `reagents` / `products`
-  /// describe the magnetic *outer*: matched at install time, fired
-  /// at magnetic-action completion (queue or timeout). The inner
-  /// recipe's fields fire at the queued inner action's completion.
+  /// filled. The outer recipe's `slots` / `reagents` /
+  /// `output_success` / `output_failure` describe the magnetic
+  /// *outer*: matched at install time, fired
+  /// at magnetic-action completion — `output_success` fires when an
+  /// inner gets queued, `output_failure` fires when the loop cap is
+  /// reached without queueing one. The inner recipe's fields fire at
+  /// the queued inner action's completion.
   pub magnetic: Option<MagneticBucket>,
   /// Tick cadence in seconds for the magnetic phase. Only meaningful
   /// when `magnetic.is_some()`; ignored otherwise. The magnetic_action
   /// schedules a tick every `interval` seconds; each tick attempts
   /// one card pickup. Required for magnetic recipes.
   pub interval: Option<u32>,
+  /// Flags to set on cards at the start of the action. For magnetic
+  /// recipes, `hex` is applied to the anchor card when `magnetic::install`
+  /// runs; `root` / `slot` are reserved for future outer-recipe use.
+  /// For non-magnetic recipes this struct is currently unused (all zeros).
+  /// See [`SetStartFlags`].
+  pub set_start: SetStartFlags,
 }
 
 const RECIPES_FILES: &[(&str, &str)] = &[
@@ -1252,69 +1309,37 @@ fn parse_recipe(
     Vec::new()
   };
 
-  let products = if let Some(products_obj) = recipe_value
-    .get("products")
-    .and_then(Value::as_object)
-  {
-    let mut groups: Vec<ProductGroup> = Vec::new();
-    for (place_name, place_value) in products_obj {
-      let place = match place_name.as_str() {
-        "inventory" => ProductPlace::Inventory,
-        other => {
-          return Err(format!(
-            "{}: recipe {:?} unknown product place {:?}, expected one of: \"inventory\"",
-            filename, id, other
-          ));
-        }
-      };
-      let place_obj = place_value.as_object().ok_or_else(|| {
-        format!(
-          "{}: recipe {:?} products[{}] not an object (expected `{{ owner: [entities…] }}`)",
-          filename, id, place_name
-        )
-      })?;
-      for (owner_name, entities_value) in place_obj {
-        let owner = match owner_name.as_str() {
-          "root" => ProductOwner::Root,
-          "actor" => ProductOwner::Actor,
-          "hex" => ProductOwner::Hex,
-          "action" => ProductOwner::Action,
-          other => {
-            return Err(format!(
-              "{}: recipe {:?} unknown product owner {:?} under place {:?}, expected one of: \"root\", \"actor\", \"hex\", \"action\"",
-              filename, id, other, place_name
-            ));
-          }
-        };
-        let entities_arr = entities_value.as_array().ok_or_else(|| {
-          format!(
-            "{}: recipe {:?} products[{}][{}] not an array",
-            filename, id, place_name, owner_name
-          )
-        })?;
-        let entities = entities_arr
-          .iter()
-          .enumerate()
-          .map(|(i, v)| {
-            parse_entity(
-              v,
-              type_ids,
-              filename,
-              &id,
-              &format!("products[{}][{}][{}]", place_name, owner_name, i),
-            )
-          })
-          .collect::<Result<Vec<_>, _>>()?;
-        groups.push(ProductGroup {
-          target: ProductTarget { place, owner },
-          entities,
-        });
-      }
-    }
-    groups
-  } else {
-    Vec::new()
-  };
+  // `products` was renamed to `output_success`; fail loud on the
+  // legacy key so stale JSON doesn't silently drop its outputs.
+  if recipe_value.get("products").is_some() {
+    return Err(format!(
+      "{}: recipe {:?} uses legacy 'products' key — rename to 'output_success'",
+      filename, id
+    ));
+  }
+  let output_success = parse_output_groups(
+    recipe_value,
+    "output_success",
+    type_ids,
+    filename,
+    &id,
+    "",
+  )?;
+  let output_failure = parse_output_groups(
+    recipe_value,
+    "output_fail",
+    type_ids,
+    filename,
+    &id,
+    "",
+  )?;
+  if !output_failure.is_empty() && magnetic.is_none() {
+    return Err(format!(
+      "{}: recipe {:?} has 'output_fail' but no 'magnetic' field — \
+       output_fail only fires when a magnetic outer's loop cap is reached",
+      filename, id
+    ));
+  }
 
   // Duration is optional only for outer magnetic recipes (where it
   // acts as the magnetic-phase loop-count cap; absent means "no
@@ -1344,6 +1369,8 @@ fn parse_recipe(
     ));
   }
 
+  let set_start = parse_set_start(recipe_value, filename, &id, "")?;
+
   let def = RecipeDef {
     index: stable_id,
     id: id.clone(),
@@ -1352,10 +1379,12 @@ fn parse_recipe(
     hex,
     slots,
     reagents,
-    products,
+    output_success,
+    output_failure,
     duration,
     magnetic,
     interval,
+    set_start,
   };
   Ok((id, stable_id, def))
 }
@@ -1438,8 +1467,10 @@ fn parse_inner_recipe(
   type_ids: &BTreeMap<String, u8>,
 ) -> Result<InnerRecipe, String> {
   // Reject fields that don't apply to inner recipes — fail loud rather
-  // than silently dropping authorial intent.
-  for forbidden in ["id", "magnetic", "interval"] {
+  // than silently dropping authorial intent. `products` was the legacy
+  // name for `output_success`; flagging it explicitly catches stale
+  // recipe JSON.
+  for forbidden in ["id", "magnetic", "interval", "products"] {
     if recipe_value.get(forbidden).is_some() {
       return Err(format!(
         "{}: recipe {:?} {}: inner recipe must not have '{}' field",
@@ -1481,66 +1512,21 @@ fn parse_inner_recipe(
     Vec::new()
   };
 
-  let products = if let Some(products_obj) = recipe_value.get("products").and_then(Value::as_object) {
-    let mut groups: Vec<ProductGroup> = Vec::new();
-    for (place_name, place_value) in products_obj {
-      let place = match place_name.as_str() {
-        "inventory" => ProductPlace::Inventory,
-        other => {
-          return Err(format!(
-            "{}: recipe {:?} {}: unknown product place {:?}, expected \"inventory\"",
-            filename, parent_id, path, other
-          ));
-        }
-      };
-      let place_obj = place_value.as_object().ok_or_else(|| {
-        format!(
-          "{}: recipe {:?} {}: products[{}] not an object",
-          filename, parent_id, path, place_name
-        )
-      })?;
-      for (owner_name, entities_value) in place_obj {
-        let owner = match owner_name.as_str() {
-          "root" => ProductOwner::Root,
-          "actor" => ProductOwner::Actor,
-          "hex" => ProductOwner::Hex,
-          "action" => ProductOwner::Action,
-          other => {
-            return Err(format!(
-              "{}: recipe {:?} {}: unknown product owner {:?}, expected \"root\", \"actor\", \"hex\", \"action\"",
-              filename, parent_id, path, other
-            ));
-          }
-        };
-        let entities_arr = entities_value.as_array().ok_or_else(|| {
-          format!(
-            "{}: recipe {:?} {}: products[{}][{}] not an array",
-            filename, parent_id, path, place_name, owner_name
-          )
-        })?;
-        let entities = entities_arr
-          .iter()
-          .enumerate()
-          .map(|(i, v)| {
-            parse_entity(
-              v,
-              type_ids,
-              filename,
-              &label,
-              &format!("products[{}][{}][{}]", place_name, owner_name, i),
-            )
-          })
-          .collect::<Result<Vec<_>, _>>()?;
-        groups.push(ProductGroup {
-          target: ProductTarget { place, owner },
-          entities,
-        });
-      }
-    }
-    groups
-  } else {
-    Vec::new()
-  };
+  let output_success = parse_output_groups(
+    recipe_value,
+    "output_success",
+    type_ids,
+    filename,
+    &label,
+    path,
+  )?;
+  if recipe_value.get("output_fail").is_some() {
+    return Err(format!(
+      "{}: recipe {:?} {}: inner recipe must not have 'output_fail' field — \
+       only the magnetic outer fires on failure",
+      filename, parent_id, path
+    ));
+  }
 
   // Inner duration is *required* — it becomes the queued inner action's
   // duration in `actions`. Without it the queued action would have no
@@ -1553,15 +1539,173 @@ fn parse_inner_recipe(
   })?;
   let duration = parse_duration(duration_value, type_ids, filename, &label)?;
 
+  let set_start = parse_set_start(recipe_value, filename, &label, path)?;
+
   Ok(InnerRecipe {
     recipe_type,
     root,
     hex,
     slots,
     reagents,
-    products,
+    output_success,
     duration,
+    set_start,
   })
+}
+
+/// Parse the `"set_start"` key on a recipe value into a
+/// [`SetStartFlags`] bitmask struct. Missing key → all-zero default
+/// (set nothing). Each sub-key (`"root"`, `"slot"`, `"hex"`) holds an
+/// array of card-flag names; each name maps to a fixed bit position in
+/// `Card.flags` (see `data/flags.json`). `"dead"` is rejected — it
+/// cannot be set via `set_start`.
+fn parse_set_start(
+  recipe_value: &Value,
+  filename: &str,
+  id_label: &str,
+  path_prefix: &str,
+) -> Result<SetStartFlags, String> {
+  let Some(obj) = recipe_value.get("set_start").and_then(Value::as_object) else {
+    return Ok(SetStartFlags::default());
+  };
+  let where_str: String = if path_prefix.is_empty() {
+    String::new()
+  } else {
+    format!(" {}", path_prefix)
+  };
+  let mut flags = SetStartFlags::default();
+  for (sub_key, val) in obj {
+    let bits_arr = val.as_array().ok_or_else(|| {
+      format!(
+        "{}: recipe {:?}{} set_start.{} not an array of flag names",
+        filename, id_label, where_str, sub_key
+      )
+    })?;
+    let mut mask: u8 = 0;
+    for (i, bit_val) in bits_arr.iter().enumerate() {
+      let name = bit_val.as_str().ok_or_else(|| {
+        format!(
+          "{}: recipe {:?}{} set_start.{}[{}] not a string",
+          filename, id_label, where_str, sub_key, i
+        )
+      })?;
+      let bit: u8 = match name {
+        "position_hold"   => 0,
+        "position_locked" => 1,
+        "layer_locked"    => 2,
+        "drop_hold"       => 3,
+        "drop_locked"     => 4,
+        "dead" => {
+          return Err(format!(
+            "{}: recipe {:?}{} set_start.{}[{}]: 'dead' cannot be set via set_start",
+            filename, id_label, where_str, sub_key, i
+          ));
+        }
+        other => {
+          return Err(format!(
+            "{}: recipe {:?}{} set_start.{}[{}]: unknown flag name {:?} \
+             (expected \"position_hold\", \"position_locked\", \"layer_locked\", \
+             \"drop_hold\", \"drop_locked\")",
+            filename, id_label, where_str, sub_key, i, other
+          ));
+        }
+      };
+      mask |= 1u8 << bit;
+    }
+    match sub_key.as_str() {
+      "root" => flags.root = mask,
+      "slot" => flags.slot = mask,
+      "hex"  => flags.hex  = mask,
+      other => {
+        return Err(format!(
+          "{}: recipe {:?}{} set_start unknown sub-key {:?} \
+           (expected \"root\", \"slot\", or \"hex\")",
+          filename, id_label, where_str, other
+        ));
+      }
+    }
+  }
+  Ok(flags)
+}
+
+/// Parse the nested `{ place: { owner: [entities…] } }` map under
+/// either `output_success` or `output_fail` into a flat
+/// [`ProductGroup`] list. Missing key → empty vec (no outputs is a
+/// valid recipe). `path_prefix` is `""` for outer recipes; for inner
+/// recipes it's the bucket path (e.g. `"magnetic.up[0]"`) so error
+/// messages still point at the offending JSON location.
+fn parse_output_groups(
+  recipe_value: &Value,
+  key: &str,
+  type_ids: &BTreeMap<String, u8>,
+  filename: &str,
+  id_label: &str,
+  path_prefix: &str,
+) -> Result<Vec<ProductGroup>, String> {
+  let Some(obj) = recipe_value.get(key).and_then(Value::as_object) else {
+    return Ok(Vec::new());
+  };
+  let where_str: String = if path_prefix.is_empty() {
+    String::new()
+  } else {
+    format!(" {}", path_prefix)
+  };
+  let mut groups: Vec<ProductGroup> = Vec::new();
+  for (place_name, place_value) in obj {
+    let place = match place_name.as_str() {
+      "inventory" => ProductPlace::Inventory,
+      other => {
+        return Err(format!(
+          "{}: recipe {:?}{} unknown product place {:?} under {}, expected \"inventory\"",
+          filename, id_label, where_str, other, key
+        ));
+      }
+    };
+    let place_obj = place_value.as_object().ok_or_else(|| {
+      format!(
+        "{}: recipe {:?}{} {}[{}] not an object (expected `{{ owner: [entities…] }}`)",
+        filename, id_label, where_str, key, place_name
+      )
+    })?;
+    for (owner_name, entities_value) in place_obj {
+      let owner = match owner_name.as_str() {
+        "root" => ProductOwner::Root,
+        "actor" => ProductOwner::Actor,
+        "hex" => ProductOwner::Hex,
+        "action" => ProductOwner::Action,
+        other => {
+          return Err(format!(
+            "{}: recipe {:?}{} unknown product owner {:?} under {}[{}], expected \"root\", \"actor\", \"hex\", \"action\"",
+            filename, id_label, where_str, other, key, place_name
+          ));
+        }
+      };
+      let entities_arr = entities_value.as_array().ok_or_else(|| {
+        format!(
+          "{}: recipe {:?}{} {}[{}][{}] not an array",
+          filename, id_label, where_str, key, place_name, owner_name
+        )
+      })?;
+      let entities = entities_arr
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+          parse_entity(
+            v,
+            type_ids,
+            filename,
+            id_label,
+            &format!("{}[{}][{}][{}]", key, place_name, owner_name, i),
+          )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+      groups.push(ProductGroup {
+        target: ProductTarget { place, owner },
+        entities,
+      });
+    }
+  }
+  Ok(groups)
 }
 
 /// Sentinel string parsed as `Entity::Any`. Reserved — a card with this

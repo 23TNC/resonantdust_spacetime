@@ -13,12 +13,10 @@
 //! create cards programmatically should call this helper directly
 //! rather than chaining reducers.
 //!
-//! [`bootstrap`] reads `data/bootstrap/bootstrap.json` (embedded at
-//! compile time) and populates:
+//! [`bootstrap`] generates four world zones around the origin via
+//! [`mapgen::fill_zone_cells`] and reads `data/bootstrap/bootstrap.json`
+//! (embedded at compile time) to populate:
 //!
-//! - the `zones` table with each entry under `"zones"` (layer is always
-//!   `LAYER_WORLD = 64`), packing `(zone_q, zone_r)` into the zone's
-//!   `macro_zone` and `(card_type, category)` into its `packed_definition`;
 //! - the inventory of player_id `1` with one card per entry in `"card"`.
 //!   Players are created via `claim_or_login`; bootstrap assumes the
 //!   first player to log in gets id 1.
@@ -32,6 +30,7 @@ use spacetimedb::{reducer, ReducerContext, Table};
 
 use crate::cards::{insert_card_row, insert_card_row_at_position, Card, LAYER_INVENTORY, LAYER_WORLD, MICRO_ZONE_LOCAL_Q_ONE};
 use crate::definitions::find_packed_by_key;
+use crate::mapgen;
 use crate::packing::pack_world_macro_zone;
 use crate::zones::{self, zones as _, LocalCoord, Zone, ZONE_SIDE};
 
@@ -123,9 +122,9 @@ pub fn debug_spawn_world(
 
 // ─── bootstrap reducer ──────────────────────────────────────────────────────
 
-/// Seed the database from `data/bootstrap/bootstrap.json`. Replaces the
-/// listed zones with their packed cell data and appends the listed cards
-/// to player_id 1's inventory.
+/// Seed the database from `data/bootstrap/bootstrap.json`. Generates
+/// four world zones around the origin and appends the listed cards to
+/// player_id 1's inventory.
 ///
 /// Zones are replaced wholesale on every call. Cards are appended — re-running
 /// adds another set. Players are created via `claim_or_login`; bootstrap
@@ -139,11 +138,10 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
     .ok_or_else(|| "bootstrap.json: top-level not an object".to_string())?;
 
   // ── Zones ──
-  // Replaces existing zones at the same `macro_zone` outright.
-  if let Some(zones_arr) = root_obj.get("zones").and_then(Value::as_array) {
-    for entry in zones_arr {
-      ensure_bootstrap_zone(ctx, entry)?;
-    }
+  // Generate a 2×2 block of world zones surrounding the origin.
+  // card_type=7 (tile), category=0 (default).
+  for (zone_q, zone_r) in [(0i16, 0i16), (-1, 0), (0, -1), (-1, -1)] {
+    generate_zone(ctx, zone_q, zone_r, 7, 0)?;
   }
 
   // ── Cards ──
@@ -161,40 +159,26 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
 
 // ─── bootstrap helpers ──────────────────────────────────────────────────────
 
-/// Insert (or replace) one Zone row from a bootstrap JSON entry.
+/// Insert (or replace) one Zone row generated from `(zone_q, zone_r)`.
 ///
-/// Expected fields: `zone_q`, `zone_r`, `card_type`, `category`, and
-/// eight cell rows `t0..t7` (each a `u64` packing eight `u8`
-/// `definition_id`s low-byte-first). Layer is always `LAYER_WORLD`.
-/// Replace-on-insert keyed on `(layer, macro_zone)` — re-running with
-/// the same pair overwrites whatever was there.
-fn ensure_bootstrap_zone(ctx: &ReducerContext, entry: &Value) -> Result<(), String> {
-  let entry_obj = entry
-    .as_object()
-    .ok_or_else(|| format!("bootstrap.json: zone entry not an object: {:?}", entry))?;
-
+/// Cell content is filled by [`mapgen::fill_zone_cells`], which samples
+/// climate noise per cell and weighted-blends across the biomes declared
+/// in `data/biomes.json`. Layer is always `LAYER_WORLD`. Replace-on-insert
+/// keyed on `(layer, macro_zone)` — re-running with the same pair
+/// overwrites whatever was there.
+fn generate_zone(
+  ctx: &ReducerContext,
+  zone_q: i16,
+  zone_r: i16,
+  card_type: u8,
+  category: u8,
+) -> Result<(), String> {
   let layer = LAYER_WORLD;
-  let zone_q = json_i16(entry_obj.get("zone_q"), "zone_q")?;
-  let zone_r = json_i16(entry_obj.get("zone_r"), "zone_r")?;
-  let card_type = json_nibble(entry_obj.get("card_type"), "card_type")?;
-  let category = json_nibble(entry_obj.get("category"), "category")?;
-
   let macro_zone = pack_world_macro_zone(zone_q, zone_r);
   let packed_definition = (card_type << 4) | category;
 
-  let read_row = |name: &str| -> Result<u64, String> {
-    entry_obj.get(name).and_then(Value::as_u64).ok_or_else(|| {
-      format!("bootstrap.json: zone ({}, {}) missing '{}' u64 cell row", zone_q, zone_r, name)
-    })
-  };
-  let t0 = read_row("t0")?;
-  let t1 = read_row("t1")?;
-  let t2 = read_row("t2")?;
-  let t3 = read_row("t3")?;
-  let t4 = read_row("t4")?;
-  let t5 = read_row("t5")?;
-  let t6 = read_row("t6")?;
-  let t7 = read_row("t7")?;
+  let mut rows = [0u64; zones::ZONE_U64_COUNT];
+  mapgen::fill_zone_cells(zone_q, zone_r, &mut rows)?;
 
   // Replace any existing Zone at (layer, macro_zone). Idempotent.
   if let Some(existing) = zones::find_zone(ctx, layer, macro_zone) {
@@ -205,36 +189,10 @@ fn ensure_bootstrap_zone(ctx: &ReducerContext, entry: &Value) -> Result<(), Stri
     layer,
     macro_zone,
     packed_definition,
-    t0, t1, t2, t3, t4, t5, t6, t7,
+    t0: rows[0], t1: rows[1], t2: rows[2], t3: rows[3],
+    t4: rows[4], t5: rows[5], t6: rows[6], t7: rows[7],
     delta_t: crate::delta_t::current(),
   });
   Ok(())
 }
 
-// ─── JSON value extractors ──────────────────────────────────────────────────
-
-fn json_i16(value: Option<&Value>, field: &str) -> Result<i16, String> {
-  let v = value.ok_or_else(|| format!("bootstrap.json: missing '{}'", field))?;
-  let n = v
-    .as_i64()
-    .ok_or_else(|| format!("bootstrap.json: '{}' not an integer: {:?}", field, v))?;
-  i16::try_from(n).map_err(|_| {
-    format!("bootstrap.json: '{}' value {} exceeds i16 range", field, n)
-  })
-}
-
-/// `card_type` and `category` must each fit in a u4 (`0..=0xF`); they
-/// occupy the high nibbles of the zone's `packed_definition` byte.
-fn json_nibble(value: Option<&Value>, field: &str) -> Result<u8, String> {
-  let v = value.ok_or_else(|| format!("bootstrap.json: missing '{}'", field))?;
-  let n = v
-    .as_u64()
-    .ok_or_else(|| format!("bootstrap.json: '{}' not a non-negative integer: {:?}", field, v))?;
-  if n > 0xF {
-    return Err(format!(
-      "bootstrap.json: '{}' value {} exceeds u4 range (0..=15)",
-      field, n
-    ));
-  }
-  Ok(n as u8)
-}
