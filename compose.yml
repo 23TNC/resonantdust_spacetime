@@ -13,7 +13,7 @@ services:
       - ./keys:/etc/spacetimedb
       - ./config:/home/spacetime/.config/spacetime
       - ./data:/home/spacetime/.local/share/spacetime/data
-      - ../data:/workspace/server/spacetimedb/data
+      - ../content:/workspace/server/spacetimedb/content
       - ./server:/workspace/server
       - ../pixijs:/workspace/pixijs
     working_dir: /workspace/server
@@ -30,7 +30,7 @@ services:
     volumes:
       - ./server:/workspace/server
       - ./data:/workspace/server/spacetimedb/data
-      - ../data:/workspace/server/spacetimedb/data
+      - ../content:/workspace/server/spacetimedb/content
       - ../pixijs:/workspace/pixijs
     working_dir: /workspace/server
     command:
@@ -41,7 +41,7 @@ services:
     volumes:
       - ./server:/workspace/server
       - ./data:/workspace/server/spacetimedb/data
-      - ../data:/workspace/server/spacetimedb/data
+      - ../content:/workspace/server/spacetimedb/content
       - ../pixijs:/workspace/pixijs
     working_dir: /workspace/server
     entrypoint: ["/bin/bash"]

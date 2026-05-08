@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
 
 SPACETIMEDB_DIR="$SCRIPT_DIR/spacetimedb"
-PIXI_OUT_DIR="$SCRIPT_DIR/../pixijs/src/server/bindings"
+PIXI_OUT_DIR="$SCRIPT_DIR/../pixijs/src/server/spacetime/bindings"
 # RUST_OUT_DIR="$SCRIPT_DIR/../actionmanager/src/spacetime/bindings"
 
 if [ ! -d "$SPACETIMEDB_DIR" ]; then
@@ -16,7 +16,7 @@ mkdir -p "$PIXI_OUT_DIR"
 # mkdir -p "$RUST_OUT_DIR"
 
 echo "Generating TypeScript bindings..."
-spacetime generate --lang typescript --out-dir "$PIXI_OUT_DIR" --module-path "$SPACETIMEDB_DIR"
+spacetime generate --yes --lang typescript --out-dir "$PIXI_OUT_DIR" --module-path "$SPACETIMEDB_DIR"
 echo "Done."
 echo "TypeScript bindings: $PIXI_OUT_DIR"
 
