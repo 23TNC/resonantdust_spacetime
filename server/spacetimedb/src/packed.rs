@@ -1,31 +1,71 @@
 // Pack/unpack helpers for the bit-packed columns on the cards table.
 //
 // Layouts:
-//   valid_at         u64 = [card_id: u32 | time_secs: u32]   (high | low)
-//   macro_zone       u32 = [q: i16 | r: i16]                 (high | low)
-//   micro_zone       u8  = [q: u3 | r: u3 | stacked_state: u2]
-//   micro_location   u32 = card_id (when stacked) | [x: i16 | y: i16] (when free)
+//   valid_at         u64 = [card_id: u32 | time_secs: u32]                  (high | low)
+//   macro_zone       u32 = [q: i16 | r: i16]                                (high | low)
+//   micro_zone       u8  — TWO INTERPRETATIONS, gated by (stacked_state, surface):
+//     stack layout — state == OnRoot AND surface < 64:
+//                   u8 = [position: u5 | direction: u1 | stacked_state: u2]
+//     legacy layout — every other case (Free / ReservedSlot / OnHex / world):
+//                   u8 = [q: u3 | r: u3 | stacked_state: u2]
+//   micro_location   u32 — interpretation depends on stacked_state:
+//     Free          → [x: i16 | y: i16] (loose XY in surface-local coords)
+//     ReservedSlot  → RESERVED for an upcoming slot-pinning mode where
+//                     micro_location will hold the immediate parent's
+//                     card_id (not the root). Unused today.
+//     OnRoot        → ROOT card_id of the rect chain (chain order /
+//                     direction from `micro_zone.position` and
+//                     `micro_zone.direction`)
+//     OnHex         → parent hex card_id (walk up via `micro_location`
+//                     to find root hex; hex chains aren't migrated)
 //   packed_def       u16 = [card_type: u4 | card_category: u4 | def_id: u8]
 //   zone_def         u8  = [card_type: u4 | card_category: u4]
 //   tile row         u64 = 8 little-endian u8 def_ids (byte i = column i)
 //   recipe           u16 = [recipe_type: u3 | recipe_category: u3 | recipe_id: u10]
+//
+// Rect chains (state = OnRoot) use the (root_id, position, direction)
+// model; hex chains (OnHex) keep parent-pointer walking. Rect-on-hex (a
+// rect card with state=OnHex) is a leaf — no rect chain hangs off it.
+// The "server is forcing this position" signal moved out of micro_zone
+// (it used to live in bit 2 alongside position/state) and now lives in
+// `flags` (`force_position` at bit 11) — see `cards/flags.json`.
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StackedState {
+    /// Loose. `micro_location` is encoded `(x, y)`; `micro_zone` upper
+    /// 6 bits are the legacy `(q, r)`.
     Free = 0,
-    OnCard = 1,
-    Reserved2 = 2,
-    Reserved3 = 3,
+    /// Parent-pointer slot. `micro_location` holds the **immediate
+    /// parent's** card_id (which can itself be `Slot`, `OnRoot`,
+    /// `Free`, or `OnHex`), not the chain root. The slot's direction
+    /// (bit 2 of `micro_zone`) is stored explicitly even though it
+    /// could be derived from the parent — saves a chain walk on every
+    /// render / parent-resolve. Position from root is implicit: walk
+    /// `micro_location` up until you hit a state that's not `Slot`
+    /// (for rect chains, that'll be `OnRoot` or `Free`). Used by
+    /// `propose_action` to stitch recipe slots above the actor —
+    /// chain integrity follows the actor when the recipe doesn't pin
+    /// to a root.
+    Slot = 1,
+    /// Stacked on a rect chain root — `micro_location` is the **root**
+    /// card_id (not the immediate parent). Chain order comes from
+    /// `micro_zone.position`; chain direction (top vs bottom of root)
+    /// comes from `micro_zone.direction`.
+    OnRoot = 2,
+    /// Stacked on a hex. Walks the chain via `micro_location = parent_hex_id`
+    /// until the root hex (state=Free). Legacy layout still applies; hex
+    /// chains aren't migrated to (root_id, position).
+    OnHex = 3,
 }
 
 impl StackedState {
     pub fn from_u2(v: u8) -> Self {
         match v & 0b11 {
             0 => Self::Free,
-            1 => Self::OnCard,
-            2 => Self::Reserved2,
-            _ => Self::Reserved3,
+            1 => Self::Slot,
+            2 => Self::OnRoot,
+            _ => Self::OnHex,
         }
     }
 
@@ -78,6 +118,82 @@ pub fn unpack_micro_zone(v: u8) -> (u8, u8, StackedState) {
 
 pub fn micro_zone_state(v: u8) -> StackedState {
     StackedState::from_u2(v)
+}
+
+/// Whether the **stack layout** applies to this `(state, surface)` pair.
+/// True when the card is rect-stacked on inventory (state == OnRoot AND
+/// surface < 64). False for Free, Slot, OnHex, and world surfaces —
+/// those keep the legacy `(q, r)` layout.
+///
+/// Note: `Slot` rows happen to share the same byte format
+/// (`[position:5 | direction:1 | state:2]` with `position = 0`), but
+/// the mirror's preserve gate doesn't fire for them — `Slot` cards are
+/// always server-authoritative (set by `propose_action`, cleared by
+/// `action_completion`). Use [`pack_slot_micro_zone`] for `Slot`
+/// writes; share `unpack_stack_micro_zone` for reads since the bit
+/// layout is identical.
+pub fn is_stack_layout(state: StackedState, surface: u8) -> bool {
+    surface < 64 && matches!(state, StackedState::OnRoot)
+}
+
+/// Direction bit values within the stack layout. `0 = up / top`,
+/// `1 = down / bottom`. Used to disambiguate which side of the chain
+/// a card sits on under the single `OnRoot` state.
+pub const STACK_DIR_UP: u8 = 0;
+pub const STACK_DIR_DOWN: u8 = 1;
+
+/// Pack `(position, direction, state)` under the stack layout:
+/// `[position: u5 | direction: u1 | stacked_state: u2]`.
+///
+/// `position` is the card's index in its chain from the root (1..=31;
+/// 0 reserved for "no chain"). Saturates at `0b11111` if higher.
+/// `direction` is `0 = up / top` or `1 = down / bottom`. The
+/// "server is forcing this position" signal moved out of micro_zone
+/// (it used to share bit 2 with the now-`direction` field) and lives
+/// in `flags` (`force_position` at bit 11) — see `cards/flags.json`.
+///
+/// **Only valid for `state == OnRoot` AND `surface < 64`.**
+/// Free / ReservedSlot / OnHex / world cards use [`pack_micro_zone`].
+pub fn pack_stack_micro_zone(position: u8, direction: u8, state: StackedState) -> u8 {
+    debug_assert!(
+        matches!(state, StackedState::OnRoot),
+        "pack_stack_micro_zone only valid for OnRoot; got {state:?}",
+    );
+    let pos = position & 0b11111;
+    let dir = direction & 0b1;
+    (pos << 3) | (dir << 2) | state.to_u2()
+}
+
+/// Inverse of [`pack_stack_micro_zone`]. Returns `(position, direction, state)`.
+/// The caller is responsible for knowing the byte was packed under the stack
+/// layout; reading a legacy-layout byte through here gives nonsense for the
+/// `position` and `direction` fields.
+pub fn unpack_stack_micro_zone(v: u8) -> (u8, u8, StackedState) {
+    let position = (v >> 3) & 0b11111;
+    let direction = (v >> 2) & 0b1;
+    (position, direction, StackedState::from_u2(v))
+}
+
+/// Read just the `position` field under the stack layout.
+pub fn micro_zone_position(v: u8) -> u8 {
+    (v >> 3) & 0b11111
+}
+
+/// Read just the `direction` bit under the stack layout.
+/// `0 = up / top`, `1 = down / bottom`.
+pub fn micro_zone_direction(v: u8) -> u8 {
+    (v >> 2) & 0b1
+}
+
+/// Pack a `micro_zone` byte for a `Slot` (parent-pointer mode).
+/// Layout matches the stack layout
+/// (`[position:5 | direction:1 | state:2]`) but with `position = 0`
+/// since position from root is implicit (walk parent pointers via
+/// `micro_location`). Direction is stored explicitly so render /
+/// parent-resolve don't have to climb the chain to derive it.
+pub fn pack_slot_micro_zone(direction: u8) -> u8 {
+    let dir = direction & 0b1;
+    (dir << 2) | StackedState::Slot.to_u2()
 }
 
 // ---- micro_location ----------------------------------------------------
@@ -185,8 +301,47 @@ mod tests {
 
     #[test]
     fn micro_zone_roundtrip() {
-        let v = pack_micro_zone(5, 3, StackedState::OnCard);
-        assert_eq!(unpack_micro_zone(v), (5, 3, StackedState::OnCard));
+        let v = pack_micro_zone(5, 3, StackedState::OnHex);
+        assert_eq!(unpack_micro_zone(v), (5, 3, StackedState::OnHex));
+    }
+
+    #[test]
+    fn stack_micro_zone_roundtrip() {
+        let v = pack_stack_micro_zone(7, STACK_DIR_UP, StackedState::OnRoot);
+        assert_eq!(unpack_stack_micro_zone(v), (7, STACK_DIR_UP, StackedState::OnRoot));
+        let v = pack_stack_micro_zone(31, STACK_DIR_DOWN, StackedState::OnRoot);
+        assert_eq!(unpack_stack_micro_zone(v), (31, STACK_DIR_DOWN, StackedState::OnRoot));
+        // position saturates at 5 bits
+        let v = pack_stack_micro_zone(0xFF, STACK_DIR_UP, StackedState::OnRoot);
+        assert_eq!(micro_zone_position(v), 31);
+        assert_eq!(micro_zone_direction(v), STACK_DIR_UP);
+        assert_eq!(micro_zone_state(v), StackedState::OnRoot);
+    }
+
+    #[test]
+    fn stack_layout_gate() {
+        assert!(is_stack_layout(StackedState::OnRoot, 1));
+        assert!(!is_stack_layout(StackedState::Free, 1));
+        // `Slot` rows are server-authoritative — even though their byte
+        // layout matches the stack layout, the mirror's preserve gate
+        // doesn't fire for them, so `is_stack_layout` returns false.
+        assert!(!is_stack_layout(StackedState::Slot, 1));
+        assert!(!is_stack_layout(StackedState::OnHex, 1));
+        // World surfaces (>= 64) keep legacy layout regardless of state.
+        assert!(!is_stack_layout(StackedState::OnRoot, 64));
+        assert!(!is_stack_layout(StackedState::OnRoot, 200));
+    }
+
+    #[test]
+    fn slot_micro_zone_roundtrip() {
+        let v = pack_slot_micro_zone(STACK_DIR_UP);
+        assert_eq!(micro_zone_state(v), StackedState::Slot);
+        assert_eq!(micro_zone_direction(v), STACK_DIR_UP);
+        assert_eq!(micro_zone_position(v), 0);
+        let v = pack_slot_micro_zone(STACK_DIR_DOWN);
+        assert_eq!(micro_zone_state(v), StackedState::Slot);
+        assert_eq!(micro_zone_direction(v), STACK_DIR_DOWN);
+        assert_eq!(micro_zone_position(v), 0);
     }
 
     #[test]

@@ -13,9 +13,14 @@ pub struct Card {
     pub macro_zone: u32,
     pub micro_zone: u8,
     pub micro_location: u32,
+    #[index(btree)]
     pub owner_id: u32,
     pub packed_definition: u16,
-    pub flags: u8,
+    /// Bit-flag column. Currently u32 — wider than the populated bit
+    /// range (bits 0..=7 today, defined in `content/cards/flags.json`).
+    /// Will shrink to the smallest type that fits the final flag count
+    /// once the registry stabilises.
+    pub flags: u32,
 }
 
 fn now_secs(ctx: &ReducerContext) -> u32 {
@@ -65,7 +70,7 @@ pub fn create(
     micro_location: u32,
     owner_id: u32,
     packed_definition: u16,
-    flags: u8,
+    flags: u32,
 ) -> Card {
     write(
         ctx,
@@ -124,7 +129,7 @@ pub fn create_at(
     micro_location: u32,
     owner_id: u32,
     packed_definition: u16,
-    flags: u8,
+    flags: u32,
 ) -> Card {
     write_at(
         ctx,
@@ -191,6 +196,6 @@ pub fn set_packed_definition(
     update_with(ctx, card_id, |c| c.packed_definition = packed_definition)
 }
 
-pub fn set_flags(ctx: &ReducerContext, card_id: u32, flags: u8) -> Option<Card> {
+pub fn set_flags(ctx: &ReducerContext, card_id: u32, flags: u32) -> Option<Card> {
     update_with(ctx, card_id, |c| c.flags = flags)
 }

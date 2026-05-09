@@ -1,21 +1,45 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use resonantdust_content::definition_core::{decode_definition, CardDefinition};
 use resonantdust_content::recipe_core::{
-    match_stack_recipe, recipe, Duration, Entity, RecipeType, StackDirection,
+    /* match_stack_recipe, */ recipe, Duration, Entity, RecipeType, StackDirection,
 };
 use spacetimedb::{reducer, ReducerContext};
 
 use crate::action_completion;
 use crate::cards;
-use crate::packed::{pack_micro_zone, unpack_micro_zone, StackedState};
+use crate::packed::{
+    pack_slot_micro_zone, pack_stack_micro_zone, unpack_micro_zone, StackedState,
+};
 use crate::players;
-use crate::stacks::CardStack;
+// use crate::stacks::CardStack;  // commented along with submit_action below
 
 // `cards/flags.json` bit positions. Append-only — pinned by the data crate.
-const FLAG_POSITION_HOLD: u8 = 1 << 0;
-const FLAG_SLOT_HOLD: u8 = 1 << 5;
+// Typed as u32 to match `Card.flags`.
+const FLAG_POSITION_HOLD: u32 = 1 << 0;
+const FLAG_SLOT_HOLD: u32 = 1 << 5;
+/// Mask for the `progress_style` 3-bit field at bits 8..=10. With-holds
+/// rows clear this so any value inherited from a prior completion row
+/// doesn't make this non-event row render a progress bar on the client.
+const PROGRESS_STYLE_MASK: u32 = 0b111 << 8;
+/// `force_position` (bit 11). Server is asserting this row's
+/// `micro_zone` / `micro_location` verbatim — the client mirror should
+/// overwrite local state and renumber conflicting entries. Replaces the
+/// older `micro_zone.local_q = 1` disagree-with-anything trick (which
+/// shared a field with real q-coordinate data). Set on with-holds rows
+/// where the server has stitched a chain layout; explicitly cleared
+/// otherwise so an inherited bit doesn't keep firing on later rows.
+const FLAG_FORCE_POSITION: u32 = 1 << 11;
 
+// ----- submit_action and its helpers — commented out 2026-05-09 -----
+//
+// Not currently needed. The active reducer is `propose_action` below
+// (client-proposed recipe verification + flag/chain-stitch). Restore by
+// removing the surrounding `/* */`, re-enabling the imports tagged
+// `commented along with submit_action below`, and (per the earlier
+// note) updating the per-card writeback to use `pack_stack_micro_zone`
+// for stacked positions instead of `pack_micro_zone`.
+/*
 /// Submit one or more card stacks to the action system.
 ///
 /// For each stack, the server:
@@ -31,11 +55,13 @@ const FLAG_SLOT_HOLD: u8 = 1 << 5;
 ///    root to the hex card) and overwrites `root.micro_location = hex`.
 /// 6. Rewrites every card's `micro_location` (and `micro_zone` state
 ///    bits) to reflect the chain — bottom card is `Free` at the stack's
-///    `micro_location`, every card above sits `OnCard` the one below.
+///    `micro_location`, every card above sits `OnCardTop` the one below.
 /// 7. If the resolved `surface < 64` and the new `stacked_state != 0`,
-///    forces `micro_zone.local_q = 1`. This deliberately disagrees with
-///    most plausible client-side q values so the next sync round-trip
-///    snaps the client back into line with the server.
+///    sets `FLAG_FORCE_POSITION` on the row so the client's mirror
+///    accepts the server's `micro_zone` / `micro_location` verbatim
+///    (overwriting any local state and renumbering conflicting
+///    entries). Replaces the older "set `micro_zone.local_q = 1`"
+///    disagree-with-anything trick.
 ///
 /// `position_hold` and `slot_hold` are **not** touched on cards outside
 /// matched recipes. Cards already carrying those flags from a previous
@@ -177,21 +203,21 @@ fn process_stack(
         let (mut state, mut micro_location) = if i == 0 {
             (StackedState::Free, stack.micro_location)
         } else {
-            (StackedState::OnCard, chain[i - 1])
+            (StackedState::OnRoot, chain[i - 1])
         };
 
         // Root pinned to hex overrides whatever chain position
         // suggested — the card is physically on the hex, not on
         // chain[i-1] (or free at a spatial position). State flips to
-        // STACKED_ON_HEX (server's `Reserved3` = client's
-        // `STACKED_ON_HEX` = 3 in `pixijs/src/game/cards/cardData.ts`),
-        // and `micro_location` becomes the hex card's id. Doing this
-        // *before* the q=1 force rule means hex-pinned roots also
-        // pick up the resync trick. Fixes the prior inconsistency where
-        // a root with no `stack_down` ended up with `state=Free` but a
+        // OnHex (= 3, same value as the client's `STACKED_ON_HEX`
+        // in `pixijs/src/game/cards/cardData.ts`), and `micro_location`
+        // becomes the hex card's id. Doing this *before* the q=1 force
+        // rule means hex-pinned roots also pick up the resync trick.
+        // Fixes the prior inconsistency where a root with no
+        // `stack_down` ended up with `state=Free` but a
         // card-id-typed `micro_location`.
         if card_id == stack.root && root_pinned_to_hex {
-            state = StackedState::Reserved3;
+            state = StackedState::OnHex;
             micro_location = arg_hex;
         }
 
@@ -219,6 +245,10 @@ fn process_stack(
             if set_slot {
                 c.flags |= FLAG_SLOT_HOLD;
             }
+            // With-holds rows aren't progress events — clear any
+            // inherited progress_style so the client doesn't render
+            // this row as one.
+            c.flags &= !PROGRESS_STYLE_MASK;
         });
     }
 
@@ -235,14 +265,20 @@ fn pack_chain_defs(ctx: &ReducerContext, ids: &[u32]) -> Vec<u16> {
         .map(|&id| cards::latest(ctx, id).map(|c| c.packed_definition).unwrap_or(0))
         .collect()
 }
+*/
+// ----- end of commented-out submit_action region -----
 
-/// Verify a client-proposed recipe and assign its hold flags.
+/// Verify a client-proposed recipe, stitch its slot cards into a chain,
+/// and assign its hold flags.
 ///
 /// Unlike [`submit_action`] (which searches for the best-matching recipe),
 /// this reducer takes a specific `recipe_id` and verifies that the
-/// supplied cards satisfy its entities. No position rewriting happens —
-/// the client is asserting "these cards are already in this recipe shape
-/// at this location"; the server's job is to check + flag, not to move.
+/// supplied cards satisfy its entities. The server then writes the chain
+/// under the (root_id, position) layout (see `packed.rs` header) so
+/// every slot card's `micro_location` points at the chain root and its
+/// row carries `FLAG_FORCE_POSITION` — the client mirror's
+/// preserve rule respects the force bit and snaps the client view to
+/// the server's chain.
 ///
 /// **Sentinel-zero semantics:** both `hex` and `root` use `0` to mean
 /// "not provided". A `0` inside `slots` is always a client bug and is
@@ -272,6 +308,21 @@ fn pack_chain_defs(ctx: &ReducerContext, ids: &[u32]) -> Vec<u16> {
 ///    `slots.len()` must equal `recipe.slots.len()` exactly — extras
 ///    or shortfalls reject.
 ///
+/// **Chain layout written to slot cards:**
+///
+/// - The "chain root" is `root` when `root != 0`, otherwise `slots[0]`
+///   (the actor) — a free-floating action makes the actor the loose
+///   root of its own one-direction chain.
+/// - Every slot that isn't the chain root gets:
+///   - `micro_location = chain_root_id`
+///   - `micro_zone = pack_stack_micro_zone(position, force_flag = false,
+///     stacked_state)`, where position is the card's 1-indexed place in
+///     the chain (actor = 1 when `root != 0`, slots[1] = 1 when
+///     `root == 0`) and stacked_state is OnCardTop for `Stack(Up)` /
+///     OnCardBottom for `Stack(Down)`.
+/// - The chain root itself is not repositioned (its existing row is
+///   left as the location-of-truth for the chain).
+///
 /// **Flag assignment** (mirrors `submit_action`):
 ///
 /// - `slot_hold` set on every slot card.
@@ -283,9 +334,8 @@ fn pack_chain_defs(ctx: &ReducerContext, ids: &[u32]) -> Vec<u16> {
 /// - `position_hold` set on `root` iff `root != 0 && hex != 0`.
 ///
 /// Flags are OR'd in, never cleared. Release happens at recipe
-/// completion (not yet implemented). All writes go through
-/// `cards::update_with` so each stamps a fresh `valid_at` and enqueues
-/// the delete sweep.
+/// completion. All writes go through `cards::update_with` so each
+/// stamps a fresh `valid_at` and enqueues the delete sweep.
 #[reducer]
 pub fn propose_action(
     ctx: &ReducerContext,
@@ -294,10 +344,25 @@ pub fn propose_action(
     slots: Vec<u32>,
     surface: u8,
     macro_zone: u32,
-    micro_zone: u8,
-    micro_location: u32,
+    micro_zone: u8,        // legacy / unused under the new layout; kept on
+                           // the wire so existing client calls still type-
+                           // check while the client migrates to the new
+                           // signature.
+    micro_location: u32,   // ditto.
     recipe_id: u16,
+    root_dist: u8,         // actor's distance from root in the new layout.
+                           // Used only when `root != 0`; the actor's
+                           // `OnRoot` row gets `position = root_dist`.
+                           // For a fresh chain with no held cards,
+                           // typically `1`; for sub-roots past held
+                           // blocks this is the full distance from the
+                           // chain root.
 ) -> Result<(), String> {
+    // Acknowledge legacy args that the new layout doesn't consume — the
+    // client still passes values but we don't need them. Keeping the
+    // parameter names on the signature so generated bindings stay
+    // stable while the client migrates.
+    let _ = (micro_zone, micro_location);
     // De-dup across hex / root / slots. Zero is the sentinel for "absent"
     // on hex and root (skipped from the dedup set); zero inside slots is
     // a client bug.
@@ -326,10 +391,18 @@ pub fn propose_action(
         0
     };
 
-    // Resolve root def + enforce location and slot_hold guard only if a
-    // root was provided. Without a root we have no anchor card to
-    // validate the location args against; the args are accepted as
-    // declarative context but unenforced.
+    // Resolve root def + slot_hold guard only when a root was provided.
+    // Without a root we have no anchor card to validate against.
+    //
+    // The full location-quartet check (surface, macro_zone, micro_zone,
+    // micro_location) that lived here previously is gone: under the
+    // new layout the client will rewrite root's `micro_zone` and
+    // `micro_location` (e.g. when re-anchoring root to a hex via this
+    // very reducer), so checking those fields against the client's
+    // pre-write claim catches false-positive drift. We still validate
+    // (surface, macro_zone) since those drive which subscriptions see
+    // the row — a mismatch there would mean the client and server
+    // disagree about which zone the recipe is happening in.
     let root_def = if root != 0 {
         let root_card = cards::latest(ctx, root)
             .ok_or_else(|| format!("root card {root} not found"))?;
@@ -338,18 +411,12 @@ pub fn propose_action(
                 "root card {root} is already claimed by another in-flight action"
             ));
         }
-        if root_card.surface != surface
-            || root_card.macro_zone != macro_zone
-            || root_card.micro_zone != micro_zone
-            || root_card.micro_location != micro_location
-        {
+        if root_card.surface != surface || root_card.macro_zone != macro_zone {
             return Err(format!(
-                "root card {root} not at proposed location \
-                 (server: surface={}, macro_zone={}, micro_zone={}, micro_location={})",
+                "root card {root} not in proposed zone \
+                 (server: surface={}, macro_zone={}; proposed: surface={surface}, macro_zone={macro_zone})",
                 root_card.surface,
                 root_card.macro_zone,
-                root_card.micro_zone,
-                root_card.micro_location,
             ));
         }
         root_card.packed_definition
@@ -412,6 +479,26 @@ pub fn propose_action(
             slots.len()
         ));
     }
+
+    // Chain-depth bound: when this action pins the actor to root (i.e.
+    // `root != 0`), `slot[0]` gets a state-2 (`OnRoot`) row whose
+    // `position` field is `root_dist`. `pack_stack_micro_zone` masks
+    // `position & 0x1f`, so any depth past 31 silently truncates and
+    // corrupts chain layout. Mirrors the client's `DragManager` and
+    // `ActionManager.tryMatch` rejection at the same threshold —
+    // having both gates means a misbehaving client can't sneak a
+    // chain-corrupting action past the server. Rootless actions
+    // (`root == 0`) don't write state-2 here, so they don't hit this.
+    if root != 0 {
+        let pin_depth = root_dist as usize + slots.len();
+        if pin_depth > 31 {
+            return Err(format!(
+                "recipe {recipe_id} would pin past chain index 31: \
+                 root_dist={root_dist} + slots.len={} = {pin_depth}",
+                slots.len()
+            ));
+        }
+    }
     for (i, slot_entity) in recipe_def.slots.iter().enumerate() {
         let def = decode_definition(slot_defs[i])
             .map_err(|err| format!("decode slot {i} def: {err}"))?
@@ -424,95 +511,106 @@ pub fn propose_action(
         }
     }
 
-    // Assign flags.
-    let mut slot_holds: BTreeSet<u32> = BTreeSet::new();
-    let mut position_holds: BTreeSet<u32> = BTreeSet::new();
-
-    for (i, &id) in slots.iter().enumerate() {
-        slot_holds.insert(id);
-        if i > 0 {
-            position_holds.insert(id);
-        }
-    }
-    // Actor pin: only meaningful when this action is anchored to a root
-    // or a hex. A free-floating action (no root, no hex) leaves the
-    // actor moveable — it's just slots in space.
-    if root != 0 || hex != 0 {
-        if let Some(&actor) = slots.first() {
-            position_holds.insert(actor);
-        }
-    }
-    // Root pinned to hex requires both to be present.
-    if root != 0 && hex != 0 {
-        position_holds.insert(root);
-    }
-
-    // Build a slot → "card below" map for chain stitching. Every slot
-    // above the actor sits on the slot below it (`slots[i-1]`). The
-    // actor (`slots[0]`) sits on root if there is one; with no root the
-    // actor is the bottom and we leave its position untouched.
-    let mut slot_below: BTreeMap<u32, u32> = BTreeMap::new();
-    for (i, &id) in slots.iter().enumerate() {
-        let below = if i == 0 {
-            if root == 0 {
-                continue;
-            }
-            root
-        } else {
-            slots[i - 1]
-        };
-        slot_below.insert(id, below);
-    }
-    // Slot cards get their micro_zone re-packed with `local_q = 1` and a
-    // direction-appropriate `stacked_state`. The `q = 1` is the
-    // deliberate disagree-with-anything trick — even if the client
-    // thinks the card is somewhere else, the next sync round-trip snaps
-    // it back into chain.
-    //
-    // Stack direction → state mapping matches the client convention in
-    // `pixijs/src/game/cards/cardData.ts`:
-    //
-    // - `Stack(Up)`   → `OnCard`    = state 1 (`STACKED_ON_RECT_X`,
-    //   client interprets as "I sit on top of micro_location").
-    // - `Stack(Down)` → `Reserved2` = state 2 (`STACKED_ON_RECT_Y`,
-    //   client interprets as "I sit on the bottom of micro_location").
-    //
-    // The server-side enum calling state 2 "Reserved2" is a misnomer —
-    // the client gives it real meaning; rename it on the content side
-    // when convenient. The recipe_type guard above already established
-    // that this branch is `Stack(_)`, so the unreachable arm only fires
-    // if that guard is later relaxed without updating this.
-    let stacked_state = match recipe_def.recipe_type {
-        RecipeType::Stack(StackDirection::Up) => StackedState::OnCard,
-        RecipeType::Stack(StackDirection::Down) => StackedState::Reserved2,
+    // Resolve direction once from the recipe — Stack(Up) → STACK_DIR_UP,
+    // Stack(Down) → STACK_DIR_DOWN. Used by both the slot chain
+    // (state-1) and the actor-on-root pin (state-2) so they share a
+    // direction. The recipe_type guard above already established this
+    // is `Stack(_)`, so the unreachable arm only fires if that guard
+    // is later relaxed without updating this.
+    let direction = match recipe_def.recipe_type {
+        RecipeType::Stack(StackDirection::Up) => crate::packed::STACK_DIR_UP,
+        RecipeType::Stack(StackDirection::Down) => crate::packed::STACK_DIR_DOWN,
         _ => unreachable!("recipe_type guard above ensures Stack(_)"),
     };
-    let stacked_micro_zone = pack_micro_zone(1, 0, stacked_state);
 
-    // Apply. Iterate the union of cards that are about to receive any
-    // flag or chain-position update. Slot cards listed in `slot_below`
-    // also get `micro_zone` + `micro_location` set; others (root, when
-    // it has holds) only get flags. Skips cards we don't care about,
-    // and naturally handles "no root provided" (root is never in any
-    // of these sets then).
-    let mut targets: BTreeSet<u32> = slot_holds.union(&position_holds).copied().collect();
-    for &id in slot_below.keys() {
-        targets.insert(id);
+    // Apply per-card writes per the lock-phase contract:
+    //
+    //   if Slots.length:
+    //     slot_hold(Slot[0])
+    //     for i in 1..N:
+    //       Slot[i] → state=Slot, microLocation=Slot[i-1],
+    //                 direction, macro_zone, surface,
+    //                 slot_hold + position_hold + force_position.
+    //     if root:
+    //       Slot[0] → state=OnRoot, microLocation=root, position=root_dist,
+    //                 direction, macro_zone, surface,
+    //                 position_hold + force_position.
+    //
+    //   if root:
+    //     slot_hold(root)
+    //     if hex:
+    //       root → state=OnHex, microZone=hex's (q,r),
+    //              microLocation=hex card_id, macro_zone, surface,
+    //              position_hold + force_position.
+    //
+    // `slot_hold` / `position_hold` flags are OR'd in. `force_position`
+    // is set on every row that gets spatial fields rewritten so the
+    // client's mirror takes the server's bytes verbatim. With-holds
+    // rows clear `progress_style` so they don't render as completion
+    // events on the client.
+    let with_holds_flags_clear = !(PROGRESS_STYLE_MASK | FLAG_FORCE_POSITION);
+
+    if !slots.is_empty() {
+        // slots[0] (actor): always gets slot_hold. Spatial fields only
+        // when root is provided (state-2 pin onto root).
+        cards::update_with(ctx, slots[0], |c| {
+            c.flags &= with_holds_flags_clear;
+            c.flags |= FLAG_SLOT_HOLD;
+            if root != 0 {
+                c.micro_location = root;
+                c.micro_zone = pack_stack_micro_zone(
+                    root_dist,
+                    direction,
+                    StackedState::OnRoot,
+                );
+                c.macro_zone = macro_zone;
+                c.surface = surface;
+                c.flags |= FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
+            }
+        });
+
+        // slots[1..]: state-1 (Slot) parent-pointer chain anchored on
+        // slots[0]. Each slot's microLocation is its immediate
+        // predecessor. Direction is stored explicitly.
+        for i in 1..slots.len() {
+            let parent_id = slots[i - 1];
+            cards::update_with(ctx, slots[i], |c| {
+                c.flags &= with_holds_flags_clear;
+                c.flags |= FLAG_SLOT_HOLD | FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
+                c.micro_location = parent_id;
+                c.micro_zone = pack_slot_micro_zone(direction);
+                c.macro_zone = macro_zone;
+                c.surface = surface;
+            });
+        }
     }
-    for id in targets {
-        let set_pos = position_holds.contains(&id);
-        let set_slot = slot_holds.contains(&id);
-        let below = slot_below.get(&id).copied();
-        cards::update_with(ctx, id, |c| {
-            if set_pos {
-                c.flags |= FLAG_POSITION_HOLD;
-            }
-            if set_slot {
-                c.flags |= FLAG_SLOT_HOLD;
-            }
-            if let Some(below_id) = below {
-                c.micro_zone = stacked_micro_zone;
-                c.micro_location = below_id;
+
+    // Root: if present, always gets slot_hold. Spatial fields only when
+    // hex is provided (state-3 re-anchor onto hex tile). When root is
+    // present without hex, root keeps its existing position — the
+    // chain hangs off it where the player put it.
+    if root != 0 {
+        // For the hex-anchor case, read the hex card's row to grab
+        // its (localQ, localR) — those are the in-zone coords we
+        // stamp on root's micro_zone so the client knows which hex
+        // tile root sits on.
+        let hex_qr: Option<(u8, u8)> = if hex != 0 {
+            cards::latest(ctx, hex).map(|hex_card| {
+                let (q, r, _) = unpack_micro_zone(hex_card.micro_zone);
+                (q, r)
+            })
+        } else {
+            None
+        };
+        cards::update_with(ctx, root, |c| {
+            c.flags &= with_holds_flags_clear;
+            c.flags |= FLAG_SLOT_HOLD;
+            if let Some((q, r)) = hex_qr {
+                c.micro_zone = crate::packed::pack_micro_zone(q, r, StackedState::OnHex);
+                c.micro_location = hex;
+                c.macro_zone = macro_zone;
+                c.surface = surface;
+                c.flags |= FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
             }
         });
     }
@@ -577,6 +675,8 @@ fn entity_satisfied(entity: &Entity, def: &CardDefinition) -> bool {
     }
 }
 
+// ----- apply_match_holds — commented out alongside submit_action -----
+/*
 // For a matched recipe id, mark the cards filling its slots:
 // - all slot fillers get slot_hold;
 // - everyone except slot[0] (the actor) gets position_hold from this rule.
@@ -602,3 +702,4 @@ fn apply_match_holds(
     }
     Ok(())
 }
+*/

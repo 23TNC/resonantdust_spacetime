@@ -14,7 +14,7 @@ use crate::packed::{pack_micro_zone, unpack_micro_zone, StackedState};
 /// - `surface` / `macro_zone` — shared by every card in the stack.
 /// - `micro_zone` — only the q/r component is meaningful here. The
 ///   `stacked_state` bits are ignored; `apply` re-packs them per card
-///   (Free for the bottom card, OnCard for everyone above it).
+///   (Free for the bottom card, OnCardTop for everyone above it).
 /// - `micro_location` — spatial position of the **bottom** card (interpreted
 ///   as packed `(x, y)` pixel coords when stack_down is empty and the root
 ///   itself is the bottom; otherwise it's the position of `stack_down.last()`).
@@ -40,7 +40,7 @@ pub struct CardStack {
 ///
 /// - Every card gets the stack's `surface` and `macro_zone`.
 /// - Every card gets `micro_zone` re-packed with the stack's q/r and a
-///   per-card stacked_state — `Free` for the bottom card, `OnCard` for each
+///   per-card stacked_state — `Free` for the bottom card, `OnCardTop` for each
 ///   card above it.
 /// - The bottom card gets `micro_location = stack.micro_location` (the
 ///   spatial position). Every other card gets `micro_location = (card_id of
@@ -53,7 +53,7 @@ pub fn apply(ctx: &ReducerContext, stack: &CardStack) -> Result<(), String> {
     // Reuse the stack's q/r; ignore whatever state bits the client sent.
     let (q, r, _) = unpack_micro_zone(stack.micro_zone);
     let micro_zone_free = pack_micro_zone(q, r, StackedState::Free);
-    let micro_zone_on = pack_micro_zone(q, r, StackedState::OnCard);
+    let micro_zone_on = pack_micro_zone(q, r, StackedState::OnRoot);
 
     // Bottom-to-top: stack_down reversed, then root, then stack_up.
     let mut chain: Vec<u32> =
@@ -83,8 +83,8 @@ pub fn apply(ctx: &ReducerContext, stack: &CardStack) -> Result<(), String> {
     })
     .ok_or_else(|| format!("card {bottom} (stack bottom) not found"))?;
 
-    // Every other card sits OnCard the one below it. micro_location holds the
-    // below card's id directly — `pack_micro_location_card_id` is identity,
+    // Every other card sits OnCardTop the one below it. micro_location holds
+    // the below card's id directly — `pack_micro_location_card_id` is identity,
     // so we just write the id.
     for window in chain.windows(2) {
         let below = window[0];

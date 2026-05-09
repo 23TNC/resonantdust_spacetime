@@ -7,10 +7,48 @@ use spacetimedb::ReducerContext;
 use crate::cards;
 use crate::packed::pack_valid_at;
 
-// Bit positions from `cards/flags.json` (see content crate).
-const FLAG_POSITION_HOLD: u8 = 1 << 0;
-const FLAG_SLOT_HOLD: u8 = 1 << 5;
-const FLAG_DEAD: u8 = 1 << 7;
+// Bit positions / fields from `cards/flags.json` (see content crate).
+// Typed as u32 to match `Card.flags`.
+const FLAG_POSITION_HOLD: u32 = 1 << 0;
+const FLAG_SLOT_HOLD: u32 = 1 << 5;
+const FLAG_DEAD: u32 = 1 << 7;
+/// `force_position` (bit 11). Set on every row `propose_action`
+/// repositions; cleared here at completion. Once the recipe finishes,
+/// the server has no view of where surviving cards belong (the chain
+/// is broken, the client decides absolute positions), so leaving the
+/// flag set would make the client mirror re-bump siblings on every
+/// subsequent push of the released / consumed row.
+const FLAG_FORCE_POSITION: u32 = 1 << 11;
+
+/// `progress_style` (bits 8..=10). 3-bit field encoding the progress
+/// bar style for this row's "next future event" client render. The
+/// client reads `(flags >> 8) & 0b111` and renders accordingly.
+///
+/// Values:
+///
+/// - `0` = no progress (no bar shown)
+/// - `1` = ltr / cw default
+/// - `2` = rtl / ccw default
+/// - `3..=7` reserved for future styles
+///
+/// Set on the actor's completion row by `action_completion::apply`;
+/// explicitly cleared on with-holds rows in `propose_action` /
+/// `submit_action` so non-event rows don't render bars from inherited
+/// state.
+const PROGRESS_STYLE_SHIFT: u32 = 8;
+const PROGRESS_STYLE_MASK: u32 = 0b111 << PROGRESS_STYLE_SHIFT;
+pub const PROGRESS_STYLE_NONE: u32 = 0;
+pub const PROGRESS_STYLE_LTR: u32 = 1;
+#[allow(dead_code)]
+pub const PROGRESS_STYLE_RTL: u32 = 2;
+
+/// Encode a `progress_style` value into the bit positions occupied by
+/// the field. Caller is responsible for clearing `PROGRESS_STYLE_MASK`
+/// from the destination first if the prior row may have a different
+/// value set.
+fn pack_progress_style(value: u32) -> u32 {
+    (value & 0b111) << PROGRESS_STYLE_SHIFT
+}
 
 /// Grace period (seconds) between a card's death (its `dead`-bit flip)
 /// and the follow-up `schedule_delete_cards` sweep that wipes the card's
@@ -88,6 +126,19 @@ pub fn apply(
         }
     };
 
+    // ---- Identify the actor ------------------------------------------
+    //
+    // The actor is the card whose row carries `FLAG_DISPLAY_PROGRESS` at
+    // completion — the one a client renders the progress bar against.
+    // Convention: root if provided, else `slots[0]`. Hex isn't yet a
+    // valid actor designation. `0` means no actor (zero-slot, no-root
+    // recipe — degenerate case where no card shows a progress bar).
+    let actor_id: u32 = if root != 0 {
+        root
+    } else {
+        slots.first().copied().unwrap_or(0)
+    };
+
     // ---- Identify consumed cards (reagents) --------------------------
     let mut consumed: BTreeSet<u32> = BTreeSet::new();
     for reagent in &recipe_def.reagents {
@@ -115,16 +166,42 @@ pub fn apply(
         }
     }
 
+    // The progress style for this completion. Hard-coded to LTR until
+    // the recipe-side change exposes a `progress_style: u8` field on
+    // `RecipeDef`; once that lands, swap this for `recipe_def.progress_style`
+    // (or whatever the parsed name ends up).
+    let actor_style: u32 = PROGRESS_STYLE_LTR;
+
     // ---- Apply reagent consumption + cleanup-sweep enqueue ----------
+    //
+    // The dead-bit always goes on consumed cards. `progress_style` *only*
+    // gets a non-zero value on the actor's completion row — a non-actor
+    // reagent dies quietly without triggering a progress-bar render on
+    // its own card. (If the actor itself is the reagent, both fields
+    // land here.) We always clear the field first in case the prior
+    // row had a stale value carried forward.
     for &id in &consumed {
+        let is_actor = id == actor_id;
+        let style = if is_actor { actor_style } else { PROGRESS_STYLE_NONE };
         cards::update_with_at(ctx, id, completion_secs, |c| {
             c.flags |= FLAG_DEAD;
+            // Clear force_position alongside the progress-style bump.
+            // The row is dying; once the client has applied the dead
+            // flag and the death animation runs, position-forcing on
+            // a doomed row only causes spurious sibling renumbers.
+            c.flags &= !(PROGRESS_STYLE_MASK | FLAG_FORCE_POSITION);
+            c.flags |= pack_progress_style(style);
         });
         let cleanup_secs = completion_secs.saturating_add(DEAD_ROW_GRACE_SECS);
         crate::schedule_delete_cards::enqueue(ctx, id, pack_valid_at(id, cleanup_secs));
     }
 
     // ---- Generate products ------------------------------------------
+    //
+    // Products are new cards arriving at completion — they're outputs of
+    // the actor's work, not actors themselves. They land Free with
+    // `progress_style = 0`; their first row is its own existence, not a
+    // progress event reference.
     for group in &recipe_def.output_success {
         let owner = resolve_owner(group.target.owner);
         for entity in &group.entities {
@@ -167,11 +244,23 @@ pub fn apply(
     for &id in &consumed {
         release.remove(&id);
     }
-    let release_mask: u8 = !(FLAG_POSITION_HOLD | FLAG_SLOT_HOLD);
+    // Release clears `position_hold`, `slot_hold`, `force_position`,
+    // *and* `progress_style` (so non-actors come out with style = 0);
+    // actor's style is then re-set with a fresh value below.
+    // `force_position` matters: at completion the chain is dissolved
+    // (`micro_zone` / `micro_location` reset to 0 below), so there's
+    // nothing for the row to "force" — the client owns absolute
+    // positions for surviving cards. Leaving the bit set would make
+    // every subsequent server push of this row trigger a sibling
+    // renumber on the client mirror.
+    let release_mask: u32 =
+        !(FLAG_POSITION_HOLD | FLAG_SLOT_HOLD | FLAG_FORCE_POSITION | PROGRESS_STYLE_MASK);
     for &id in &release {
         let is_root = root != 0 && id == root;
+        let is_actor = id == actor_id;
+        let style = if is_actor { actor_style } else { PROGRESS_STYLE_NONE };
         cards::update_with_at(ctx, id, completion_secs, |c| {
-            c.flags &= release_mask;
+            c.flags = (c.flags & release_mask) | pack_progress_style(style);
             if !is_root {
                 c.micro_zone = 0;
                 c.micro_location = 0;
