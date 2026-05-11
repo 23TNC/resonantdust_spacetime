@@ -202,6 +202,12 @@ pub fn apply(
     // the actor's work, not actors themselves. They land Free with
     // `progress_style = 0`; their first row is its own existence, not a
     // progress event reference.
+    //
+    // Each product runs through `on_create::trigger` so OnCreate recipes
+    // can match against it — useful when a recipe's output is a card
+    // that itself triggers further automation (e.g. a magnetic anchor,
+    // or an instant-effect card with `duration = 0`). Cascading is the
+    // recipe author's responsibility to keep acyclic.
     for group in &recipe_def.output_success {
         let owner = resolve_owner(group.target.owner);
         for entity in &group.entities {
@@ -222,6 +228,7 @@ pub fn apply(
                 packed_def,
                 /* flags           */ 0,
             );
+            crate::on_create::trigger(ctx, new_id, caller_player_id)?;
         }
     }
 

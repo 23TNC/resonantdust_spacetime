@@ -12,6 +12,7 @@ use crate::packed::{
     pack_slot_micro_zone, pack_stack_micro_zone, unpack_micro_zone, StackedState,
 };
 use crate::players;
+use crate::recipe_eval::{aspect_pool, entity_satisfied_pool};
 // use crate::stacks::CardStack;  // commented along with submit_action below
 
 // `cards/flags.json` bit positions. Append-only — pinned by the data crate.
@@ -622,10 +623,41 @@ pub fn propose_action(
     // row once wall-clock catches up. No scheduler involved.
     let duration_secs = match &recipe_def.duration {
         Some(Duration::Fixed(s)) => *s,
-        Some(Duration::Conditional { .. }) => {
-            return Err(format!(
-                "recipe {recipe_id}: conditional durations not yet supported"
-            ));
+        Some(Duration::Conditional { cases, fallback }) => {
+            // Pool: root (when present) + every slot's def. Hex tier
+            // aspects are excluded by convention — duration is a
+            // chain-side property, not an anchor property. Defs are
+            // re-decoded here rather than threaded down from the
+            // earlier eligibility loop; the registry lookups are
+            // O(log n) and the chain is short.
+            let mut chain_defs: Vec<&CardDefinition> = Vec::new();
+            if root != 0 {
+                if let Some(d) = decode_definition(root_def)
+                    .map_err(|err| format!("recipe {recipe_id}: decode root def for pool: {err}"))?
+                {
+                    chain_defs.push(d);
+                }
+            }
+            for (i, &packed) in slot_defs.iter().enumerate() {
+                if let Some(d) = decode_definition(packed).map_err(|err| {
+                    format!("recipe {recipe_id}: decode slot {i} def for pool: {err}")
+                })? {
+                    chain_defs.push(d);
+                }
+            }
+            let pool = aspect_pool(chain_defs);
+            // Cases evaluate in declaration order; first match wins.
+            // Falls back to the trailing default when no case fires.
+            let mut hit: Option<u32> = None;
+            for (secs, entity) in cases {
+                if entity_satisfied_pool(entity, &pool).map_err(|err| {
+                    format!("recipe {recipe_id}: conditional duration entity: {err}")
+                })? {
+                    hit = Some(*secs);
+                    break;
+                }
+            }
+            hit.unwrap_or(*fallback)
         }
         None => return Err(format!("recipe {recipe_id}: missing duration")),
     };

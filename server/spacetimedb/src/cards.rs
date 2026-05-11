@@ -1,6 +1,18 @@
+use resonantdust_content::definition_core::decode_definition;
 use spacetimedb::{table, ReducerContext, Table};
 
 use crate::packed::{pack_valid_at, valid_at_time};
+
+/// Bit-mask of flags carried by `packed_definition`'s `CardDefinition.flags`,
+/// or 0 when the definition isn't registered. Called from `create` /
+/// `create_at` so any card spawned with a definition inherits its
+/// flag set without per-call-site bookkeeping.
+fn definition_flag_mask(packed: u16) -> u32 {
+    decode_definition(packed)
+        .ok()
+        .flatten()
+        .map_or(0, |def| def.flags)
+}
 
 #[table(accessor = cards, public)]
 pub struct Card {
@@ -60,6 +72,12 @@ fn write_at(ctx: &ReducerContext, mut card: Card, time_secs: u32) -> Card {
 }
 
 // Insert a brand-new card. valid_at is computed; pass 0 will be overwritten.
+//
+// The card's `flags` column is `flags | definition_flag_mask(packed_definition)`
+// — every card spawned with a definition inherits that definition's flag
+// set (e.g. an event card with `["drop_locked", "surface_locked"]` lands
+// already drop-locked / surface-locked). Callers that need to ADD dynamic
+// bits at spawn time still pass them via `flags`; they get OR'd in.
 #[allow(clippy::too_many_arguments)]
 pub fn create(
     ctx: &ReducerContext,
@@ -83,7 +101,7 @@ pub fn create(
             micro_location,
             owner_id,
             packed_definition,
-            flags,
+            flags: flags | definition_flag_mask(packed_definition),
         },
     )
 }
@@ -117,7 +135,8 @@ where
 
 // Like `create`, but stamps the new row at a specific `time_secs` rather
 // than `now`. Used by the action-completion path to materialize products
-// at the action's scheduled completion time.
+// at the action's scheduled completion time. Same definition-flag merge
+// as `create`.
 #[allow(clippy::too_many_arguments)]
 pub fn create_at(
     ctx: &ReducerContext,
@@ -142,7 +161,7 @@ pub fn create_at(
             micro_location,
             owner_id,
             packed_definition,
-            flags,
+            flags: flags | definition_flag_mask(packed_definition),
         },
         time_secs,
     )

@@ -2,8 +2,10 @@
 pub mod action_completion;
 pub mod actions;
 pub mod cards;
+pub mod on_create;
 pub mod packed;
 pub mod players;
+pub mod recipe_eval;
 pub mod schedule_delete_cards;
 pub mod schedule_delete_players;
 pub mod stacks;
