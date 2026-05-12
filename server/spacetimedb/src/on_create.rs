@@ -65,8 +65,18 @@ pub fn trigger(
         None => return Ok(()),
     };
 
-    let candidates = recipes_of_type(RecipeType::OnCreate)
+    // Both `on_create/self` and `on_create/magnetic` recipes fire on
+    // card creation — the latter are magnetic outers, which we still
+    // surface here so the TODO skip-and-return branch below catches
+    // them. The two lists are concatenated; the specificity comparison
+    // below picks the best regardless of category.
+    let self_candidates = recipes_of_type(RecipeType::OnCreate)
         .map_err(|err| format!("on_create: recipes_of_type: {err}"))?;
+    let magnetic_candidates = recipes_of_type(RecipeType::OnCreateMagnetic)
+        .map_err(|err| format!("on_create: recipes_of_type: {err}"))?;
+    let candidates = self_candidates
+        .into_iter()
+        .chain(magnetic_candidates.into_iter());
 
     // Highest-specificity match wins. Tuple ordering: hex tier outranks
     // root tier outright (matches `match_stack_recipe`'s convention).
@@ -151,8 +161,23 @@ pub fn trigger(
     // existing row at that pk, deletes, re-inserts — so the card's
     // first visible row to the client is the held version, not a
     // brief flagless flicker.
+    //
+    // OnCreate also applies the recipe's `set_start.root` (always —
+    // the new card is conceptually root per recipe_core's
+    // "OnCreate root == actor") and `set_start.hex` (when the recipe
+    // declared a hex entity). `set_start.slot` is meaningful only for
+    // recipes that have slots (i.e. magnetic recipes via inner-recipe
+    // slot fills) and so is ignored here.
+    let set_start_root = recipe.set_start.root as u32;
+    let set_start_hex = if recipe.hex.is_some() {
+        recipe.set_start.hex as u32
+    } else {
+        0
+    };
     cards::update_with_at(ctx, card_id, card_secs, |c| {
         c.flags |= FLAG_SLOT_HOLD | FLAG_POSITION_HOLD;
+        c.flags |= set_start_root;
+        c.flags |= set_start_hex;
     });
 
     // Per recipe_core's "OnCreate (root == actor)" convention, the new

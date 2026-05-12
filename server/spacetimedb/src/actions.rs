@@ -19,6 +19,11 @@ use crate::recipe_eval::{aspect_pool, entity_satisfied_pool};
 // Typed as u32 to match `Card.flags`.
 const FLAG_POSITION_HOLD: u32 = 1 << 0;
 const FLAG_SLOT_HOLD: u32 = 1 << 5;
+// Surfaces ≥ this are world-layer; below is inventory-ish. Mirrored from
+// `action_completion::WORLD_LAYER` so both modules agree on the boundary
+// that distinguishes "rect sits on a hex tile in the world" from
+// "rect is loose on an inventory surface".
+const WORLD_LAYER: u8 = 64;
 /// Mask for the `progress_style` 3-bit field at bits 8..=10. With-holds
 /// rows clear this so any value inherited from a prior completion row
 /// doesn't make this non-event row render a progress bar on the client.
@@ -345,11 +350,13 @@ pub fn propose_action(
     slots: Vec<u32>,
     surface: u8,
     macro_zone: u32,
-    micro_zone: u8,        // legacy / unused under the new layout; kept on
-                           // the wire so existing client calls still type-
-                           // check while the client migrates to the new
-                           // signature.
-    micro_location: u32,   // ditto.
+    micro_zone: u8,        // World-rooted only: tile's local (q, r) with
+                           // state=OnHex, used when root == 0 && hex == 0
+                           // && surface >= WORLD_LAYER. Ignored otherwise
+                           // (rooted / hex-anchored anchors derive their
+                           // micro_zone from the anchor card).
+    micro_location: u32,   // legacy / unused; kept on the wire for binding
+                           // stability.
     recipe_id: u16,
     root_dist: u8,         // actor's distance from root in the new layout.
                            // Used only when `root != 0`; the actor's
@@ -359,11 +366,13 @@ pub fn propose_action(
                            // blocks this is the full distance from the
                            // chain root.
 ) -> Result<(), String> {
-    // Acknowledge legacy args that the new layout doesn't consume — the
-    // client still passes values but we don't need them. Keeping the
-    // parameter names on the signature so generated bindings stay
-    // stable while the client migrates.
-    let _ = (micro_zone, micro_location);
+    // `micro_zone` is consumed only by the world-rooted anchor case
+    // below (root == 0, hex == 0, surface >= WORLD_LAYER) — it carries
+    // the virtual hex tile's local (q, r) with state=OnHex. The
+    // rooted and hex-anchored cases derive their micro_zone from the
+    // chain's anchor card instead. `micro_location` is still legacy
+    // on the wire; kept for binding stability.
+    let _ = micro_location;
     // De-dup across hex / root / slots. Zero is the sentinel for "absent"
     // on hex and root (skipped from the dedup set); zero inside slots is
     // a client bug.
@@ -532,10 +541,25 @@ pub fn propose_action(
     //       Slot[i] → state=Slot, microLocation=Slot[i-1],
     //                 direction, macro_zone, surface,
     //                 slot_hold + position_hold + force_position.
-    //     if root:
-    //       Slot[0] → state=OnRoot, microLocation=root, position=root_dist,
-    //                 direction, macro_zone, surface,
-    //                 position_hold + force_position.
+    //
+    //     Slot[0]'s spatial anchor depends on the chain shape (see
+    //     `actor_anchor` above):
+    //       - root != 0:
+    //           Slot[0] → state=OnRoot, microLocation=root,
+    //                     position=root_dist, direction,
+    //                     macro_zone, surface,
+    //                     position_hold + force_position.
+    //       - root == 0 && hex != 0:
+    //           Slot[0] → state=OnHex, microZone=hex's (q,r),
+    //                     microLocation=hex card_id, macro_zone, surface
+    //                     (all taken from hex card's row),
+    //                     position_hold + force_position.
+    //       - root == 0 && hex == 0 && surface >= WORLD_LAYER:
+    //           Slot[0] → state=OnHex, microZone=caller's (carries q,r),
+    //                     microLocation=0, macro_zone, surface
+    //                     (all taken from caller args),
+    //                     position_hold + force_position.
+    //       - otherwise: no spatial change (rootless inventory action).
     //
     //   if root:
     //     slot_hold(root)
@@ -549,23 +573,98 @@ pub fn propose_action(
     // client's mirror takes the server's bytes verbatim. With-holds
     // rows clear `progress_style` so they don't render as completion
     // events on the client.
+    //
+    // Recipe-side `set_start` flags are applied per role at the same
+    // time as the built-in holds: `set_start.slot` ORed onto every
+    // slot card, `set_start.root` onto root (if present),
+    // `set_start.hex` onto hex (if present). `set_start.slot` applies
+    // uniformly across all slots in the matched recipe — per-index
+    // overrides aren't a current need. Held flags clear at completion
+    // via `action_completion::apply`'s `release_mask` (every `*_hold`
+    // bit); permanent variants are the `*_locked` flags, which the
+    // release_mask doesn't touch.
+    let set_start_root = recipe_def.set_start.root as u32;
+    let set_start_slot = recipe_def.set_start.slot as u32;
+    let set_start_hex = recipe_def.set_start.hex as u32;
     let with_holds_flags_clear = !(PROGRESS_STYLE_MASK | FLAG_FORCE_POSITION);
 
+    // Precompute slots[0]'s spatial anchor. Four cases:
+    //   1. `root != 0`                        → state-2 OnRoot pin onto
+    //                                            root at `root_dist`.
+    //   2. `root == 0 && hex != 0`            → state-3 OnHex onto the hex
+    //                                            card; (surface, macro_zone,
+    //                                            q, r) come from hex's row.
+    //   3. `root == 0 && hex == 0
+    //       && surface >= WORLD_LAYER`        → state-3 OnHex onto a
+    //                                            virtual world tile (no
+    //                                            hex card row); the
+    //                                            caller's (surface,
+    //                                            macro_zone, micro_zone)
+    //                                            encode the tile.
+    //   4. otherwise                          → no spatial change; slots[0]
+    //                                            keeps its current loose
+    //                                            position (rootless
+    //                                            inventory action).
+    //
+    // The server is authoritative on slot spatial state: the client's
+    // local overlay for world drops is local-only, so without this
+    // write the server would leave slots[0]'s stale (pre-drop) spatial
+    // bytes intact and push them back, collapsing the chain on the
+    // client mirror.
+    let actor_anchor: Option<(u8, u32, u8, u32)> = if slots.is_empty() {
+        None
+    } else if root != 0 {
+        Some((
+            surface,
+            macro_zone,
+            pack_stack_micro_zone(root_dist, direction, StackedState::OnRoot),
+            root,
+        ))
+    } else if hex != 0 {
+        let hex_card = cards::latest(ctx, hex)
+            .ok_or_else(|| format!("hex card {hex} not found"))?;
+        if hex_card.surface != surface || hex_card.macro_zone != macro_zone {
+            return Err(format!(
+                "hex card {hex} not in proposed zone \
+                 (server: surface={}, macro_zone={}; proposed: surface={surface}, macro_zone={macro_zone})",
+                hex_card.surface, hex_card.macro_zone,
+            ));
+        }
+        let (q, r, _) = unpack_micro_zone(hex_card.micro_zone);
+        Some((
+            hex_card.surface,
+            hex_card.macro_zone,
+            crate::packed::pack_micro_zone(q, r, StackedState::OnHex),
+            hex,
+        ))
+    } else if surface >= WORLD_LAYER {
+        // World-rooted: trust the caller's tile coords. The state bits
+        // in `micro_zone` must say OnHex — anything else is a client
+        // bug we don't want to silently paper over.
+        let (_, _, state) = unpack_micro_zone(micro_zone);
+        if state != StackedState::OnHex {
+            return Err(format!(
+                "world-rooted action requires micro_zone state=OnHex; got {state:?}"
+            ));
+        }
+        Some((surface, macro_zone, micro_zone, 0))
+    } else {
+        None
+    };
+
     if !slots.is_empty() {
-        // slots[0] (actor): always gets slot_hold. Spatial fields only
-        // when root is provided (state-2 pin onto root).
+        // slots[0] (actor): always gets slot_hold. Spatial fields when
+        // `actor_anchor` is `Some` (the three anchored cases above) —
+        // also sets position_hold + force_position so the client
+        // mirror accepts the server's bytes verbatim.
         cards::update_with(ctx, slots[0], |c| {
             c.flags &= with_holds_flags_clear;
-            c.flags |= FLAG_SLOT_HOLD;
-            if root != 0 {
-                c.micro_location = root;
-                c.micro_zone = pack_stack_micro_zone(
-                    root_dist,
-                    direction,
-                    StackedState::OnRoot,
-                );
-                c.macro_zone = macro_zone;
-                c.surface = surface;
+            c.flags |= FLAG_SLOT_HOLD | set_start_slot;
+            if let Some((s, mz_macro, mz_micro, ml)) = actor_anchor {
+                c.surface = s;
+                c.macro_zone = mz_macro;
+                c.micro_zone = mz_micro;
+                c.micro_location = ml;
                 c.flags |= FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
             }
         });
@@ -577,7 +676,7 @@ pub fn propose_action(
             let parent_id = slots[i - 1];
             cards::update_with(ctx, slots[i], |c| {
                 c.flags &= with_holds_flags_clear;
-                c.flags |= FLAG_SLOT_HOLD | FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
+                c.flags |= FLAG_SLOT_HOLD | FLAG_POSITION_HOLD | FLAG_FORCE_POSITION | set_start_slot;
                 c.micro_location = parent_id;
                 c.micro_zone = pack_slot_micro_zone(direction);
                 c.macro_zone = macro_zone;
@@ -605,7 +704,7 @@ pub fn propose_action(
         };
         cards::update_with(ctx, root, |c| {
             c.flags &= with_holds_flags_clear;
-            c.flags |= FLAG_SLOT_HOLD;
+            c.flags |= FLAG_SLOT_HOLD | set_start_root;
             if let Some((q, r)) = hex_qr {
                 c.micro_zone = crate::packed::pack_micro_zone(q, r, StackedState::OnHex);
                 c.micro_location = hex;
@@ -613,6 +712,16 @@ pub fn propose_action(
                 c.surface = surface;
                 c.flags |= FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
             }
+        });
+    }
+
+    // Hex: not otherwise touched by the lock-phase, but if the recipe's
+    // `set_start.hex` carries non-zero bits we OR them onto the hex
+    // card's row. Skipping the write when both `hex == 0` and
+    // `set_start_hex == 0` avoids producing a no-op version row.
+    if hex != 0 && set_start_hex != 0 {
+        cards::update_with(ctx, hex, |c| {
+            c.flags |= set_start_hex;
         });
     }
 

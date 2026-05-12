@@ -10,8 +10,14 @@ use crate::packed::pack_valid_at;
 // Bit positions / fields from `cards/flags.json` (see content crate).
 // Typed as u32 to match `Card.flags`.
 const FLAG_POSITION_HOLD: u32 = 1 << 0;
+const FLAG_DROP_HOLD: u32 = 1 << 3;
 const FLAG_SLOT_HOLD: u32 = 1 << 5;
 const FLAG_DEAD: u32 = 1 << 7;
+/// Every `*_hold` bit, OR'd together. Used as the clearing mask for
+/// recipe-completion releases — anything in this mask gets cleared on
+/// the release row, on the policy "if you wanted a permanent variant,
+/// you'd have set `*_locked` instead." Append future hold bits here.
+const HOLD_FLAGS_MASK: u32 = FLAG_POSITION_HOLD | FLAG_DROP_HOLD | FLAG_SLOT_HOLD;
 /// `force_position` (bit 11). Set on every row `propose_action`
 /// repositions; cleared here at completion. Once the recipe finishes,
 /// the server has no view of where surviving cards belong (the chain
@@ -128,15 +134,22 @@ pub fn apply(
 
     // ---- Identify the actor ------------------------------------------
     //
-    // The actor is the card whose row carries `FLAG_DISPLAY_PROGRESS` at
-    // completion — the one a client renders the progress bar against.
-    // Convention: root if provided, else `slots[0]`. Hex isn't yet a
-    // valid actor designation. `0` means no actor (zero-slot, no-root
-    // recipe — degenerate case where no card shows a progress bar).
+    // The actor is the card whose completion row carries the action's
+    // `progress_style` value — the one a client renders the progress
+    // bar against. Selection precedence: `root` (if provided), else
+    // `slots[0]` (if any slots), else `hex` (if provided), else `0`
+    // (no actor — degenerate case, no card shows a progress bar).
+    //
+    // Hex-as-actor fallback covers the on_create.magnetic shape where
+    // the only resolved role is the anchor's hex slot — consistent with
+    // recipe_core's "OnCreate root == actor" convention: when only one
+    // role is present, that role is conceptually the actor.
     let actor_id: u32 = if root != 0 {
         root
+    } else if !slots.is_empty() {
+        slots[0]
     } else {
-        slots.first().copied().unwrap_or(0)
+        hex
     };
 
     // ---- Identify consumed cards (reagents) --------------------------
@@ -251,27 +264,37 @@ pub fn apply(
     for &id in &consumed {
         release.remove(&id);
     }
-    // Release clears `position_hold`, `slot_hold`, `force_position`,
-    // *and* `progress_style` (so non-actors come out with style = 0);
-    // actor's style is then re-set with a fresh value below.
-    // `force_position` matters: at completion the chain is dissolved
-    // (`micro_zone` / `micro_location` reset to 0 below), so there's
-    // nothing for the row to "force" — the client owns absolute
-    // positions for surviving cards. Leaving the bit set would make
-    // every subsequent server push of this row trigger a sibling
-    // renumber on the client mirror.
+    // Release clears every `*_hold` bit (per the project rule — if you
+    // want permanence, use `*_locked` instead), plus `force_position`
+    // and `progress_style`. Non-actors come out with style = 0; actor's
+    // style is then re-set with a fresh value in the loop below.
+    //
+    // **Spatial fields are intentionally NOT touched on release.** The
+    // chain reshape after a consumed card dies is the client's job,
+    // handled by `CardManager.spliceCard` once the dying card's death
+    // animation has completed (gated on `dead === 2`). At that point
+    // `transplantSlotChildren` promotes a state-1 child to inherit
+    // the dying card's `micro_zone` / `micro_location` / `macro_zone`
+    // / `surface` byte-for-byte — so a card freed from a world-tile
+    // chain ends up state-3 OnHex on that tile, and a card freed from
+    // an inventory chain inherits whatever inventory shape the dying
+    // card had, all without the server having to second-guess client-
+    // owned visual timing.
+    //
+    // Leaving the released card's spatial alone keeps the server row
+    // pointing at the (about-to-be-deleted) parent until the dead-row
+    // sweep at `completion_secs + DEAD_ROW_GRACE_SECS`. That's fine —
+    // by then the client has already transplanted, and the mirror's
+    // orphan-slot defensive recovery handles any reload edge-case
+    // where the parent vanishes before the local view caught up.
     let release_mask: u32 =
-        !(FLAG_POSITION_HOLD | FLAG_SLOT_HOLD | FLAG_FORCE_POSITION | PROGRESS_STYLE_MASK);
+        !(HOLD_FLAGS_MASK | FLAG_FORCE_POSITION | PROGRESS_STYLE_MASK);
+
     for &id in &release {
-        let is_root = root != 0 && id == root;
         let is_actor = id == actor_id;
         let style = if is_actor { actor_style } else { PROGRESS_STYLE_NONE };
         cards::update_with_at(ctx, id, completion_secs, |c| {
             c.flags = (c.flags & release_mask) | pack_progress_style(style);
-            if !is_root {
-                c.micro_zone = 0;
-                c.micro_location = 0;
-            }
         });
     }
 
