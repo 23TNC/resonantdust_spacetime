@@ -167,18 +167,61 @@ pub fn create_at(
     )
 }
 
-// Allocate a fresh card_id by scanning the cards history for `max+1`.
-// O(N) over every version row, but the max is unaffected by per-id
-// duplication so the answer is correct. Inserts within the current
-// reducer are visible to subsequent calls — three creates in a loop
-// produce three distinct ids.
+/// Single-row counter table holding the next card_id to allocate.
+/// Private — internal allocator state, not part of the client wire.
+///
+/// PK is always `0` — this is a one-row table; we use `id` as a
+/// fixed sentinel rather than `#[auto_inc]` because we want stable
+/// access to the same row across calls.
+#[table(accessor = card_id_counter)]
+pub struct CardIdCounter {
+    #[primary_key]
+    pub id: u8,
+    pub next: u32,
+}
+
+/// Allocate a fresh card_id in O(1). Backed by a single-row counter
+/// table; lazy-seeded from the current `max(card_id) + 1` on the very
+/// first call after a fresh deployment, then pure read-modify-write
+/// thereafter. Inserts within the current reducer are visible to
+/// subsequent calls — three creates in a loop produce three distinct
+/// ids.
+///
+/// Previously this scanned the whole cards table on every call —
+/// O(N) over every version row — which became expensive as the
+/// history grew. Counter table fixes that without changing semantics.
 pub fn next_card_id(ctx: &ReducerContext) -> u32 {
-    ctx.db
-        .cards()
-        .iter()
-        .map(|c| c.card_id)
-        .max()
-        .map_or(1, |m| m + 1)
+    if let Some(counter) = ctx.db.card_id_counter().id().find(0) {
+        let allocated = counter.next;
+        // Delete-and-reinsert is the established pattern in this
+        // codebase (see `cards::write_at`, `players::write`); avoids
+        // depending on whether `.update` is exposed on this binding
+        // version.
+        ctx.db.card_id_counter().id().delete(0);
+        ctx.db.card_id_counter().insert(CardIdCounter {
+            id: 0,
+            next: allocated.saturating_add(1),
+        });
+        allocated
+    } else {
+        // Lazy seed. One full scan, paid exactly once after each fresh
+        // deployment (or after `republish` clears data). The seed must
+        // include existing cards so we don't collide with rows the
+        // counter wasn't tracking yet.
+        let current_max = ctx
+            .db
+            .cards()
+            .iter()
+            .map(|c| c.card_id)
+            .max()
+            .unwrap_or(0);
+        let allocated = current_max.saturating_add(1);
+        ctx.db.card_id_counter().insert(CardIdCounter {
+            id: 0,
+            next: allocated.saturating_add(1),
+        });
+        allocated
+    }
 }
 
 // ---- single-field setters ---------------------------------------------

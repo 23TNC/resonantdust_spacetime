@@ -1,12 +1,20 @@
+use resonantdust_content::definition_core::find_packed_by_key;
 use spacetimedb::{reducer, Identity, ReducerContext, Table};
 use std::collections::BTreeSet;
 
-use crate::cards::cards;
+use crate::cards::{self, cards as _cards_table};
 use crate::packed::{pack_valid_at, valid_at_time};
 
 /// Maximum byte length of a `Player.name`. Enforced by `validate_player_name`
 /// on the input name and again after normalization in `claim_or_login`.
 pub const MAX_PLAYER_NAME_LEN: usize = 64;
+
+/// First `player_id` `next_player_id` will hand out on a fresh deployment.
+/// Ids `0..FIRST_PLAYER_ID` are reserved for system / pseudo-players —
+/// e.g., a "world" player that owns trees, rocks, and other unowned-by-
+/// any-human world cards. Real players coming through `claim_or_login`
+/// start at `FIRST_PLAYER_ID` and go up.
+pub const FIRST_PLAYER_ID: u32 = 1024;
 
 #[spacetimedb::table(accessor = players, public)]
 #[derive(Debug, Clone)]
@@ -194,15 +202,56 @@ pub fn resolve_caller(ctx: &ReducerContext) -> Result<u32, String> {
 
 // ---- player lifecycle -------------------------------------------------
 
-// Allocate the next `player_id`. Walks every version row's `player_id` field
-// and takes max+1. O(N) over the table; fine while the player count is small.
+/// Single-row counter table holding the next player_id to allocate.
+/// Private — internal allocator state. Mirrors `CardIdCounter`.
+#[spacetimedb::table(accessor = player_id_counter)]
+pub struct PlayerIdCounter {
+    #[primary_key]
+    pub id: u8,
+    pub next: u32,
+}
+
+/// Allocate the next `player_id` in O(1). Backed by a single-row
+/// counter table; lazy-seeded from the current `max(player_id) + 1`
+/// on the first call after a fresh deployment, O(1) thereafter.
+///
+/// Previously a full scan over `players` history — fine when small,
+/// slow once every login or mutation has accumulated version rows.
 fn next_player_id(ctx: &ReducerContext) -> u32 {
-    ctx.db
-        .players()
-        .iter()
-        .map(|p| p.player_id)
-        .max()
-        .map_or(1, |m| m + 1)
+    if let Some(counter) = ctx.db.player_id_counter().id().find(0) {
+        let allocated = counter.next;
+        ctx.db.player_id_counter().id().delete(0);
+        ctx.db.player_id_counter().insert(PlayerIdCounter {
+            id: 0,
+            next: allocated.saturating_add(1),
+        });
+        allocated
+    } else {
+        // Lazy seed — one full scan, paid exactly once after a fresh
+        // deployment. Two constraints:
+        //  - Must include existing players so the counter doesn't hand
+        //    out ids that already exist (covers databases that pre-date
+        //    the counter table or were migrated from an older schema).
+        //  - Must start at least at `FIRST_PLAYER_ID` so the
+        //    `0..FIRST_PLAYER_ID` reserved range stays free for
+        //    system / pseudo-players (e.g., a world-owner for trees,
+        //    rocks, etc.).
+        // The `.max(FIRST_PLAYER_ID)` clamp picks whichever lower bound
+        // is stricter — existing data wins if it ran past the reserve.
+        let current_max = ctx
+            .db
+            .players()
+            .iter()
+            .map(|p| p.player_id)
+            .max()
+            .unwrap_or(0);
+        let allocated = current_max.saturating_add(1).max(FIRST_PLAYER_ID);
+        ctx.db.player_id_counter().insert(PlayerIdCounter {
+            id: 0,
+            next: allocated.saturating_add(1),
+        });
+        allocated
+    }
 }
 
 /// Delete every version row for `player_id`, plus all sessions and any cards
@@ -264,6 +313,38 @@ pub fn delete_player(ctx: &ReducerContext, player_id: u32) {
     }
 }
 
+/// Spawn the soul card that represents a freshly-created player.
+///
+/// Today the only soul variant is `soul/default/human` — every new
+/// player gets one. Placed at `(surface=0, macro_zone=0, micro_zone=0,
+/// micro_location=0)` to mirror the Player row's "not yet placed"
+/// initial location fields. Owned by the new player, so inventory
+/// queries / hex-owner resolution treat the soul like any other
+/// player-owned card.
+///
+/// Goes through the standard `cards::create` + `on_create::trigger`
+/// path, so any future `on_create.self.human` recipe (e.g. one that
+/// hands out starter discipline cards) wires up automatically.
+fn spawn_soul_for(ctx: &ReducerContext, player_id: u32) -> Result<(), String> {
+    let soul_def = find_packed_by_key("human")
+        .map_err(|e| format!("spawn_soul_for: lookup human soul: {e}"))?
+        .ok_or_else(|| "spawn_soul_for: human soul not registered".to_string())?;
+    let soul_card_id = cards::next_card_id(ctx);
+    cards::create(
+        ctx,
+        soul_card_id,
+        /* surface         */ 0,
+        /* macro_zone      */ 0,
+        /* micro_zone      */ 0,
+        /* micro_location  */ 0,
+        /* owner_id        */ player_id,
+        soul_def,
+        /* flags           */ 0,
+    );
+    crate::on_create::trigger(ctx, soul_card_id, player_id)?;
+    Ok(())
+}
+
 /// Trust-on-first-use registration / login.
 ///
 /// If no `Player` exists with the given (case-sensitive) name, one is
@@ -279,10 +360,27 @@ pub fn claim_or_login(ctx: &ReducerContext, name: String) -> Result<(), String> 
     validate_player_name(&name)?;
 
     let player_id = match latest_by_name(ctx, &name) {
-        Some(player) => player.player_id,
+        Some(player) => {
+            // Reserved-range players (`__world__`, future NPC owners,
+            // etc.) live at `player_id < FIRST_PLAYER_ID`. They're
+            // server-internal and must never be claimable by a human
+            // — claiming would let a player drag-pick the world's
+            // entire tree / rock inventory through normal inventory
+            // ops. `next_player_id` already starts above the reserve,
+            // so this branch is the only entry point that could resolve
+            // to a reserved id (via name lookup of a server-seeded row).
+            if player.player_id < FIRST_PLAYER_ID {
+                return Err(format!(
+                    "player name {:?} is reserved",
+                    name
+                ));
+            }
+            player.player_id
+        }
         None => {
             let new_id = next_player_id(ctx);
             create(ctx, new_id, name, 0, 0, 0, 0);
+            spawn_soul_for(ctx, new_id)?;
             new_id
         }
     };

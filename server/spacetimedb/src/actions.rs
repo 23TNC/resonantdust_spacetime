@@ -9,10 +9,15 @@ use spacetimedb::{reducer, ReducerContext};
 use crate::action_completion;
 use crate::cards;
 use crate::packed::{
-    pack_slot_micro_zone, pack_stack_micro_zone, unpack_micro_zone, StackedState,
+    self, pack_slot_micro_zone, pack_stack_micro_zone, unpack_micro_zone, valid_at_time,
+    StackedState,
 };
 use crate::players;
 use crate::recipe_eval::{aspect_pool, entity_satisfied_pool};
+// Module + the generated `zones()` accessor trait — needed for the
+// synthetic-hex lookup. Same `(self, … as _)` pattern as
+// `magnetic.rs` / `world_gen.rs`.
+use crate::zones::zones as _zones_table;
 // use crate::stacks::CardStack;  // commented along with submit_action below
 
 // `cards/flags.json` bit positions. Append-only — pinned by the data crate.
@@ -24,6 +29,74 @@ const FLAG_SLOT_HOLD: u32 = 1 << 5;
 // that distinguishes "rect sits on a hex tile in the world" from
 // "rect is loose on an inventory surface".
 const WORLD_LAYER: u8 = 64;
+/// Surfaces ≥ this carry hex-tile data inside their backing `Zone` row.
+/// Surfaces below this (player inventory panels, future personal
+/// surfaces) have no hex tiles, so a `propose_action` that omits a
+/// `hex` card on a low surface simply means "this action has no hex".
+/// `32..64` is reserved for future pocket-dimension-style surfaces
+/// that *do* carry tile data; world surfaces start at [`WORLD_LAYER`].
+const SYNTHETIC_HEX_MIN_SURFACE: u8 = 32;
+
+/// Resolve a synthetic hex for an action whose client passed `hex = 0`.
+/// Returns the full `packed_definition` (so the recipe matcher sees
+/// the same entity shape a real tile-Card would have) plus a
+/// [`HexLocation`] (so [`action_completion::apply`] can write back
+/// to the same tile for consumption / location outputs).
+///
+/// Reads the Zone at `(surface, macro_zone)`, extracts the tile byte
+/// at the `(q, r)` decoded from `micro_zone`, and combines it with
+/// the zone's `packed_definition` (which encodes the tile catalog's
+/// type + category) to produce the full `packed_definition`.
+///
+/// Returns `None` when:
+/// - `surface < SYNTHETIC_HEX_MIN_SURFACE` (panel surface — no zone
+///   tile data here, no hex semantics).
+/// - The `micro_zone` byte's state field isn't `OnHex` (client must
+///   address a hex tile via that state to opt into this path).
+/// - No Zone row exists at `(surface, macro_zone)` (unmapped area).
+/// - The tile byte is `0` (no tile here — empty / cleared).
+///
+/// On `None`, the caller falls back to `hex_def = 0` and `hex_location
+/// = None`. The matcher rejects the recipe if it declared `hex`;
+/// otherwise the action proceeds as a chain-only proposal.
+fn derive_synthetic_hex(
+    ctx: &ReducerContext,
+    surface: u8,
+    macro_zone: u32,
+    micro_zone: u8,
+) -> Option<(u16, action_completion::HexLocation)> {
+    if surface < SYNTHETIC_HEX_MIN_SURFACE {
+        return None;
+    }
+    let (q, r, state) = unpack_micro_zone(micro_zone);
+    if state != StackedState::OnHex {
+        return None;
+    }
+    let zone = ctx
+        .db
+        .zones()
+        .macro_zone()
+        .filter(macro_zone)
+        .filter(|z| z.surface == surface)
+        .max_by_key(|z| valid_at_time(z.valid_at))?;
+    let tile_byte = packed::tile_byte(zone.tile_row(r).unwrap_or(0), q as usize);
+    if tile_byte == 0 {
+        return None;
+    }
+    // `packed_definition` layout: `[card_type:u4 | card_category:u4 |
+    // def_id:u8]`. The zone's `packed_definition` is `[type:u4 |
+    // category:u4]` already packed into a u8 — shift it up by 8 to
+    // open the low byte for the tile def_id.
+    let packed_def = ((zone.packed_definition as u16) << 8) | (tile_byte as u16);
+    let location = action_completion::HexLocation {
+        zone_id: zone.zone_id,
+        macro_zone: zone.macro_zone,
+        col: q,
+        row: r,
+        owner_id: zone.owner_id,
+    };
+    Some((packed_def, location))
+}
 /// Mask for the `progress_style` 3-bit field at bits 8..=10. With-holds
 /// rows clear this so any value inherited from a prior completion row
 /// doesn't make this non-event row render a progress bar on the client.
@@ -392,13 +465,29 @@ pub fn propose_action(
         }
     }
 
-    // Resolve hex def.
-    let hex_def = if hex != 0 {
-        cards::latest(ctx, hex)
+    // Resolve hex def. Two paths:
+    //
+    // 1. **Real hex card** (`hex != 0`): standard lookup against the
+    //    `cards` table. Same shape this codebase has always had.
+    // 2. **Synthetic hex from a zone tile** (`hex == 0`, surface carries
+    //    tile data): derive the `packed_definition` from the Zone at
+    //    `macro_zone` and the tile byte at the `(q, r)` decoded from
+    //    `micro_zone`. Gives the matcher the same entity-shaped data
+    //    a real Card would, without materializing a card row.
+    //
+    // If neither path resolves (no hex card, no tile under the cursor,
+    // or panel-surface), `hex_def = 0` — the matcher will reject the
+    // recipe if it declared `hex` and accept it otherwise.
+    let (hex_def, hex_location) = if hex != 0 {
+        let def = cards::latest(ctx, hex)
             .ok_or_else(|| format!("hex card {hex} not found"))?
-            .packed_definition
+            .packed_definition;
+        (def, None)
     } else {
-        0
+        match derive_synthetic_hex(ctx, surface, macro_zone, micro_zone) {
+            Some((def, loc)) => (def, Some(loc)),
+            None => (0, None),
+        }
     };
 
     // Resolve root def + slot_hold guard only when a root was provided.
@@ -685,10 +774,18 @@ pub fn propose_action(
         }
     }
 
-    // Root: if present, always gets slot_hold. Spatial fields only when
-    // hex is provided (state-3 re-anchor onto hex tile). When root is
-    // present without hex, root keeps its existing position — the
-    // chain hangs off it where the player put it.
+    // Root: in stack recipes, root is the chain anchor — not the actor
+    // (actor is slots[0]; see action_completion::apply's actor_id
+    // resolution). Per the recipe-author contract, slot_hold goes on
+    // the actor + slot fillers, not on root in stack recipes.
+    // `set_start.root` bits and the hex-anchor spatial pin are still
+    // applied here; the difference vs. earlier revisions is just that
+    // we no longer OR in slot_hold.
+    //
+    // Spatial fields only when hex is provided (state-3 re-anchor
+    // onto hex tile). When root is present without hex, root keeps
+    // its existing position — the chain hangs off it where the player
+    // put it.
     if root != 0 {
         // For the hex-anchor case, read the hex card's row to grab
         // its (localQ, localR) — those are the in-zone coords we
@@ -704,7 +801,7 @@ pub fn propose_action(
         };
         cards::update_with(ctx, root, |c| {
             c.flags &= with_holds_flags_clear;
-            c.flags |= FLAG_SLOT_HOLD | set_start_root;
+            c.flags |= set_start_root;
             if let Some((q, r)) = hex_qr {
                 c.micro_zone = crate::packed::pack_micro_zone(q, r, StackedState::OnHex);
                 c.micro_location = hex;
@@ -787,6 +884,7 @@ pub fn propose_action(
         &slots,
         completion_secs,
         caller_player_id,
+        hex_location,
     )?;
 
     Ok(())

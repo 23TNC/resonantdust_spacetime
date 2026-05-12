@@ -1,13 +1,14 @@
-use resonantdust_content::definition_core::{decode_definition, is_hex_type, CardDefinition};
+use resonantdust_content::definition_core::{decode_definition, is_hex_type};
 use resonantdust_content::recipe_core::{
-    recipes_of_type, Duration, Entity, RecipeDef, RecipeType,
+    recipes_of_type, Duration, RecipeDef, RecipeType,
 };
 use spacetimedb::ReducerContext;
 
 use crate::action_completion;
 use crate::cards;
+use crate::magnetic;
 use crate::packed::valid_at_time;
-use crate::recipe_eval::{aspect_pool, entity_satisfied_pool};
+use crate::recipe_eval::{aspect_pool, entity_satisfied_pool, entity_specificity};
 
 // `cards/flags.json` bit positions we need to OR onto the new card row.
 const FLAG_POSITION_HOLD: u32 = 1 << 0;
@@ -39,13 +40,14 @@ const FLAG_SLOT_HOLD: u32 = 1 << 5;
 /// satisfying the entity. Among eligible recipes the highest
 /// `(hex_spec, root_spec)` lexicographic tuple wins.
 ///
-/// **What's NOT supported yet.**
+/// **Magnetic recipes** (`recipe.magnetic.is_some()`) take a separate
+/// path: [`magnetic::install`] applies `set_start.hex` + the auto
+/// `magnetic_hold`, inserts a `MagneticAction` row, and returns. The
+/// non-magnetic completion-schedule code below does not run for them.
 ///
-/// - **Magnetic recipes** (`recipe.magnetic.is_some()`) are detected
-///   and skipped — they need a `magnetic_actions` table + tick
-///   reducer that doesn't exist yet.
-/// - **Conditional durations** are rejected with `Err` (same policy as
-///   `propose_action`).
+/// **Conditional durations** are rejected with `Err` for the
+/// non-magnetic path (same policy as `propose_action`). The magnetic
+/// path enforces the same restriction inside `magnetic::install`.
 ///
 /// A no-match result is `Ok(())` — most card creations won't match any
 /// OnCreate recipe and that's fine.
@@ -119,9 +121,11 @@ pub fn trigger(
     };
 
     if recipe.magnetic.is_some() {
-        // TODO: install a magnetic_action ticker. Requires the
-        // magnetic_actions table + tick reducer infrastructure.
-        return Ok(());
+        // Magnetic path. `install` handles `set_start.hex` + auto
+        // `magnetic_hold` on the anchor and inserts the MagneticAction
+        // row; the non-magnetic completion-schedule code below is
+        // intentionally skipped.
+        return magnetic::install(ctx, recipe, card_id, caller_player_id);
     }
 
     let duration_secs = match &recipe.duration {
@@ -168,6 +172,23 @@ pub fn trigger(
     // declared a hex entity). `set_start.slot` is meaningful only for
     // recipes that have slots (i.e. magnetic recipes via inner-recipe
     // slot fills) and so is ignored here.
+    // `position_hold` is only meaningful when the new card is spatially
+    // pinned by the recipe — which today means the recipe declared
+    // `hex` (so the new card is both root and hex, pinned to itself).
+    // A pure root-only OnCreate like `fatigue` doesn't pin the card
+    // anywhere: it just sits where it was spawned and the player should
+    // still be able to move it around mid-action. Setting position_hold
+    // there would block drag for no reason. `slot_hold` always applies —
+    // it's the "this card is participating in an action" signal that
+    // the recipe-eligibility / drop checks key on.
+    //
+    // Same gating principle as `actions.rs`'s slot[0]/root spatial
+    // writes (force_position only when there's something to pin to).
+    let position_hold = if recipe.hex.is_some() {
+        FLAG_POSITION_HOLD
+    } else {
+        0
+    };
     let set_start_root = recipe.set_start.root as u32;
     let set_start_hex = if recipe.hex.is_some() {
         recipe.set_start.hex as u32
@@ -175,7 +196,7 @@ pub fn trigger(
         0
     };
     cards::update_with_at(ctx, card_id, card_secs, |c| {
-        c.flags |= FLAG_SLOT_HOLD | FLAG_POSITION_HOLD;
+        c.flags |= FLAG_SLOT_HOLD | position_hold;
         c.flags |= set_start_root;
         c.flags |= set_start_hex;
     });
@@ -197,54 +218,9 @@ pub fn trigger(
         /* slots */ &[],
         completion_secs,
         caller_player_id,
+        /* hex_location */ None,
     )?;
 
     Ok(())
 }
 
-// Score how well a single entity matches a card definition. 0 means no
-// match; positive values reflect specificity. Mirrors the private
-// `entity_specificity` in `resonantdust_content::recipe_core`.
-fn entity_specificity(entity: &Entity, def: &CardDefinition) -> u32 {
-    match entity {
-        Entity::Card(key) => {
-            if &def.key == key {
-                4
-            } else {
-                0
-            }
-        }
-        Entity::Aspect(aspect, min) => {
-            let val = def
-                .aspects
-                .iter()
-                .find_map(|(a, v)| (a == aspect).then_some(*v))
-                .unwrap_or(0);
-            if val >= *min {
-                3
-            } else {
-                0
-            }
-        }
-        Entity::Type(type_id) => {
-            if def.card_type == *type_id {
-                2
-            } else {
-                0
-            }
-        }
-        Entity::Any => 1,
-        Entity::And(a, b) => {
-            let sa = entity_specificity(a, def);
-            let sb = entity_specificity(b, def);
-            if sa > 0 && sb > 0 {
-                sa + sb
-            } else {
-                0
-            }
-        }
-        Entity::Or(a, b) | Entity::WeightedOr { a, b, .. } => {
-            entity_specificity(a, def).max(entity_specificity(b, def))
-        }
-    }
-}

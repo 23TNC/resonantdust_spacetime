@@ -1,11 +1,41 @@
 use std::collections::BTreeSet;
 
 use resonantdust_content::definition_core::find_packed_by_key;
-use resonantdust_content::recipe_core::{Entity, ProductOwner, Reagent, RecipeDef};
-use spacetimedb::ReducerContext;
+use resonantdust_content::recipe_core::{
+    Entity, ProductOwner, ProductPlace, Reagent, RecipeDef,
+};
+use spacetimedb::{log, ReducerContext};
 
 use crate::cards;
-use crate::packed::pack_valid_at;
+use crate::packed::{pack_valid_at, unpack_macro_zone};
+use crate::world_gen;
+use crate::zones;
+
+/// Address of a synthetic hex — a "hex card" that doesn't actually exist
+/// as a `Card` row but is derived from a Zone tile byte. Passed alongside
+/// `hex == 0` into [`apply`] when the calling action targets a tile-as-
+/// hex (the `propose_action` synthetic-hex path).
+///
+/// Carries everything `apply` needs to (1) resolve
+/// `ProductOwner::Hex` to the zone's owner, (2) consume the hex by
+/// reverting the tile byte to the underlying biome via
+/// `world_gen::biome_for(global_q, global_r)`, and (3) write
+/// `ProductPlace::Location` products into the same tile.
+#[derive(Debug, Clone, Copy)]
+pub struct HexLocation {
+    pub zone_id: u32,
+    /// Packed `(macro_q, macro_r)` of the zone — preserved here so the
+    /// consumption path can compute the tile's *global* hex coords
+    /// (zone macro × 8 + tile col/row) without re-reading the Zone
+    /// row, which is needed to call `world_gen::biome_for`.
+    pub macro_zone: u32,
+    pub col: u8,
+    pub row: u8,
+    /// Snapshot of the zone's `owner_id` at the time the synthetic hex
+    /// was derived. Used for `ProductOwner::Hex` resolution so the
+    /// inheritance behaves like a real hex card's `owner_id`.
+    pub owner_id: u32,
+}
 
 // Bit positions / fields from `cards/flags.json` (see content crate).
 // Typed as u32 to match `Card.flags`.
@@ -92,6 +122,7 @@ const DEAD_ROW_GRACE_SECS: u32 = 10;
 /// eventually swept. The implicit sweep enqueued by `update_with_at`
 /// (firing at `completion_secs`) clears every prior version but
 /// preserves the dead row; this explicit second sweep catches it.
+#[allow(clippy::too_many_arguments)]
 pub fn apply(
     ctx: &ReducerContext,
     recipe_def: &RecipeDef,
@@ -100,9 +131,41 @@ pub fn apply(
     slots: &[u32],
     completion_secs: u32,
     caller_player_id: u32,
+    // `hex_location` is `Some` when the action targets a tile-as-hex
+    // (`hex == 0` plus `propose_action` resolved a synthetic hex).
+    // `None` everywhere else — real hex cards, OnCreate, magnetic.
+    hex_location: Option<HexLocation>,
 ) -> Result<(), String> {
+    // ---- Identify the actor ------------------------------------------
+    //
+    // The actor is the card whose completion row carries the action's
+    // `progress_style` value — the one a client renders the progress
+    // bar against, and the source for `ProductOwner::Actor` inheritance.
+    //
+    // Selection precedence: `slots[0]` (if any slots), else `root` (if
+    // provided), else `hex` (if provided), else `0`. The slots-first
+    // rule is the recipe-author-facing contract: actor is always
+    // slots[0] when the recipe declares slots. `root` is only the
+    // actor in the OnCreate shape, where slots is empty and root is
+    // the new card itself ("OnCreate root == actor" convention). The
+    // hex fallback covers degenerate on_create.magnetic shapes where
+    // only the anchor is resolved.
+    //
+    // For stack recipes with both root and slots — e.g.
+    // `root: A, slots: B+C` — actor is B (slots[0]), not A. Root in
+    // stack recipes is just the chain anchor, not the actor.
+    //
+    // Resolved *before* owner sources so `ProductOwner::Actor` reads
+    // the same id used everywhere else in this function.
+    let actor_id: u32 = if !slots.is_empty() {
+        slots[0]
+    } else if root != 0 {
+        root
+    } else {
+        hex
+    };
+
     // ---- Resolve owner sources --------------------------------------
-    let actor_id = slots.first().copied().unwrap_or(0);
     let actor_owner = if actor_id != 0 {
         cards::latest(ctx, actor_id).map(|c| c.owner_id).unwrap_or(0)
     } else {
@@ -110,6 +173,11 @@ pub fn apply(
     };
     let hex_owner = if hex != 0 {
         cards::latest(ctx, hex).map(|c| c.owner_id).unwrap_or(0)
+    } else if let Some(loc) = &hex_location {
+        // Synthetic hex — its "owner" is the Zone's `owner_id`,
+        // snapshotted at proposal time. `0` for world zones means
+        // `resolve_owner`'s fallback chain kicks in (→ caller).
+        loc.owner_id
     } else {
         0
     };
@@ -132,28 +200,15 @@ pub fn apply(
         }
     };
 
-    // ---- Identify the actor ------------------------------------------
-    //
-    // The actor is the card whose completion row carries the action's
-    // `progress_style` value — the one a client renders the progress
-    // bar against. Selection precedence: `root` (if provided), else
-    // `slots[0]` (if any slots), else `hex` (if provided), else `0`
-    // (no actor — degenerate case, no card shows a progress bar).
-    //
-    // Hex-as-actor fallback covers the on_create.magnetic shape where
-    // the only resolved role is the anchor's hex slot — consistent with
-    // recipe_core's "OnCreate root == actor" convention: when only one
-    // role is present, that role is conceptually the actor.
-    let actor_id: u32 = if root != 0 {
-        root
-    } else if !slots.is_empty() {
-        slots[0]
-    } else {
-        hex
-    };
-
     // ---- Identify consumed cards (reagents) --------------------------
+    //
+    // `consumed` tracks Card-row deaths. Synthetic-hex consumption is
+    // tracked separately in `consume_synthetic_hex` because the path
+    // is different: a synthetic hex has no Card row, so consuming it
+    // means clearing the zone tile byte (write 0), not flipping a
+    // `dead` bit on a row that doesn't exist.
     let mut consumed: BTreeSet<u32> = BTreeSet::new();
+    let mut consume_synthetic_hex = false;
     for reagent in &recipe_def.reagents {
         match reagent {
             Reagent::Root => {
@@ -164,6 +219,8 @@ pub fn apply(
             Reagent::Hex => {
                 if hex != 0 {
                     consumed.insert(hex);
+                } else if hex_location.is_some() {
+                    consume_synthetic_hex = true;
                 }
             }
             // 1-indexed: Slot(1) is the actor at slots[0]. Slot(0) and
@@ -209,6 +266,42 @@ pub fn apply(
         crate::schedule_delete_cards::enqueue(ctx, id, pack_valid_at(id, cleanup_secs));
     }
 
+    // Synthetic-hex consumption: revert the tile byte to its
+    // *underlying biome* — what `world_gen::tile_for` would have
+    // produced before the per-tile variant roll. Chopping a tree
+    // leaves the forest tile it was placed on; mining a rock leaves
+    // forest; consuming forest itself reverts to plains (the biome
+    // under forest). Pure-deterministic re-derivation from the same
+    // noise the generator used, so the revert is byte-equivalent to
+    // what the world looked like before the tree existed.
+    //
+    // Explicit `location: { hex: [...] }` outputs in the recipe run
+    // *after* this revert (in the product loop below), so a recipe
+    // author who wants a specific tile (or an empty hex via a sentinel
+    // tile if we ever add one) can override the auto-revert by
+    // declaring a location output.
+    //
+    // `set_tile_at` future-stamps the Zone version row at
+    // `completion_secs`, so the client's promote-by-time logic keeps
+    // showing the original tile until the action actually completes —
+    // matches the Card-death `update_with_at` discipline.
+    if consume_synthetic_hex {
+        if let Some(loc) = &hex_location {
+            let (macro_q, macro_r) = unpack_macro_zone(loc.macro_zone);
+            let global_q = macro_q as i32 * 8 + loc.col as i32;
+            let global_r = macro_r as i32 * 8 + loc.row as i32;
+            let underlying = world_gen::biome_for(global_q, global_r);
+            zones::set_tile_at(
+                ctx,
+                loc.zone_id,
+                completion_secs,
+                loc.row,
+                loc.col,
+                underlying,
+            );
+        }
+    }
+
     // ---- Generate products ------------------------------------------
     //
     // Products are new cards arriving at completion — they're outputs of
@@ -222,26 +315,70 @@ pub fn apply(
     // or an instant-effect card with `duration = 0`). Cascading is the
     // recipe author's responsibility to keep acyclic.
     for group in &recipe_def.output_success {
-        let owner = resolve_owner(group.target.owner);
-        for entity in &group.entities {
-            let packed_def = resolve_product_entity(entity)?;
-            let new_id = cards::next_card_id(ctx);
-            // Inventory placement convention (mirrors utilities::add_card):
-            // surface=1 (inventory), macro_zone=owner, no spatial coords,
-            // micro_location=0 — layout is the client's job.
-            cards::create_at(
-                ctx,
-                new_id,
-                completion_secs,
-                /* surface         */ 1,
-                /* macro_zone      */ owner,
-                /* micro_zone      */ 0,
-                /* micro_location  */ 0,
-                /* owner_id        */ owner,
-                packed_def,
-                /* flags           */ 0,
-            );
-            crate::on_create::trigger(ctx, new_id, caller_player_id)?;
+        match group.target.place {
+            ProductPlace::Inventory => {
+                let owner = resolve_owner(group.target.owner);
+                for entity in &group.entities {
+                    let packed_def = resolve_product_entity(entity)?;
+                    let new_id = cards::next_card_id(ctx);
+                    // Inventory placement convention (mirrors
+                    // utilities::add_card): surface=1, macro_zone=owner,
+                    // no spatial coords — layout is the client's job.
+                    cards::create_at(
+                        ctx,
+                        new_id,
+                        completion_secs,
+                        /* surface         */ 1,
+                        /* macro_zone      */ owner,
+                        /* micro_zone      */ 0,
+                        /* micro_location  */ 0,
+                        /* owner_id        */ owner,
+                        packed_def,
+                        /* flags           */ 0,
+                    );
+                    crate::on_create::trigger(ctx, new_id, caller_player_id)?;
+                }
+            }
+            ProductPlace::Location => {
+                // Only `ProductOwner::Hex` is implemented today (the
+                // parser rejects other owners at parse time). The
+                // tile address comes from the synthetic-hex
+                // `hex_location`; if the action ran against a real
+                // hex card or had no hex at all, there's no tile
+                // address to write to — error so the recipe author
+                // sees the misuse instead of silent drop.
+                let Some(loc) = &hex_location else {
+                    return Err(format!(
+                        "recipe {}: location output requires a synthetic-hex action \
+                         (hex must be omitted by the client; surface must carry tile data)",
+                        recipe_def.id
+                    ));
+                };
+                // Multi-entity groups: a tile byte can hold at most
+                // one def_id. Per the agreed policy, take the first
+                // entity and warn so the recipe author sees the
+                // truncation without the action failing.
+                if group.entities.len() > 1 {
+                    log::warn!(
+                        "recipe {}: location output group has {} entities; only the first will be written",
+                        recipe_def.id,
+                        group.entities.len()
+                    );
+                }
+                let Some(entity) = group.entities.first() else {
+                    continue;
+                };
+                let packed_def = resolve_product_entity(entity)?;
+                // packed_definition: [card_type:u4 | card_category:u4 |
+                // def_id:u8]. Tile bytes store only the def_id — low
+                // 8 bits. The high byte (type+category) must match
+                // the destination zone's `packed_definition`, but we
+                // trust the recipe author's `Entity::Card("tree")`
+                // alongside a `tile/default` zone to be consistent;
+                // a future enhancement can verify equality.
+                let def_id = (packed_def & 0xFF) as u8;
+                zones::set_tile_at(ctx, loc.zone_id, completion_secs, loc.row, loc.col, def_id);
+            }
         }
     }
 
@@ -269,8 +406,8 @@ pub fn apply(
     // and `progress_style`. Non-actors come out with style = 0; actor's
     // style is then re-set with a fresh value in the loop below.
     //
-    // **Spatial fields are intentionally NOT touched on release.** The
-    // chain reshape after a consumed card dies is the client's job,
+    // **Spatial fields are NOT touched on non-bottom released cards.**
+    // The chain reshape after a consumed card dies is the client's job,
     // handled by `CardManager.spliceCard` once the dying card's death
     // animation has completed (gated on `dead === 2`). At that point
     // `transplantSlotChildren` promotes a state-1 child to inherit
@@ -281,20 +418,49 @@ pub fn apply(
     // card had, all without the server having to second-guess client-
     // owned visual timing.
     //
-    // Leaving the released card's spatial alone keeps the server row
+    // Leaving non-bottom cards' spatial alone keeps the server row
     // pointing at the (about-to-be-deleted) parent until the dead-row
     // sweep at `completion_secs + DEAD_ROW_GRACE_SECS`. That's fine —
     // by then the client has already transplanted, and the mirror's
     // orphan-slot defensive recovery handles any reload edge-case
     // where the parent vanishes before the local view caught up.
+    //
+    // **EXCEPTION: chain bottom relocates to inventory when its
+    // current `surface != 1`.** A chain action that completed on the
+    // world (or any non-inventory surface — trade window, hypothetical
+    // surface 32, etc.) sends its bottom card home. Every other
+    // released card stays put — their `micro_location` parent pointers
+    // make them follow the bottom automatically. The bottom of the
+    // released chain is `root` if a root was provided, else `slots[0]`
+    // if there are slots. The hex-only context (no root, no slots —
+    // e.g. an on_create.magnetic anchor) has no chain bottom to
+    // relocate (`bottom_id = 0`); hex tiles don't move regardless.
+    //
+    // The relocate writes `surface=1, macro_zone=c.owner_id,
+    // micro_zone=0, micro_location=0` — i.e. loose-at-default-position
+    // in the owner's inventory. Client lays out from there.
+    let bottom_id: u32 = if root != 0 {
+        root
+    } else if !slots.is_empty() {
+        slots[0]
+    } else {
+        0
+    };
     let release_mask: u32 =
         !(HOLD_FLAGS_MASK | FLAG_FORCE_POSITION | PROGRESS_STYLE_MASK);
 
     for &id in &release {
         let is_actor = id == actor_id;
+        let is_bottom = bottom_id != 0 && id == bottom_id;
         let style = if is_actor { actor_style } else { PROGRESS_STYLE_NONE };
         cards::update_with_at(ctx, id, completion_secs, |c| {
             c.flags = (c.flags & release_mask) | pack_progress_style(style);
+            if is_bottom && c.surface != 1 {
+                c.surface = 1;
+                c.macro_zone = c.owner_id;
+                c.micro_zone = 0;
+                c.micro_location = 0;
+            }
         });
     }
 
