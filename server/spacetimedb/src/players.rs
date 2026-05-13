@@ -3,7 +3,12 @@ use spacetimedb::{reducer, Identity, ReducerContext, Table};
 use std::collections::BTreeSet;
 
 use crate::cards::{self, cards as _cards_table};
-use crate::packed::{pack_valid_at, valid_at_time};
+use crate::packed::{pack_macro_zone, pack_micro_zone, pack_valid_at, valid_at_time, StackedState};
+
+/// World-layer surface threshold (mirrors the constant in
+/// `action_completion.rs` / `actions.rs`). Souls spawn on this surface
+/// so they live in the world tier rather than inventory.
+const WORLD_LAYER: u8 = 64;
 
 /// Maximum byte length of a `Player.name`. Enforced by `validate_player_name`
 /// on the input name and again after normalization in `claim_or_login`.
@@ -32,19 +37,20 @@ pub struct Player {
     /// the registration reducer enforces it via lookup — see `claim_or_login`.
     #[index(btree)]
     pub name: String,
-    /// Surface (formerly "layer") the player's soul currently occupies.
-    /// `0` while the soul is not yet placed in the world.
-    pub surface: u8,
-    /// World macro_zone the soul currently occupies. `0` while unplaced.
-    #[index(btree)]
-    pub macro_zone: u32,
-    /// In-zone position of the soul: `[local_q:u3][local_r:u3][stack_state:u2]`.
-    /// `0` while unplaced.
-    pub micro_zone: u8,
-    /// Within-`micro_zone` position. Either a parent `card_id` (soul attached
-    /// to another card) or packed `(i16 x, i16 y)` pixel coords (loose).
-    /// `0` while unplaced.
-    pub micro_location: u32,
+    /// `card_id` of the soul card this player currently inhabits — the
+    /// in-world avatar that carries positional data (surface, macro_zone,
+    /// micro_zone, micro_location). `0` before the soul has been spawned
+    /// (a lazy migration in `claim_or_login` provisions one on next login
+    /// for any player whose row predates the soul system). Replaces the
+    /// older "positional fields directly on Player" model — every piece of
+    /// in-world state now lives on a `Card`, and the player row is a thin
+    /// identity row that points at *which* card the player is.
+    ///
+    /// Future multi-character support: this field names the *currently
+    /// controlled* soul. Switching characters means swapping this id;
+    /// other souls belonging to the same player would be normal owned
+    /// cards. Today there's exactly one soul per player.
+    pub soul_card_id: u32,
 }
 
 /// Maps a connection's current `Identity` to the persistent `player_id`.
@@ -103,15 +109,11 @@ fn write(ctx: &ReducerContext, mut player: Player) -> Player {
 }
 
 // Insert a brand-new player. valid_at is computed; pass 0 will be overwritten.
-#[allow(clippy::too_many_arguments)]
 pub fn create(
     ctx: &ReducerContext,
     player_id: u32,
     name: String,
-    surface: u8,
-    macro_zone: u32,
-    micro_zone: u8,
-    micro_location: u32,
+    soul_card_id: u32,
 ) -> Player {
     write(
         ctx,
@@ -119,10 +121,7 @@ pub fn create(
             valid_at: 0,
             player_id,
             name,
-            surface,
-            macro_zone,
-            micro_zone,
-            micro_location,
+            soul_card_id,
         },
     )
 }
@@ -138,26 +137,12 @@ where
     Some(write(ctx, p))
 }
 
-// ---- single-field setters ---------------------------------------------
-
-pub fn set_surface(ctx: &ReducerContext, player_id: u32, surface: u8) -> Option<Player> {
-    update_with(ctx, player_id, |p| p.surface = surface)
-}
-
-pub fn set_macro_zone(ctx: &ReducerContext, player_id: u32, macro_zone: u32) -> Option<Player> {
-    update_with(ctx, player_id, |p| p.macro_zone = macro_zone)
-}
-
-pub fn set_micro_zone(ctx: &ReducerContext, player_id: u32, micro_zone: u8) -> Option<Player> {
-    update_with(ctx, player_id, |p| p.micro_zone = micro_zone)
-}
-
-pub fn set_micro_location(
+pub fn set_soul_card_id(
     ctx: &ReducerContext,
     player_id: u32,
-    micro_location: u32,
+    soul_card_id: u32,
 ) -> Option<Player> {
-    update_with(ctx, player_id, |p| p.micro_location = micro_location)
+    update_with(ctx, player_id, |p| p.soul_card_id = soul_card_id)
 }
 
 // ---- name handling ----------------------------------------------------
@@ -313,36 +298,43 @@ pub fn delete_player(ctx: &ReducerContext, player_id: u32) {
     }
 }
 
-/// Spawn the soul card that represents a freshly-created player.
+/// Spawn the soul card that represents a freshly-created player and
+/// return its `card_id`.
 ///
 /// Today the only soul variant is `soul/default/human` — every new
-/// player gets one. Placed at `(surface=0, macro_zone=0, micro_zone=0,
-/// micro_location=0)` to mirror the Player row's "not yet placed"
-/// initial location fields. Owned by the new player, so inventory
-/// queries / hex-owner resolution treat the soul like any other
-/// player-owned card.
+/// player gets one. Placed on the world surface at tile `(0, 0)` as a
+/// state-3 OnHex virtual-hex-root (no parent hex card row at the
+/// spawn point — the rect card sits on the bare world tile). Owned by
+/// the new player, so inventory queries / hex-owner resolution treat
+/// the soul like any other player-owned card.
+///
+/// Eventually the spawn location should be map-driven (a designated
+/// spawn tile per region). For now it's fixed at world origin to keep
+/// the bootstrap simple.
 ///
 /// Goes through the standard `cards::create` + `on_create::trigger`
 /// path, so any future `on_create.self.human` recipe (e.g. one that
 /// hands out starter discipline cards) wires up automatically.
-fn spawn_soul_for(ctx: &ReducerContext, player_id: u32) -> Result<(), String> {
+fn spawn_soul_for(ctx: &ReducerContext, player_id: u32) -> Result<u32, String> {
     let soul_def = find_packed_by_key("human")
         .map_err(|e| format!("spawn_soul_for: lookup human soul: {e}"))?
         .ok_or_else(|| "spawn_soul_for: human soul not registered".to_string())?;
     let soul_card_id = cards::next_card_id(ctx);
+    let spawn_macro_zone = pack_macro_zone(0, 0);
+    let spawn_micro_zone = pack_micro_zone(0, 0, StackedState::OnHex);
     cards::create(
         ctx,
         soul_card_id,
-        /* surface         */ 0,
-        /* macro_zone      */ 0,
-        /* micro_zone      */ 0,
+        /* surface         */ WORLD_LAYER,
+        /* macro_zone      */ spawn_macro_zone,
+        /* micro_zone      */ spawn_micro_zone,
         /* micro_location  */ 0,
         /* owner_id        */ player_id,
         soul_def,
         /* flags           */ 0,
     );
     crate::on_create::trigger(ctx, soul_card_id, player_id)?;
-    Ok(())
+    Ok(soul_card_id)
 }
 
 /// Trust-on-first-use registration / login.
@@ -375,12 +367,28 @@ pub fn claim_or_login(ctx: &ReducerContext, name: String) -> Result<(), String> 
                     name
                 ));
             }
+            // Lazy soul migration. Pre-soul-system players have
+            // `soul_card_id = 0`; spawn one on next login and write
+            // the id back. New cards will rarely take this branch
+            // (they get a soul at creation below) but it's also the
+            // recovery path if a player row exists without a
+            // corresponding soul card for any reason (orphaned by a
+            // bug, manual ops, etc.).
+            if player.soul_card_id == 0 {
+                let soul_card_id = spawn_soul_for(ctx, player.player_id)?;
+                set_soul_card_id(ctx, player.player_id, soul_card_id);
+            }
             player.player_id
         }
         None => {
             let new_id = next_player_id(ctx);
-            create(ctx, new_id, name, 0, 0, 0, 0);
-            spawn_soul_for(ctx, new_id)?;
+            // Spawn the soul first so we can record its id on the
+            // player's first row, instead of writing the player twice
+            // (once with `soul_card_id = 0`, then again after the
+            // soul exists). Single write keeps the version history
+            // clean.
+            let soul_card_id = spawn_soul_for(ctx, new_id)?;
+            create(ctx, new_id, name, soul_card_id);
             new_id
         }
     };

@@ -255,11 +255,17 @@ pub fn apply(
         let style = if is_actor { actor_style } else { PROGRESS_STYLE_NONE };
         cards::update_with_at(ctx, id, completion_secs, |c| {
             c.flags |= FLAG_DEAD;
-            // Clear force_position alongside the progress-style bump.
-            // The row is dying; once the client has applied the dead
-            // flag and the death animation runs, position-forcing on
-            // a doomed row only causes spurious sibling renumbers.
-            c.flags &= !(PROGRESS_STYLE_MASK | FLAG_FORCE_POSITION);
+            // Clear holds + force_position + progress_style alongside
+            // the dead-bit bump. The row is dying; the action that
+            // claimed it is over, so `slot_hold` and friends shouldn't
+            // linger. Same mask the release loop below uses for
+            // non-consumed slots (`HOLD_FLAGS_MASK | FLAG_FORCE_POSITION
+            // | PROGRESS_STYLE_MASK`) — keeping the two paths in sync
+            // means "alive but released" and "dead" rows agree on the
+            // post-action flag baseline. The `progress_style` value
+            // that the actor card carries is then re-OR'd from
+            // `style` below.
+            c.flags &= !(HOLD_FLAGS_MASK | FLAG_FORCE_POSITION | PROGRESS_STYLE_MASK);
             c.flags |= pack_progress_style(style);
         });
         let cleanup_secs = completion_secs.saturating_add(DEAD_ROW_GRACE_SECS);

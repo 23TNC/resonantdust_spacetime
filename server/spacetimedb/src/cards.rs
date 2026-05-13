@@ -61,14 +61,118 @@ fn write(ctx: &ReducerContext, card: Card) -> Card {
 // timestamp instead of `now`. Used by the action-completion path to apply
 // product generation / reagent consumption / flag release at the action's
 // scheduled completion time rather than at "scheduler tick" time.
+//
+// After the insert, the souls module's `on_card_write` hook fires.
+// That hook is responsible for keeping the `Soul` table in sync with
+// the cards table — soul-card positional mirroring (when this write
+// is the soul card itself) and stat-counter diffing (when this write
+// changes a tracked faculty card). Capturing `prev_latest` BEFORE
+// the find/delete/insert is essential: it's the row the diff
+// compares against, and it's exactly the row we may be about to
+// replace at the same PK. Doing this here keeps every code path that
+// writes cards (action_completion, on_create, magnetic, movement,
+// utilities, world_gen) automatically participating in soul
+// tracking — there's only one write entry point.
 fn write_at(ctx: &ReducerContext, mut card: Card, time_secs: u32) -> Card {
     card.valid_at = pack_valid_at(card.card_id, time_secs);
+    let prev_latest = latest(ctx, card.card_id);
     if ctx.db.cards().valid_at().find(card.valid_at).is_some() {
         ctx.db.cards().valid_at().delete(card.valid_at);
     }
     let inserted = ctx.db.cards().insert(card);
     crate::schedule_delete_cards::enqueue(ctx, inserted.card_id, inserted.valid_at);
+    crate::souls::on_card_write(ctx, prev_latest.as_ref(), &inserted, time_secs);
+    if let Some(prev) = prev_latest.as_ref() {
+        propagate_flag_diff_forward(ctx, &inserted, prev.flags, time_secs);
+    }
     inserted
+}
+
+/// Forward-propagate the flag delta between `prev_flags` (the row our
+/// `write_at` just replaced) and `new_card.flags` (the row we just
+/// wrote) into every existing future-stamped row for the same card,
+/// with stop-on-deliberate-change discipline per bit.
+///
+/// The motivating case: a fleeting card has a future-stamped dead row
+/// (from `on_create.fleeting`'s consume) scheduled at `T_expire`. A
+/// player drops it into another action at `T_propose < T_expire`,
+/// which sets `slot_hold` on the card at `T_propose`. Without
+/// forward-propagation, the `T_expire` row still has `slot_hold = 0`,
+/// so client-side death-animation gates that check `slot_hold == 0`
+/// fire prematurely while the action is mid-flight.
+///
+/// Per-bit logic, mirroring the zones-forward-propagation pattern but
+/// generalised across all 32 flag bits:
+///
+/// - `set_bits = new & !prev` — bits we just turned on.
+/// - `clear_bits = prev & !new` — bits we just turned off.
+/// - For each future row in ascending `valid_at_time`, narrow the
+///   active set/clear masks down to bits whose value in that row
+///   *still matches* the prior's value (set bits where the row has 0;
+///   clear bits where the row has 1). Bits that diverged were
+///   deliberately changed by some other write — drop them from the
+///   active mask and don't second-guess that decision. Apply the
+///   surviving mask to the row.
+///
+/// Bypasses `write_at` for the future-row updates (direct
+/// `delete` / `insert`) so we don't recursively fire hooks or
+/// re-enqueue schedule-deletes for rows that were already scheduled
+/// at their original write. The `valid_at` PK is preserved across the
+/// delete/insert pair, so any existing `schedule_delete_cards` row
+/// keyed on it still targets the correct (replacement) row.
+fn propagate_flag_diff_forward(
+    ctx: &ReducerContext,
+    new_card: &Card,
+    prev_flags: u32,
+    time_secs: u32,
+) {
+    let set_bits = new_card.flags & !prev_flags;
+    let clear_bits = prev_flags & !new_card.flags;
+    if set_bits == 0 && clear_bits == 0 {
+        return;
+    }
+
+    let mut future: Vec<u64> = ctx
+        .db
+        .cards()
+        .card_id()
+        .filter(new_card.card_id)
+        .filter(|c| valid_at_time(c.valid_at) > time_secs)
+        .map(|c| c.valid_at)
+        .collect();
+    future.sort_unstable_by_key(|v| valid_at_time(*v));
+
+    let mut active_set = set_bits;
+    let mut active_clear = clear_bits;
+
+    for v in future {
+        if active_set == 0 && active_clear == 0 {
+            break;
+        }
+        let Some(row) = ctx.db.cards().valid_at().find(v) else {
+            continue;
+        };
+        let row_flags = row.flags;
+
+        // Narrow per-bit:
+        //  - For set_bits: keep bits where row has 0 (matches prev's
+        //    0, so the row inherited from before our write). Drop
+        //    bits where row has 1 (someone deliberately set it).
+        //  - For clear_bits: keep bits where row has 1 (matches
+        //    prev's 1, so inherited). Drop bits where row has 0
+        //    (someone deliberately cleared it).
+        active_set &= !row_flags;
+        active_clear &= row_flags;
+        if active_set == 0 && active_clear == 0 {
+            break;
+        }
+
+        let new_flags = (row_flags & !active_clear) | active_set;
+        ctx.db.cards().valid_at().delete(v);
+        let mut updated = row;
+        updated.flags = new_flags;
+        ctx.db.cards().insert(updated);
+    }
 }
 
 // Insert a brand-new card. valid_at is computed; pass 0 will be overwritten.

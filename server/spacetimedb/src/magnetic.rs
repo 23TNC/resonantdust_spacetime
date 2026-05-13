@@ -11,8 +11,8 @@ use crate::action_completion;
 // other consumer here).
 use crate::cards::{self, cards as _cards_table};
 use crate::packed::{
-    pack_stack_micro_zone, pack_valid_at, valid_at_time, StackedState,
-    STACK_DIR_DOWN, STACK_DIR_UP,
+    pack_micro_zone, pack_slot_micro_zone, pack_valid_at, unpack_micro_zone,
+    valid_at_time, StackedState, STACK_DIR_DOWN, STACK_DIR_UP,
 };
 
 /// `progress_style` bit field (bits 8..=10) packing — mirrors
@@ -141,14 +141,17 @@ pub fn install(
     let installed_secs = valid_at_time(anchor.valid_at);
     let duration_at = installed_secs.saturating_add(duration_secs);
 
-    // Apply `set_start.hex` (single bitmask u8 → u32 OR) plus auto-OR
+    // Apply `set_start.hex` (FlagOps: set + clear masks) plus auto-OR
     // `FLAG_MAGNETIC_HOLD` onto the anchor at install time. Stamped at
     // `installed_secs` (== anchor.valid_at_time) so the holds land on
     // the anchor's first visible row via `write_at`'s find/delete/insert
-    // pattern — no flagless flicker for the client.
-    let set_start_hex = recipe_def.set_start.hex as u32;
+    // pattern — no flagless flicker for the client. The auto magnetic
+    // hold is OR'd *after* set_start so an author can't accidentally
+    // clear it via `set_start.hex.magnetic_hold = false` (not currently
+    // a parseable flag anyway, but the policy is explicit).
+    let set_start_hex = recipe_def.set_start.hex;
     cards::update_with_at(ctx, anchor_card_id, installed_secs, |c| {
-        c.flags |= set_start_hex | FLAG_MAGNETIC_HOLD;
+        c.flags = set_start_hex.apply(c.flags) | FLAG_MAGNETIC_HOLD;
     });
 
     // Lay down a future-stamped row on the anchor at `duration_at` so
@@ -252,17 +255,33 @@ pub fn magnetic_tick(ctx: &ReducerContext, args: MagneticAction) -> Result<(), S
 
     let mut args = args;
 
-    // Final-tick branch: at or past the magnetic phase deadline, one
-    // last fill attempt then commit one way or the other.
+    // Pull every available card this tick — up to `needed` total, or
+    // until inventory runs out of matches for the next slot's entity.
+    // Previously we pulled one card per tick (predictable cadence,
+    // visible speckle), but with server-side instant commit on full
+    // fill that cadence wasn't doing much for the player visually.
+    // Trying the all-at-once approach to see how it reads.
+    //
+    // The loop stops as soon as `find_match` returns `None` for the
+    // current slot: missing-from-inventory means we *can't* fill any
+    // further, and waiting for the next tick is the only recourse
+    // (player might drop something in the meantime).
+    let initial_pulled_count = args.pulled_cards.len();
+    while args.pulled_cards.len() < needed {
+        let Some(entity) = entity_at_pull_index(success_recipe, args.pulled_cards.len()) else {
+            break;
+        };
+        let Some(c) = find_match(ctx, &args, entity)? else {
+            break;
+        };
+        magnetize(ctx, c, &args, args.pulled_cards.len(), direction)?;
+        args.pulled_cards.push(c);
+    }
+
+    // Final-tick branch: at or past the magnetic phase deadline,
+    // commit one way or the other. The pull loop above is our "one
+    // last fill attempt"; whatever it produced is what we have.
     if now >= args.duration_at {
-        if args.pulled_cards.len() < needed {
-            if let Some(entity) = entity_at_pull_index(success_recipe, args.pulled_cards.len()) {
-                if let Some(c) = find_match(ctx, &args, entity)? {
-                    magnetize(ctx, c, &args, args.pulled_cards.len(), direction)?;
-                    args.pulled_cards.push(c);
-                }
-            }
-        }
         if args.pulled_cards.len() == needed {
             commit_success(ctx, &args, success_recipe, now)?;
         } else {
@@ -271,26 +290,16 @@ pub fn magnetic_tick(ctx: &ReducerContext, args: MagneticAction) -> Result<(), S
         return Ok(());
     }
 
-    // Regular tick: one pull attempt. If a card was successfully
-    // pulled, persist the updated pulled_cards into the row so the
-    // next tick sees the new fill count.
-    if args.pulled_cards.len() < needed {
-        if let Some(entity) = entity_at_pull_index(success_recipe, args.pulled_cards.len()) {
-            if let Some(c) = find_match(ctx, &args, entity)? {
-                magnetize(ctx, c, &args, args.pulled_cards.len(), direction)?;
-                args.pulled_cards.push(c);
-                ctx.db
-                    .magnetic_actions()
-                    .magnetic_id()
-                    .update(args.clone());
-            }
-        }
-    }
-
-    // Early-success: if the last pull just filled the slot list,
-    // commit immediately rather than waiting for `duration_at`.
+    // Regular tick: if filling completed in this tick, commit success
+    // now (skip waiting for `duration_at`). Otherwise persist the new
+    // partial-fill count so subsequent ticks pick up from here.
     if args.pulled_cards.len() == needed && needed > 0 {
         commit_success(ctx, &args, success_recipe, now)?;
+    } else if args.pulled_cards.len() != initial_pulled_count {
+        ctx.db
+            .magnetic_actions()
+            .magnetic_id()
+            .update(args.clone());
     }
 
     Ok(())
@@ -428,15 +437,35 @@ fn find_match(
     Ok(best.map(|(id, _)| id))
 }
 
-/// Magnetize one card onto the anchor as a state-2 OnRoot leaf at
-/// `leaf_index`. Writes are NOW-stamped via `cards::update_with`
-/// (i.e. `write_at(now_secs(ctx))`).
+/// Magnetize one card into the magnetic chain at position `leaf_index`.
+/// Writes are NOW-stamped via `cards::update_with`.
 ///
-/// Per the design doc: pulled cards are LEAVES on the anchor — every
-/// pulled card has `micro_location = anchor_id` and is distinguished by
-/// `leaf_index` in the position field. No daisy-chaining; each pulled
-/// card stacks directly on the anchor regardless of how many came
-/// before it.
+/// Spatial layout mirrors `actions.rs::propose_action`'s chain stitch:
+///
+/// - **First pull (`leaf_index == 0`)** — the chain bottom. Whether the
+///   recipe declares `root` or just relies on `slots[0]` (recipe slot
+///   1, 1-indexed in `reagents` syntax), this is the card that sits
+///   directly on the hex anchor. State = `OnHex`, `micro_location` =
+///   `anchor_card_id`, `micro_zone` packs the anchor's local `(q, r)`
+///   under `StackedState::OnHex`.
+///
+/// - **Subsequent pulls (`leaf_index > 0`)** — daisy-chained above the
+///   previous pull. State = `Slot`, `micro_location` =
+///   `args.pulled_cards[leaf_index - 1]` (parent pointer to the
+///   immediately-preceding pull), `micro_zone` =
+///   `pack_slot_micro_zone(direction)` (direction bit set; position
+///   from root is implicit — walk parent pointers until the chain
+///   bottom). Identical encoding to the `slots[1..]` loop in
+///   `propose_action`.
+///
+/// The role split (root vs slot[0]) is handled at commit time by
+/// `commit_success`'s `pulls_root`-based partition; this function
+/// doesn't need to care because the *spatial* layout is the same in
+/// both cases. The previous design ("all pulls are leaves on the
+/// anchor") was replaced with this chain layout to make recipes like
+/// `strike_success` (root: corpus, slots: [corpus, corpus]) stack
+/// visually as `strike → corpus → corpus → corpus` instead of fanning
+/// the three corpus out as siblings on the strike hex.
 fn magnetize(
     ctx: &ReducerContext,
     card_id: u32,
@@ -450,19 +479,40 @@ fn magnetize(
             args.anchor_card_id
         )
     })?;
-    let leaf_pos: u8 = u8::try_from(leaf_index).map_err(|_| {
-        format!(
-            "magnetic_tick: leaf_index {} overflows u8 — chain depth past 255",
-            leaf_index
+
+    let (new_micro_zone, new_micro_location) = if leaf_index == 0 {
+        // Chain bottom — pin to the hex anchor. Decode anchor's local
+        // `(q, r)` and repack with `OnHex` state. Same shape
+        // `propose_action`'s hex-anchored slots[0] uses.
+        let (q, r, _) = unpack_micro_zone(anchor.micro_zone);
+        (
+            pack_micro_zone(q, r, StackedState::OnHex),
+            args.anchor_card_id,
         )
-    })?;
-    let micro_zone = pack_stack_micro_zone(leaf_pos, direction, StackedState::OnRoot);
+    } else {
+        // Above-the-bottom — state=Slot parent-pointer onto previous
+        // pull. `pack_slot_micro_zone` writes
+        // `[position=0, direction, state=Slot]`; chain position is
+        // implicit (walk parent chain until non-Slot state).
+        let parent_id = args.pulled_cards[leaf_index - 1];
+        (pack_slot_micro_zone(direction), parent_id)
+    };
+
     cards::update_with(ctx, card_id, |c| {
-        c.micro_zone = micro_zone;
-        c.micro_location = args.anchor_card_id;
+        c.micro_zone = new_micro_zone;
+        c.micro_location = new_micro_location;
         c.macro_zone = anchor.macro_zone;
         c.surface = anchor.surface;
-        c.flags |= FLAG_POSITION_HOLD | FLAG_DROP_HOLD | FLAG_FORCE_POSITION;
+        // `SLOT_HOLD` here mirrors `propose_action`'s
+        // "every card claimed by an in-flight action carries slot_hold"
+        // rule — pulled cards are slot-claimed by the magnetic action
+        // for the duration of the magnetic phase + inner recipe, so
+        // other action proposals' slot_hold guard rejects them.
+        // Released alongside POSITION_HOLD / DROP_HOLD on commit
+        // (via `PULL_FLAGS_MASK` on failure / anchor-death paths, and
+        // via `action_completion::apply`'s `release_mask` on the
+        // success path).
+        c.flags |= FLAG_POSITION_HOLD | FLAG_DROP_HOLD | FLAG_SLOT_HOLD | FLAG_FORCE_POSITION;
     });
     Ok(())
 }
@@ -470,7 +520,7 @@ fn magnetize(
 /// Mask of pull-side flags magnetize sets on pulled cards. Cleared (or
 /// partially cleared) on commit.
 const PULL_FLAGS_MASK: u32 =
-    FLAG_POSITION_HOLD | FLAG_DROP_HOLD | FLAG_FORCE_POSITION;
+    FLAG_POSITION_HOLD | FLAG_DROP_HOLD | FLAG_SLOT_HOLD | FLAG_FORCE_POSITION;
 
 /// Commit the magnetic action's **success** path:
 ///
@@ -478,9 +528,11 @@ const PULL_FLAGS_MASK: u32 =
 ///    `commit_at = now + delay_secs`: clear `FLAG_FORCE_POSITION` (the
 ///    chain is now stable, no more force-position semantics needed) and
 ///    OR in the inner success recipe's `set_start.slot` bits. Keep
-///    `FLAG_POSITION_HOLD` / `FLAG_DROP_HOLD` — the inner recipe is
-///    about to claim the cards anyway and we don't want a flicker
-///    between magnetic release and inner set_start.
+///    `FLAG_POSITION_HOLD` / `FLAG_DROP_HOLD` / `FLAG_SLOT_HOLD` — the
+///    inner recipe is about to claim the cards anyway and we don't
+///    want a flicker between magnetic release and inner set_start.
+///    `action_completion::apply` will clear all three holds on the
+///    inner recipe's completion row via its `release_mask`.
 /// 2. Hand off to `action_completion::apply` for the inner success
 ///    recipe at `commit_at + inner.duration`, passing the anchor as
 ///    `hex`, `root = 0`, and the pulled cards as `slots`.
@@ -492,26 +544,49 @@ fn commit_success(
     success_recipe: &RecipeDef,
     now: u32,
 ) -> Result<(), String> {
-    let commit_at = now.saturating_add(args.delay_secs);
-    let set_start_root = success_recipe.set_start.root as u32;
-    let set_start_slot = success_recipe.set_start.slot as u32;
+    // No delay on the success path — by the time we get here the
+    // server has already written every pull row (visible to the
+    // client as the chain assembled) and the conditions to start the
+    // inner recipe are met. The previous `now + delay_secs` was a
+    // timing-drift buffer carried over from an earlier user-driven
+    // claim design; server-driven polling has no such race, so the
+    // recipe can start at `now` and the client sees the inner
+    // recipe's progress begin at the same moment the last pull
+    // landed. `delay_secs` is left on the `MagneticAction` row for
+    // now — `commit_failure` still uses it, and removing it is a
+    // schema change worth its own pass.
+    let commit_at = now;
+    let set_start_root = success_recipe.set_start.root;
+    let set_start_slot = success_recipe.set_start.slot;
     let pulls_root = recipe_pulls_root(success_recipe);
 
-    // Per pulled card: drop the pull-side force_position; OR in the
-    // inner success recipe's set_start bits for that card's role
-    // (root vs slot). Preserve POSITION_HOLD / DROP_HOLD on the same
-    // write so the inner recipe's `set_start` lands on a row that
-    // already carries them — no flagless flicker between magnetic
-    // release and inner set_start.
+    // Per pulled card: apply the inner success recipe's set_start
+    // FlagOps for that card's role (root vs slot). Preserve
+    // POSITION_HOLD / DROP_HOLD / SLOT_HOLD / FORCE_POSITION on the
+    // same write so the inner recipe's `set_start` lands on a row
+    // that already carries them — no flagless flicker between
+    // magnetic release and inner set_start.
+    //
+    // FORCE_POSITION specifically must remain set through `commit_at`:
+    // with no `delay_secs` between magnetize and commit, magnetize and
+    // commit write rows at the same `valid_at_time`, and clearing it
+    // here would mean the client never sees a row with force_position
+    // set — its mirror would preserve the pre-magnetize local position
+    // instead of trusting the chain bytes the server wrote. The
+    // consumption path in `action_completion::apply` clears
+    // FORCE_POSITION (and the other holds) at `completion_secs` via
+    // `release_mask`, so cleanup still lands at the natural moment.
+    //
+    // Author's set_start runs *last* so explicit `slot_hold: false`
+    // can override the magnetic-pull slot_hold here.
     for (i, &card_id) in args.pulled_cards.iter().enumerate() {
-        let role_mask = if pulls_root && i == 0 {
+        let role_ops = if pulls_root && i == 0 {
             set_start_root
         } else {
             set_start_slot
         };
         cards::update_with_at(ctx, card_id, commit_at, |c| {
-            c.flags &= !FLAG_FORCE_POSITION;
-            c.flags |= role_mask;
+            c.flags = role_ops.apply(c.flags);
         });
     }
 

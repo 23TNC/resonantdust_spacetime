@@ -13,13 +13,18 @@ use crate::zones::{self, zones as _zones_table};
 // plumbing a runtime resolver. Promote to a content-side helper when
 // the tile set grows.
 //
-// `tree` and `rock` are *tile* variants of forest — not separate
+// `tree` and `rock` are *tile* variants of forest_2 — not separate
 // card rows. The old tile_object-card path used those names for
 // per-hex card spawns; we now express the same scenery as a tile
 // byte, which keeps zone data dense (1 byte per hex) and avoids the
 // per-card overhead for static scenery.
-const TILE_PLAINS: u8 = 1;
-const TILE_FOREST: u8 = 2;
+//
+// `forest_1` and `forest_2` are placeholders for what will become a
+// richer biome palette — `forest_1` is the "outside the noise blob"
+// tile (formerly `plains`) and `forest_2` is the "inside the blob"
+// tile (formerly `forest`). Same byte values, more generic names.
+const TILE_FOREST_1: u8 = 1;
+const TILE_FOREST_2: u8 = 2;
 const TILE_TREE: u8 = 3;
 const TILE_ROCK: u8 = 4;
 
@@ -144,8 +149,8 @@ pub const WORLD_SEED: u64 = 0xF05E_5700_DEAD_BEEF;
 
 /// Biome layer only — what `tile_for` would return *before* the
 /// per-tile variant roll. Pure function of `(global_q, global_r)`
-/// keyed off [`WORLD_SEED`]. Returns one of `TILE_FOREST` (inside a
-/// forest blob) or `TILE_PLAINS` (outside).
+/// keyed off [`WORLD_SEED`]. Returns one of `TILE_FOREST_2` (inside a
+/// forest blob) or `TILE_FOREST_1` (outside).
 ///
 /// Used by `action_completion::apply` to revert a consumed
 /// synthetic-hex tile back to its underlying biome (e.g., a chopped
@@ -157,9 +162,9 @@ pub fn biome_for(global_q: i32, global_r: i32) -> u8 {
     let x = global_q as f32 * FOREST_BASE_SCALE;
     let y = global_r as f32 * FOREST_BASE_SCALE;
     if fbm(x, y, WORLD_SEED) <= FOREST_THRESHOLD {
-        TILE_PLAINS
+        TILE_FOREST_1
     } else {
-        TILE_FOREST
+        TILE_FOREST_2
     }
 }
 
@@ -191,7 +196,7 @@ pub fn tile_for(global_q: i32, global_r: i32, seed: u64) -> u8 {
     let x = global_q as f32 * FOREST_BASE_SCALE;
     let y = global_r as f32 * FOREST_BASE_SCALE;
     if fbm(x, y, seed) <= FOREST_THRESHOLD {
-        return TILE_PLAINS;
+        return TILE_FOREST_1;
     }
     // Inside a forest blob — roll for the scenery variant. Uses a
     // hash channel orthogonal to the biome FBM (different seed
@@ -213,7 +218,7 @@ pub fn tile_for(global_q: i32, global_r: i32, seed: u64) -> u8 {
     } else if bucket < 50 {
         TILE_ROCK
     } else {
-        TILE_FOREST
+        TILE_FOREST_2
     }
 }
 
@@ -232,7 +237,7 @@ pub fn generate_zone_tiles(macro_q: i16, macro_r: i16, seed: u64) -> [u64; 8] {
     let base_r = macro_r as i32 * 8;
     let mut rows = [0u64; 8];
     for r in 0..8u8 {
-        let mut row = [TILE_PLAINS; 8];
+        let mut row = [TILE_FOREST_1; 8];
         for c in 0..8u8 {
             row[c as usize] = tile_for(base_q + c as i32, base_r + r as i32, seed);
         }
@@ -364,7 +369,7 @@ mod tests {
             for r in -20..20 {
                 let t = tile_for(q, r, 7);
                 assert!(
-                    matches!(t, TILE_PLAINS | TILE_FOREST | TILE_TREE | TILE_ROCK),
+                    matches!(t, TILE_FOREST_1 | TILE_FOREST_2 | TILE_TREE | TILE_ROCK),
                     "unexpected tile id {t} at ({q}, {r})"
                 );
             }
@@ -379,7 +384,7 @@ mod tests {
             for byte in row.to_le_bytes() {
                 assert!(matches!(
                     byte,
-                    TILE_PLAINS | TILE_FOREST | TILE_TREE | TILE_ROCK
+                    TILE_FOREST_1 | TILE_FOREST_2 | TILE_TREE | TILE_ROCK
                 ));
             }
         }

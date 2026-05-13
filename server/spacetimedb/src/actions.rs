@@ -672,9 +672,15 @@ pub fn propose_action(
     // via `action_completion::apply`'s `release_mask` (every `*_hold`
     // bit); permanent variants are the `*_locked` flags, which the
     // release_mask doesn't touch.
-    let set_start_root = recipe_def.set_start.root as u32;
-    let set_start_slot = recipe_def.set_start.slot as u32;
-    let set_start_hex = recipe_def.set_start.hex as u32;
+    // `set_start` is `FlagOps` per role — set/clear bitmasks built
+    // from the JSON `"flag": true|false` entries. Each consumer site
+    // below applies them *after* the server defaults so the author's
+    // explicit `false` can release auto-held bits (e.g.,
+    // `set_start.root.slot_hold = false` to drop the auto slot_hold
+    // chain-stitching would otherwise leave on a slot).
+    let set_start_root = recipe_def.set_start.root;
+    let set_start_slot = recipe_def.set_start.slot;
+    let set_start_hex = recipe_def.set_start.hex;
     let with_holds_flags_clear = !(PROGRESS_STYLE_MASK | FLAG_FORCE_POSITION);
 
     // Precompute slots[0]'s spatial anchor. Four cases:
@@ -748,7 +754,7 @@ pub fn propose_action(
         // mirror accepts the server's bytes verbatim.
         cards::update_with(ctx, slots[0], |c| {
             c.flags &= with_holds_flags_clear;
-            c.flags |= FLAG_SLOT_HOLD | set_start_slot;
+            c.flags |= FLAG_SLOT_HOLD;
             if let Some((s, mz_macro, mz_micro, ml)) = actor_anchor {
                 c.surface = s;
                 c.macro_zone = mz_macro;
@@ -756,6 +762,9 @@ pub fn propose_action(
                 c.micro_location = ml;
                 c.flags |= FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
             }
+            // set_start.slot runs last so the author can override the
+            // auto-held bits set above (slot_hold, position_hold).
+            c.flags = set_start_slot.apply(c.flags);
         });
 
         // slots[1..]: state-1 (Slot) parent-pointer chain anchored on
@@ -765,7 +774,8 @@ pub fn propose_action(
             let parent_id = slots[i - 1];
             cards::update_with(ctx, slots[i], |c| {
                 c.flags &= with_holds_flags_clear;
-                c.flags |= FLAG_SLOT_HOLD | FLAG_POSITION_HOLD | FLAG_FORCE_POSITION | set_start_slot;
+                c.flags |= FLAG_SLOT_HOLD | FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
+                c.flags = set_start_slot.apply(c.flags);
                 c.micro_location = parent_id;
                 c.micro_zone = pack_slot_micro_zone(direction);
                 c.macro_zone = macro_zone;
@@ -801,7 +811,6 @@ pub fn propose_action(
         };
         cards::update_with(ctx, root, |c| {
             c.flags &= with_holds_flags_clear;
-            c.flags |= set_start_root;
             if let Some((q, r)) = hex_qr {
                 c.micro_zone = crate::packed::pack_micro_zone(q, r, StackedState::OnHex);
                 c.micro_location = hex;
@@ -809,16 +818,17 @@ pub fn propose_action(
                 c.surface = surface;
                 c.flags |= FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
             }
+            c.flags = set_start_root.apply(c.flags);
         });
     }
 
     // Hex: not otherwise touched by the lock-phase, but if the recipe's
-    // `set_start.hex` carries non-zero bits we OR them onto the hex
-    // card's row. Skipping the write when both `hex == 0` and
-    // `set_start_hex == 0` avoids producing a no-op version row.
-    if hex != 0 && set_start_hex != 0 {
+    // `set_start.hex` carries any non-zero set/clear masks we apply
+    // them to the hex card's row. Skipping the write when both
+    // `hex == 0` and the ops are all-zero avoids a no-op version row.
+    if hex != 0 && (set_start_hex.set_mask != 0 || set_start_hex.clear_mask != 0) {
         cards::update_with(ctx, hex, |c| {
-            c.flags |= set_start_hex;
+            c.flags = set_start_hex.apply(c.flags);
         });
     }
 

@@ -189,16 +189,20 @@ pub fn trigger(
     } else {
         0
     };
-    let set_start_root = recipe.set_start.root as u32;
+    // `set_start.root` is always applied; `set_start.hex` only fires
+    // when the recipe declared a hex entity. Author's set_start runs
+    // *last* so it can override the auto-set holds above (e.g.
+    // `set_start.root.slot_hold = false` releases the auto slot_hold).
+    let set_start_root = recipe.set_start.root;
     let set_start_hex = if recipe.hex.is_some() {
-        recipe.set_start.hex as u32
+        recipe.set_start.hex
     } else {
-        0
+        resonantdust_content::recipe_core::FlagOps::default()
     };
     cards::update_with_at(ctx, card_id, card_secs, |c| {
         c.flags |= FLAG_SLOT_HOLD | position_hold;
-        c.flags |= set_start_root;
-        c.flags |= set_start_hex;
+        c.flags = set_start_root.apply(c.flags);
+        c.flags = set_start_hex.apply(c.flags);
     });
 
     // Per recipe_core's "OnCreate (root == actor)" convention, the new
