@@ -22,8 +22,11 @@ use crate::zones::zones as _zones_table;
 
 // `cards/flags.json` bit positions. Append-only — pinned by the data crate.
 // Typed as u32 to match `Card.flags`.
-const FLAG_POSITION_HOLD: u32 = 1 << 0;
 const FLAG_SLOT_HOLD: u32 = 1 << 5;
+/// Caller-set marker: "movement (and other position-prop) must not
+/// touch this row's spatial fields." Stamped on chain-stitch / hex-pin
+/// writes here so a queued move_soul can't yank a card mid-recipe.
+const FLAG_POSITION_PRESERVE: u32 = 1 << 14;
 // Surfaces ≥ this are world-layer; below is inventory-ish. Mirrored from
 // `action_completion::WORLD_LAYER` so both modules agree on the boundary
 // that distinguishes "rect sits on a hex tile in the world" from
@@ -682,6 +685,13 @@ pub fn propose_action(
     let set_start_slot = recipe_def.set_start.slot;
     let set_start_hex = recipe_def.set_start.hex;
     let with_holds_flags_clear = !(PROGRESS_STYLE_MASK | FLAG_FORCE_POSITION);
+    // Reducer-call timestamp, captured once. Used by both the chain-
+    // stitch position-hold forward-propagation below and the
+    // `completion_ms` calculation further down. `cards::now_ms` is
+    // ctx-timestamp-based so multiple calls within the same reducer
+    // return the same value; precomputing just makes the dataflow
+    // explicit.
+    let start_ms = crate::cards::now_ms(ctx);
 
     // Precompute slots[0]'s spatial anchor. Four cases:
     //   1. `root != 0`                        → state-2 OnRoot pin onto
@@ -750,8 +760,9 @@ pub fn propose_action(
     if !slots.is_empty() {
         // slots[0] (actor): always gets slot_hold. Spatial fields when
         // `actor_anchor` is `Some` (the three anchored cases above) —
-        // also sets position_hold + force_position so the client
-        // mirror accepts the server's bytes verbatim.
+        // also bumps position_hold_count + force_position so the
+        // client mirror accepts the server's bytes verbatim.
+        let actor_takes_position_hold = actor_anchor.is_some();
         cards::update_with(ctx, slots[0], |c| {
             c.flags &= with_holds_flags_clear;
             c.flags |= FLAG_SLOT_HOLD;
@@ -760,27 +771,45 @@ pub fn propose_action(
                 c.macro_zone = mz_macro;
                 c.micro_zone = mz_micro;
                 c.micro_location = ml;
-                c.flags |= FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
+                // `position_preserve` only when we actually pinned a
+                // position. Rootless inventory actions (actor_anchor =
+                // None) leave the card where the player put it, so a
+                // later move_soul is free to re-home it.
+                c.flags = cards::increment_position_hold_count(c.flags)
+                    | FLAG_FORCE_POSITION
+                    | FLAG_POSITION_PRESERVE;
             }
             // set_start.slot runs last so the author can override the
             // auto-held bits set above (slot_hold, position_hold).
             c.flags = set_start_slot.apply(c.flags);
         });
+        if actor_takes_position_hold {
+            // Forward-prop the count delta we just applied to any
+            // future rows of this card (release rows queued by other
+            // in-flight actions on the same card, etc.).
+            cards::propagate_position_hold_forward(ctx, slots[0], start_ms, true);
+        }
 
         // slots[1..]: state-1 (Slot) parent-pointer chain anchored on
         // slots[0]. Each slot's microLocation is its immediate
-        // predecessor. Direction is stored explicitly.
+        // predecessor. Direction is stored explicitly. Always
+        // `position_preserve` — these slots' positions are entirely
+        // derived from the chain and movement must not reposition them.
         for i in 1..slots.len() {
             let parent_id = slots[i - 1];
             cards::update_with(ctx, slots[i], |c| {
                 c.flags &= with_holds_flags_clear;
-                c.flags |= FLAG_SLOT_HOLD | FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
+                c.flags = cards::increment_position_hold_count(c.flags)
+                    | FLAG_SLOT_HOLD
+                    | FLAG_FORCE_POSITION
+                    | FLAG_POSITION_PRESERVE;
                 c.flags = set_start_slot.apply(c.flags);
                 c.micro_location = parent_id;
                 c.micro_zone = pack_slot_micro_zone(direction);
                 c.macro_zone = macro_zone;
                 c.surface = surface;
             });
+            cards::propagate_position_hold_forward(ctx, slots[i], start_ms, true);
         }
     }
 
@@ -809,6 +838,7 @@ pub fn propose_action(
         } else {
             None
         };
+        let root_takes_position_hold = hex_qr.is_some();
         cards::update_with(ctx, root, |c| {
             c.flags &= with_holds_flags_clear;
             if let Some((q, r)) = hex_qr {
@@ -816,10 +846,17 @@ pub fn propose_action(
                 c.micro_location = hex;
                 c.macro_zone = macro_zone;
                 c.surface = surface;
-                c.flags |= FLAG_POSITION_HOLD | FLAG_FORCE_POSITION;
+                // Pinned onto the hex tile — `position_preserve` so
+                // movement can't yank the root off the hex mid-action.
+                c.flags = cards::increment_position_hold_count(c.flags)
+                    | FLAG_FORCE_POSITION
+                    | FLAG_POSITION_PRESERVE;
             }
             c.flags = set_start_root.apply(c.flags);
         });
+        if root_takes_position_hold {
+            cards::propagate_position_hold_forward(ctx, root, start_ms, true);
+        }
     }
 
     // Hex: not otherwise touched by the lock-phase, but if the recipe's
@@ -877,8 +914,10 @@ pub fn propose_action(
         }
         None => return Err(format!("recipe {recipe_id}: missing duration")),
     };
-    let start_secs = (ctx.timestamp.to_micros_since_unix_epoch() / 1_000_000) as u32;
-    let completion_secs = start_secs.saturating_add(duration_secs);
+    // `start_ms` was precomputed at the top of the lock-phase. Recipe
+    // `duration` is authored in whole seconds (JSON int); convert to
+    // ms for the time-budget arithmetic everywhere downstream.
+    let completion_ms = start_ms.saturating_add((duration_secs as u64) * 1_000);
 
     // Capture the caller's player_id for ProductOwner::Action
     // resolution. Falling back to 0 if the caller has no session keeps
@@ -886,15 +925,55 @@ pub fn propose_action(
     // with owner_id=0 in that pathological case.
     let caller_player_id = players::resolve_caller(ctx).unwrap_or(0);
 
+    // Resolve `has` / `reagents.has` predicates against the soul
+    // stacks of the root's owner and the actor's owner. Empty
+    // `HasMatches` when the recipe declares no has-predicates.
+    //
+    // Owner resolution mirrors `action_completion::apply`'s actor
+    // pick: actor is `slots[0]` if slots exist, else root, else hex.
+    // The owners of those cards are what `has.root` / `has.actor`
+    // checks against — both are resolved from the cards table here.
+    let root_owner = if root != 0 {
+        cards::latest(ctx, root).map(|c| c.owner_id).unwrap_or(0)
+    } else {
+        0
+    };
+    let actor_id_for_has = if !slots.is_empty() {
+        slots[0]
+    } else if root != 0 {
+        root
+    } else {
+        hex
+    };
+    let actor_owner = if actor_id_for_has != 0 {
+        cards::latest(ctx, actor_id_for_has)
+            .map(|c| c.owner_id)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let has_matches = crate::recipe_eval::resolve_has(
+        ctx,
+        &recipe_def.id,
+        &recipe_def.has,
+        &recipe_def.reagents.has,
+        &recipe_def.has_below,
+        &recipe_def.reagents.has_below,
+        root_owner,
+        actor_owner,
+        start_ms,
+    )?;
+
     action_completion::apply(
         ctx,
         recipe_def,
         hex,
         root,
         &slots,
-        completion_secs,
+        completion_ms,
         caller_player_id,
         hex_location,
+        has_matches,
     )?;
 
     Ok(())

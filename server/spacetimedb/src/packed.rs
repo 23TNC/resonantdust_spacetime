@@ -75,21 +75,32 @@ impl StackedState {
 }
 
 // ---- valid_at ----------------------------------------------------------
+//
+// PK layout: `(time_ms_u48 << 16) | sequence_u16`.
+//
+// - High 48 bits: milliseconds since Unix epoch. u48 ms ≈ 8920 years
+//   of runway from epoch (covers our lifetime trivially). PK ordering
+//   is chronological — a btree scan walks rows in time order, useful
+//   for any range queries that need it (though most callers go via
+//   `card_id` btree index, where the explicit `max_by_key` ordering
+//   is what's load-bearing).
+// - Low 16 bits: global sequence number from `sequence::next_sequence`,
+//   refreshed per write. Disambiguates two writes that share a
+//   millisecond — within one module, even thousands of same-ms writes
+//   sit far below the 65k wrap budget. Cross-shard collisions don't
+//   exist because shards' PK spaces don't overlap (each shard owns
+//   its own rows entirely).
+//
+// The card_id portion that previously occupied the high 32 bits is
+// gone — every row already carries `card_id` as a column, and the
+// PK never needed to encode it for anything beyond uniqueness.
 
-pub fn pack_valid_at(card_id: u32, time_secs: u32) -> u64 {
-    ((card_id as u64) << 32) | (time_secs as u64)
+pub fn pack_valid_at(time_ms: u64, sequence: u16) -> u64 {
+    (time_ms << 16) | (sequence as u64)
 }
 
-pub fn unpack_valid_at(v: u64) -> (u32, u32) {
-    ((v >> 32) as u32, v as u32)
-}
-
-pub fn valid_at_card_id(v: u64) -> u32 {
-    (v >> 32) as u32
-}
-
-pub fn valid_at_time(v: u64) -> u32 {
-    v as u32
+pub fn valid_at_time(v: u64) -> u64 {
+    v >> 16
 }
 
 // ---- macro_zone --------------------------------------------------------
@@ -285,10 +296,12 @@ mod tests {
 
     #[test]
     fn valid_at_roundtrip() {
-        let v = pack_valid_at(0xDEAD_BEEF, 0x1234_5678);
-        assert_eq!(unpack_valid_at(v), (0xDEAD_BEEF, 0x1234_5678));
-        assert_eq!(valid_at_card_id(v), 0xDEAD_BEEF);
-        assert_eq!(valid_at_time(v), 0x1234_5678);
+        // Time in u48 ms, sequence in u16. `valid_at_time` recovers
+        // the time portion; the sequence is opaque (only its
+        // uniqueness matters for PK).
+        let v = pack_valid_at(0x0000_DEAD_BEEF_1234, 0x5678);
+        assert_eq!(valid_at_time(v), 0x0000_DEAD_BEEF_1234);
+        assert_eq!(v & 0xFFFF, 0x5678);
     }
 
     #[test]

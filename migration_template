@@ -1,0 +1,45 @@
+## Migration: cards -> cards_v2
+
+### Goal
+Add `valid_at` and `flags` without losing existing card rows.
+
+### Old table
+cards:
+- id: u32
+- definition: u16
+- soul_id: u32
+- zone: u32
+- position: u8
+
+### New table
+cards_v2:
+- id: u32
+- definition: u16
+- soul_id: u32
+- zone: u32
+- position: u8
+- valid_at: u32
+- flags: u64
+
+### Compatibility
+Reducers read `cards_v2` first, then fall back to `cards`.
+
+### Backfill rule
+When old row is touched:
+
+- copy old fields
+- set `valid_at = 0`
+- set `flags = 0`
+- insert into `cards_v2`
+
+### Client transition
+Client subscribes to both during migration, then only `cards_v2`.
+
+### Completion condition
+All active `cards` rows exist in `cards_v2`.
+
+### Cleanup
+After one stable release:
+- remove fallback reads
+- remove old `cards` subscriptions
+- later remove old `cards` table

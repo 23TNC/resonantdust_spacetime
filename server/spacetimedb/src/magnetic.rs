@@ -11,7 +11,7 @@ use crate::action_completion;
 // other consumer here).
 use crate::cards::{self, cards as _cards_table};
 use crate::packed::{
-    pack_micro_zone, pack_slot_micro_zone, pack_valid_at, unpack_micro_zone,
+    pack_micro_zone, pack_slot_micro_zone, unpack_micro_zone,
     valid_at_time, StackedState, STACK_DIR_DOWN, STACK_DIR_UP,
 };
 
@@ -31,7 +31,10 @@ use resonantdust_content::definition_core::decode_definition;
 // Kept local rather than promoted to a shared module — that's a project-
 // wide cleanup the codebase hasn't done yet, and copying the few bits we
 // need here doesn't justify the refactor on its own.
-const FLAG_POSITION_HOLD: u32 = 1 << 0;
+/// Caller-set marker: position must not be touched by movement /
+/// teleport / push. Magnetic-pulled cards carry this so a queued
+/// move_soul can't yank them off the anchor mid-recipe.
+const FLAG_POSITION_PRESERVE: u32 = 1 << 14;
 const FLAG_DROP_HOLD: u32 = 1 << 3;
 const FLAG_SLOT_HOLD: u32 = 1 << 5;
 const FLAG_DEAD: u32 = 1 << 7;
@@ -60,15 +63,15 @@ pub struct MagneticAction {
     pub outer_recipe_id: u16,
     pub success_recipe_id: u16,
     pub failure_recipe_id: u16,
-    /// Wall-clock second the magnetic phase deadlines at — install time
-    /// plus `outer.duration`. Once a tick fires at or past this, the
-    /// final-attempt branch runs.
-    pub duration_at: u32,
-    /// Seconds added between commit decision and inner-recipe start.
+    /// Wall-clock milliseconds the magnetic phase deadlines at — install
+    /// time plus `outer.duration`. Once a tick fires at or past this,
+    /// the final-attempt branch runs.
+    pub duration_at: u64,
+    /// Milliseconds added between commit decision and inner-recipe start.
     /// Snapshotted from the recipe at install so an in-flight tick
     /// doesn't change behaviour mid-cycle if the value is ever made
     /// per-recipe.
-    pub delay_secs: u32,
+    pub delay_ms: u64,
     /// The player whose inventory we poll for matching cards, and the
     /// fallback owner for products that resolve as `ProductOwner::Action`.
     pub caller_player_id: u32,
@@ -138,19 +141,20 @@ pub fn install(
     let anchor = cards::latest(ctx, anchor_card_id).ok_or_else(|| {
         format!("magnetic::install: anchor card_id={anchor_card_id} not found")
     })?;
-    let installed_secs = valid_at_time(anchor.valid_at);
-    let duration_at = installed_secs.saturating_add(duration_secs);
+    let installed_ms = valid_at_time(anchor.valid_at);
+    // Recipe `duration` in JSON is seconds; convert to ms.
+    let duration_at = installed_ms.saturating_add((duration_secs as u64) * 1_000);
 
     // Apply `set_start.hex` (FlagOps: set + clear masks) plus auto-OR
     // `FLAG_MAGNETIC_HOLD` onto the anchor at install time. Stamped at
-    // `installed_secs` (== anchor.valid_at_time) so the holds land on
+    // `installed_ms` (== anchor.valid_at_time) so the holds land on
     // the anchor's first visible row via `write_at`'s find/delete/insert
     // pattern — no flagless flicker for the client. The auto magnetic
     // hold is OR'd *after* set_start so an author can't accidentally
     // clear it via `set_start.hex.magnetic_hold = false` (not currently
     // a parseable flag anyway, but the policy is explicit).
     let set_start_hex = recipe_def.set_start.hex;
-    cards::update_with_at(ctx, anchor_card_id, installed_secs, |c| {
+    cards::update_with_at(ctx, anchor_card_id, installed_ms, |c| {
         c.flags = set_start_hex.apply(c.flags) | FLAG_MAGNETIC_HOLD;
     });
 
@@ -185,7 +189,7 @@ pub fn install(
         // on the same second). Use a positive value when the recipe
         // wants a timing-drift buffer between the release/with-holds
         // rows and the inner's set_start.
-        delay_secs: recipe_def.delay.unwrap_or(0),
+        delay_ms: (recipe_def.delay.unwrap_or(0) as u64) * 1_000,
         caller_player_id,
         pulled_cards: Vec::new(),
     });
@@ -230,10 +234,7 @@ pub fn magnetic_tick(ctx: &ReducerContext, args: MagneticAction) -> Result<(), S
         // the row was reaped), then delete this magnetic action so
         // the scheduler stops firing.
         release_pulled_to_inventory(ctx, &args.pulled_cards);
-        ctx.db
-            .cards()
-            .valid_at()
-            .delete(pack_valid_at(args.anchor_card_id, args.duration_at));
+        cards::delete_at(ctx, args.anchor_card_id, args.duration_at);
         ctx.db
             .magnetic_actions()
             .magnetic_id()
@@ -251,7 +252,7 @@ pub fn magnetic_tick(ctx: &ReducerContext, args: MagneticAction) -> Result<(), S
         })?;
     let direction = magnetic_direction(success_recipe)?;
     let needed = needed_count(success_recipe);
-    let now = now_secs(ctx);
+    let now = now_ms(ctx);
 
     let mut args = args;
 
@@ -309,11 +310,11 @@ pub fn magnetic_tick(ctx: &ReducerContext, args: MagneticAction) -> Result<(), S
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Wall-clock now in unix seconds (u32). Mirrors the same conversion
-/// used everywhere else server-side (`cards::now_secs`, `actions.rs`'s
-/// `start_secs` derivation).
-fn now_secs(ctx: &ReducerContext) -> u32 {
-    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000_000) as u32
+/// Wall-clock now in unix milliseconds (u64). Mirrors the same
+/// conversion used everywhere else server-side (`cards::now_ms`,
+/// `actions.rs`'s `start_ms` derivation).
+fn now_ms(ctx: &ReducerContext) -> u64 {
+    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000) as u64
 }
 
 /// Map a magnetic inner recipe's `RecipeType::Magnetic(Up|Down)` to the
@@ -377,20 +378,20 @@ fn recipe_pulls_root(recipe: &RecipeDef) -> bool {
 /// `magnetic_hold` / `dead`, and its definition must satisfy the
 /// entity with non-zero specificity.
 ///
-/// Walks `ctx.db.cards().iter()` — the cards table doesn't currently
-/// btree-index `owner_id` (see the comment on `players::delete_player`),
-/// so this is an O(N) scan over all version rows. Dedupes per-card via
-/// `cards::latest`. Fine while the table is small; if it becomes hot,
-/// add the index and switch to `cards().owner_id().filter(...)`.
+/// Uses the `owner_id` btree index — only this player's version rows
+/// are walked, not the whole cards table. Per-card_id dedupe happens
+/// via the `BTreeSet` (which also de-duplicates against `cards::latest`
+/// returning the same row for multiple history versions).
 fn find_match(
     ctx: &ReducerContext,
     args: &MagneticAction,
     entity: &Entity,
 ) -> Result<Option<u32>, String> {
-    // Enumerate distinct card_ids once, then ask `cards::latest` for
-    // each — version-row dedupe happens implicitly via the BTreeSet.
+    // Enumerate distinct card_ids for this owner once via the
+    // btree index — version-row dedupe happens implicitly via the
+    // BTreeSet.
     let mut card_ids: BTreeSet<u32> = BTreeSet::new();
-    for c in ctx.db.cards().iter() {
+    for c in ctx.db.cards().owner_id().filter(args.caller_player_id) {
         card_ids.insert(c.card_id);
     }
 
@@ -408,6 +409,9 @@ fn find_match(
             Some(c) => c,
             None => continue,
         };
+        // Owner check is technically redundant (index already filtered)
+        // but cheap and defensive — `latest` returns the row at <= now,
+        // which could in theory differ from the indexed version row.
         if card.owner_id != args.caller_player_id {
             continue;
         }
@@ -508,19 +512,29 @@ fn magnetize(
         // rule — pulled cards are slot-claimed by the magnetic action
         // for the duration of the magnetic phase + inner recipe, so
         // other action proposals' slot_hold guard rejects them.
-        // Released alongside POSITION_HOLD / DROP_HOLD on commit
-        // (via `PULL_FLAGS_MASK` on failure / anchor-death paths, and
-        // via `action_completion::apply`'s `release_mask` on the
-        // success path).
-        c.flags |= FLAG_POSITION_HOLD | FLAG_DROP_HOLD | FLAG_SLOT_HOLD | FLAG_FORCE_POSITION;
+        // Released alongside DROP_HOLD on commit (via
+        // `PULL_FLAGS_MASK`); the count-driven position-hold release
+        // happens via `cards::release_position_hold` on the same paths.
+        c.flags = cards::increment_position_hold_count(c.flags)
+            | FLAG_DROP_HOLD
+            | FLAG_SLOT_HOLD
+            | FLAG_FORCE_POSITION
+            | FLAG_POSITION_PRESERVE;
     });
+    cards::propagate_position_hold_forward(ctx, card_id, now_ms(ctx), true);
     Ok(())
 }
 
-/// Mask of pull-side flags magnetize sets on pulled cards. Cleared (or
-/// partially cleared) on commit.
-const PULL_FLAGS_MASK: u32 =
-    FLAG_POSITION_HOLD | FLAG_DROP_HOLD | FLAG_SLOT_HOLD | FLAG_FORCE_POSITION;
+/// Mask of pull-side NON-counted flags magnetize sets on pulled cards.
+/// `position_hold` is intentionally absent — it's ref-counted via the
+/// `position_hold_count` field, so cleanup paths decrement via
+/// `cards::decrement_position_hold_count` (inline) and
+/// `cards::propagate_position_hold_forward(..., false)` (carries the
+/// -1 to any rows past the release time).
+const PULL_FLAGS_MASK: u32 = FLAG_DROP_HOLD
+    | FLAG_SLOT_HOLD
+    | FLAG_FORCE_POSITION
+    | FLAG_POSITION_PRESERVE;
 
 /// Commit the magnetic action's **success** path:
 ///
@@ -542,7 +556,7 @@ fn commit_success(
     ctx: &ReducerContext,
     args: &MagneticAction,
     success_recipe: &RecipeDef,
-    now: u32,
+    now: u64,
 ) -> Result<(), String> {
     // No delay on the success path — by the time we get here the
     // server has already written every pull row (visible to the
@@ -607,17 +621,48 @@ fn commit_success(
     // reagent) inherits the already-cleared magnetic flag.
     end_magnetic_phase(ctx, args.anchor_card_id, args.duration_at);
 
-    let inner_duration = inner_duration_secs(success_recipe)?;
-    let completion_secs = commit_at.saturating_add(inner_duration);
+    let inner_duration_secs = inner_duration_secs(success_recipe)?;
+    let completion_ms = commit_at.saturating_add((inner_duration_secs as u64) * 1_000);
+
+    // Resolve has-predicates against the relevant owners' soul
+    // stacks. Empty for inner recipes that don't declare has.
+    let root_owner = if root_id != 0 {
+        cards::latest(ctx, root_id).map(|c| c.owner_id).unwrap_or(0)
+    } else {
+        args.caller_player_id
+    };
+    let actor_for_has = if !slots_for_apply.is_empty() {
+        slots_for_apply[0]
+    } else if root_id != 0 {
+        root_id
+    } else {
+        args.anchor_card_id
+    };
+    let actor_owner = cards::latest(ctx, actor_for_has)
+        .map(|c| c.owner_id)
+        .unwrap_or(0);
+    let has_matches = crate::recipe_eval::resolve_has(
+        ctx,
+        &success_recipe.id,
+        &success_recipe.has,
+        &success_recipe.reagents.has,
+        &success_recipe.has_below,
+        &success_recipe.reagents.has_below,
+        root_owner,
+        actor_owner,
+        commit_at,
+    )?;
+
     action_completion::apply(
         ctx,
         success_recipe,
         /* hex          */ args.anchor_card_id,
         /* root         */ root_id,
         /* slots        */ slots_for_apply,
-        completion_secs,
+        completion_ms,
         args.caller_player_id,
         /* hex_location */ None,
+        has_matches,
     )?;
 
     ctx.db
@@ -641,9 +686,9 @@ fn commit_success(
 fn commit_failure(
     ctx: &ReducerContext,
     args: &MagneticAction,
-    now: u32,
+    now: u64,
 ) -> Result<(), String> {
-    let commit_at = now.saturating_add(args.delay_secs);
+    let commit_at = now.saturating_add(args.delay_ms);
 
     let failure_recipe = recipe(args.failure_recipe_id)
         .map_err(|e| format!("magnetic_tick: failure recipe lookup: {e}"))?
@@ -658,23 +703,47 @@ fn commit_failure(
     for &card_id in &args.pulled_cards {
         cards::update_with_at(ctx, card_id, commit_at, |c| {
             c.flags &= release_mask;
+            // `position_hold` is ref-counted — decrement this action's
+            // contribution inline; forward-prop below carries the -1
+            // onto any rows past `commit_at`.
+            c.flags = cards::decrement_position_hold_count(c.flags);
         });
+        cards::propagate_position_hold_forward(ctx, card_id, commit_at, false);
     }
 
     // Same magnetic-phase teardown as `commit_success`.
     end_magnetic_phase(ctx, args.anchor_card_id, args.duration_at);
 
-    let inner_duration = inner_duration_secs(failure_recipe)?;
-    let completion_secs = commit_at.saturating_add(inner_duration);
+    let inner_duration_secs = inner_duration_secs(failure_recipe)?;
+    let completion_ms = commit_at.saturating_add((inner_duration_secs as u64) * 1_000);
+
+    // Failure path: only the anchor participates, no root, no slots.
+    // Resolve has-predicates against the anchor's owner.
+    let anchor_owner = cards::latest(ctx, args.anchor_card_id)
+        .map(|c| c.owner_id)
+        .unwrap_or(0);
+    let has_matches = crate::recipe_eval::resolve_has(
+        ctx,
+        &failure_recipe.id,
+        &failure_recipe.has,
+        &failure_recipe.reagents.has,
+        &failure_recipe.has_below,
+        &failure_recipe.reagents.has_below,
+        /* root_owner */ 0,
+        /* actor_owner */ anchor_owner,
+        commit_at,
+    )?;
+
     action_completion::apply(
         ctx,
         failure_recipe,
         /* hex          */ args.anchor_card_id,
         /* root         */ 0,
         /* slots        */ &[],
-        completion_secs,
+        completion_ms,
         args.caller_player_id,
         /* hex_location */ None,
+        has_matches,
     )?;
 
     ctx.db
@@ -695,9 +764,8 @@ fn commit_failure(
 /// an already-clear flag is a no-op. Safe to call even when no
 /// `duration_at` row was ever written (e.g. install was somehow
 /// skipped).
-fn end_magnetic_phase(ctx: &ReducerContext, anchor_id: u32, duration_at: u32) {
-    let duration_at_key = pack_valid_at(anchor_id, duration_at);
-    ctx.db.cards().valid_at().delete(duration_at_key);
+fn end_magnetic_phase(ctx: &ReducerContext, anchor_id: u32, duration_at: u64) {
+    cards::delete_at(ctx, anchor_id, duration_at);
     cards::update_with(ctx, anchor_id, |c| {
         c.flags &= !FLAG_MAGNETIC_HOLD;
     });
@@ -710,9 +778,14 @@ fn end_magnetic_phase(ctx: &ReducerContext, anchor_id: u32, duration_at: u32) {
 /// it could commit.
 fn release_pulled_to_inventory(ctx: &ReducerContext, pulled_cards: &[u32]) {
     let release_mask = !(PULL_FLAGS_MASK | FLAG_MAGNETIC_HOLD);
+    let now = now_ms(ctx);
     for &card_id in pulled_cards {
         cards::update_with(ctx, card_id, |c| {
             c.flags &= release_mask;
+            // `position_hold` is ref-counted — decrement this pull's
+            // contribution inline; forward-prop below carries the -1
+            // onto any rows past `now`.
+            c.flags = cards::decrement_position_hold_count(c.flags);
             // Reset to inventory-loose: macro_zone = ownerId,
             // surface = 1, micro_zone = state-0 LOOSE, micro_location
             // = 0 (client's mirror loose-preserve gate will keep
@@ -724,6 +797,7 @@ fn release_pulled_to_inventory(ctx: &ReducerContext, pulled_cards: &[u32]) {
             c.micro_zone = 0;
             c.micro_location = 0;
         });
+        cards::propagate_position_hold_forward(ctx, card_id, now, false);
     }
 }
 

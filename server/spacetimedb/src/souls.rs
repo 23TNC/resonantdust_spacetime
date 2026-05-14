@@ -6,6 +6,7 @@ use spacetimedb::{table, ReducerContext, Table};
 
 use crate::cards::Card;
 use crate::packed::{pack_valid_at, valid_at_time};
+use crate::sequence;
 
 // Bit positions we read off `Card.flags`. Kept local to mirror the
 // pattern used elsewhere (action_completion, magnetic, etc.) — promote
@@ -35,11 +36,10 @@ const FLAG_DEAD: u32 = 1 << 7;
 #[table(accessor = souls, public)]
 #[derive(Debug, Clone)]
 pub struct Soul {
-    /// Packed primary key — `[card_id: u32 | time_secs: u32]`. Same
+    /// Packed primary key — `[time_ms: u48 | seq: u16]`. Same
     /// history-row pattern `cards` / `players` / `zones` use. The
-    /// `card_id` half is the soul *card*'s id (i.e., the human-soul
-    /// card row this Soul mirrors); the row with the largest
-    /// `valid_at_time` is the active state.
+    /// `card_id` is on the row column (see below); the row with the
+    /// largest `valid_at_time` is the active state.
     #[primary_key]
     pub valid_at: u64,
     #[index(btree)]
@@ -93,8 +93,8 @@ pub fn quad_set(v: u32, byte_index: u8, byte: u8) -> u32 {
 
 // ---- CRUD ----------------------------------------------------------
 
-fn now_secs(ctx: &ReducerContext) -> u32 {
-    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000_000) as u32
+fn now_ms(ctx: &ReducerContext) -> u64 {
+    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000) as u64
 }
 
 pub fn latest(ctx: &ReducerContext, card_id: u32) -> Option<Soul> {
@@ -106,14 +106,29 @@ pub fn latest(ctx: &ReducerContext, card_id: u32) -> Option<Soul> {
 }
 
 fn write(ctx: &ReducerContext, soul: Soul) -> Soul {
-    write_at(ctx, soul, now_secs(ctx))
+    write_at(ctx, soul, now_ms(ctx))
 }
 
-fn write_at(ctx: &ReducerContext, mut soul: Soul, time_secs: u32) -> Soul {
-    soul.valid_at = pack_valid_at(soul.card_id, time_secs);
-    if ctx.db.souls().valid_at().find(soul.valid_at).is_some() {
-        ctx.db.souls().valid_at().delete(soul.valid_at);
+fn write_at(ctx: &ReducerContext, mut soul: Soul, time_ms: u64) -> Soul {
+    // "Last write at this (card_id, time_ms) wins." The new sequence-
+    // bearing PK is unique per write, so without this purge an
+    // in-reducer accumulator like `apply_slot_delta` firing 3 times
+    // at `now_ms` (bootstrap's 3-corpus path) would leave 3 distinct
+    // soul rows at the same time, each with a different stats value,
+    // and `latest()` would pick whichever max_by_key returns on ties
+    // — non-deterministic and almost always wrong.
+    let stale: Vec<u64> = ctx
+        .db
+        .souls()
+        .card_id()
+        .filter(soul.card_id)
+        .filter(|s| valid_at_time(s.valid_at) == time_ms)
+        .map(|s| s.valid_at)
+        .collect();
+    for v in stale {
+        ctx.db.souls().valid_at().delete(v);
     }
+    soul.valid_at = pack_valid_at(time_ms, sequence::next_sequence(ctx));
     ctx.db.souls().insert(soul)
 }
 
@@ -130,7 +145,7 @@ where
 pub fn update_with_at<F>(
     ctx: &ReducerContext,
     card_id: u32,
-    time_secs: u32,
+    time_ms: u64,
     f: F,
 ) -> Option<Soul>
 where
@@ -138,7 +153,7 @@ where
 {
     let mut s = latest(ctx, card_id)?;
     f(&mut s);
-    Some(write_at(ctx, s, time_secs))
+    Some(write_at(ctx, s, time_ms))
 }
 
 // ---- stat-slot mapping ---------------------------------------------
@@ -254,10 +269,10 @@ pub fn on_card_write(
     ctx: &ReducerContext,
     prev_latest: Option<&Card>,
     new_card: &Card,
-    time_secs: u32,
+    time_ms: u64,
 ) {
     // (1) Identity sync. Only fires when the written card is a soul
-    // card. Reads the *prior* soul row (max valid_at_time ≤ time_secs)
+    // card. Reads the *prior* soul row (max valid_at_time ≤ time_ms)
     // for the same reason `apply_slot_delta` does — out-of-order
     // writes within a reducer (e.g., movement followed by an earlier-
     // stamped action completion) must not contaminate older rows
@@ -276,7 +291,7 @@ pub fn on_card_write(
             .souls()
             .card_id()
             .filter(new_card.card_id)
-            .filter(|s| valid_at_time(s.valid_at) <= time_secs)
+            .filter(|s| valid_at_time(s.valid_at) <= time_ms)
             .max_by_key(|s| valid_at_time(s.valid_at));
         match prior {
             Some(mut s) => {
@@ -285,7 +300,7 @@ pub fn on_card_write(
                 s.macro_zone = new_card.macro_zone;
                 s.micro_zone = new_card.micro_zone;
                 s.micro_location = new_card.micro_location;
-                write_at(ctx, s, time_secs);
+                write_at(ctx, s, time_ms);
             }
             None => {
                 write_at(
@@ -302,7 +317,7 @@ pub fn on_card_write(
                         fatigued: 0,
                         injured: 0,
                     },
-                    time_secs,
+                    time_ms,
                 );
             }
         }
@@ -319,11 +334,11 @@ pub fn on_card_write(
             // Same owner + same slot — no stat change.
         }
         (Some(p), Some(n)) => {
-            apply_slot_delta(ctx, p.0, p.1, -1, time_secs);
-            apply_slot_delta(ctx, n.0, n.1, 1, time_secs);
+            apply_slot_delta(ctx, p.0, p.1, -1, time_ms);
+            apply_slot_delta(ctx, n.0, n.1, 1, time_ms);
         }
-        (Some(p), None) => apply_slot_delta(ctx, p.0, p.1, -1, time_secs),
-        (None, Some(n)) => apply_slot_delta(ctx, n.0, n.1, 1, time_secs),
+        (Some(p), None) => apply_slot_delta(ctx, p.0, p.1, -1, time_ms),
+        (None, Some(n)) => apply_slot_delta(ctx, n.0, n.1, 1, time_ms),
         (None, None) => {}
     }
 }
@@ -352,15 +367,15 @@ fn card_contribution(card: &Card) -> Option<(u32, StatSlot)> {
 /// to write more immediate rows):
 ///
 /// 1. **Read from the prior soul row, not the latest.** "Prior" is
-///    the row with max `valid_at_time ≤ time_secs`. Reading
+///    the row with max `valid_at_time ≤ time_ms`. Reading
 ///    `latest()` (unbounded max) would pull in deltas applied by
 ///    later writes, contaminating our row with not-yet-due state.
 ///
 /// 2. **Forward-propagate the delta.** Every soul row with
-///    `valid_at_time > time_secs` represents the soul's state at
+///    `valid_at_time > time_ms` represents the soul's state at
 ///    that future moment — and *that* state needs to include our
 ///    delta too, because the card we just touched is alive (or
-///    newly-consumed) from `time_secs` onward. Unlike zones'
+///    newly-consumed) from `time_ms` onward. Unlike zones'
 ///    forward-propagation (which stops on deliberate change), souls
 ///    always propagate: each delta is an independent card-state
 ///    contribution, and downstream writes have already computed their
@@ -371,7 +386,7 @@ fn apply_slot_delta(
     player_id: u32,
     slot: StatSlot,
     delta: i8,
-    time_secs: u32,
+    time_ms: u64,
 ) {
     if player_id == 0 {
         return;
@@ -395,13 +410,13 @@ fn apply_slot_delta(
         .souls()
         .card_id()
         .filter(soul_card_id)
-        .filter(|s| valid_at_time(s.valid_at) <= time_secs)
+        .filter(|s| valid_at_time(s.valid_at) <= time_ms)
         .max_by_key(|s| valid_at_time(s.valid_at))
     else {
         return;
     };
     apply_delta_to_soul(&mut prior, slot, delta);
-    write_at(ctx, prior, time_secs);
+    write_at(ctx, prior, time_ms);
 
     // (2) Forward-propagate. Collect future row valid_ats first so
     // we're not iterating the table while mutating it.
@@ -410,7 +425,7 @@ fn apply_slot_delta(
         .souls()
         .card_id()
         .filter(soul_card_id)
-        .filter(|s| valid_at_time(s.valid_at) > time_secs)
+        .filter(|s| valid_at_time(s.valid_at) > time_ms)
         .map(|s| s.valid_at)
         .collect();
     future.sort_unstable_by_key(|v| valid_at_time(*v));

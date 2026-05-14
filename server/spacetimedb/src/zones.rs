@@ -1,6 +1,7 @@
 use spacetimedb::{table, ReducerContext, Table};
 
 use crate::packed::{self, pack_valid_at, valid_at_time};
+use crate::sequence;
 
 #[table(accessor = zones, public)]
 pub struct Zone {
@@ -60,8 +61,8 @@ impl Zone {
     }
 }
 
-fn now_secs(ctx: &ReducerContext) -> u32 {
-    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000_000) as u32
+fn now_ms(ctx: &ReducerContext) -> u64 {
+    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000) as u64
 }
 
 // Latest row for a zone_id is the row with the largest time component of valid_at.
@@ -77,20 +78,32 @@ pub fn latest(ctx: &ReducerContext, zone_id: u32) -> Option<Zone> {
 // exact key (two writes in the same second), the existing one is replaced —
 // "always accept the most recent write".
 fn write(ctx: &ReducerContext, zone: Zone) -> Zone {
-    write_at(ctx, zone, now_secs(ctx))
+    write_at(ctx, zone, now_ms(ctx))
 }
 
-// Like `write`, but stamps `valid_at` with a caller-supplied second-precision
+// Like `write`, but stamps `valid_at` with a caller-supplied millisecond
 // timestamp instead of `now`. Used by the action-completion path to apply
 // zone changes (tile-byte clears, location-output writes) at the action's
-// `completion_secs` rather than at the wall-clock moment the reducer runs —
+// `completion_ms` rather than at the wall-clock moment the reducer runs —
 // so the client doesn't see a tile change the instant an action starts, only
 // when its buffered clock reaches the action's completion.
-fn write_at(ctx: &ReducerContext, mut zone: Zone, time_secs: u32) -> Zone {
-    zone.valid_at = pack_valid_at(zone.zone_id, time_secs);
-    if ctx.db.zones().valid_at().find(zone.valid_at).is_some() {
-        ctx.db.zones().valid_at().delete(zone.valid_at);
+fn write_at(ctx: &ReducerContext, mut zone: Zone, time_ms: u64) -> Zone {
+    // "Last write at this (zone_id, time_ms) wins." See
+    // `cards::write_at` for the full rationale — same-time writes
+    // would otherwise accumulate distinct rows under the new
+    // sequence-bearing PK.
+    let stale: Vec<u64> = ctx
+        .db
+        .zones()
+        .zone_id()
+        .filter(zone.zone_id)
+        .filter(|z| valid_at_time(z.valid_at) == time_ms)
+        .map(|z| z.valid_at)
+        .collect();
+    for v in stale {
+        ctx.db.zones().valid_at().delete(v);
     }
+    zone.valid_at = pack_valid_at(time_ms, sequence::next_sequence(ctx));
     ctx.db.zones().insert(zone)
 }
 
@@ -138,12 +151,12 @@ where
 }
 
 // Like `update_with`, but stamps the resulting row at a specific
-// `time_secs` rather than `now`. Used by the action-completion path to
-// future-stamp tile writes at `completion_secs`.
+// `time_ms` rather than `now`. Used by the action-completion path to
+// future-stamp tile writes at `completion_ms`.
 pub fn update_with_at<F>(
     ctx: &ReducerContext,
     zone_id: u32,
-    time_secs: u32,
+    time_ms: u64,
     f: F,
 ) -> Option<Zone>
 where
@@ -151,7 +164,7 @@ where
 {
     let mut z = latest(ctx, zone_id)?;
     f(&mut z);
-    Some(write_at(ctx, z, time_secs))
+    Some(write_at(ctx, z, time_ms))
 }
 
 // ---- single-field setters ---------------------------------------------
@@ -204,7 +217,7 @@ pub fn set_tile_rows(ctx: &ReducerContext, zone_id: u32, tiles: [u64; 8]) -> Opt
 // (each 0..8). Stamps the new version row at *now*. Delegates to
 // `set_tile_at` so both the prior-row read and the forward-propagation
 // of the change apply uniformly — wall-clock writes are just the
-// `time_secs = now_secs` special case.
+// `time_ms = now_ms` special case.
 pub fn set_tile(
     ctx: &ReducerContext,
     zone_id: u32,
@@ -212,11 +225,11 @@ pub fn set_tile(
     col: u8,
     def_id: u8,
 ) -> Option<Zone> {
-    set_tile_at(ctx, zone_id, now_secs(ctx), row, col, def_id)
+    set_tile_at(ctx, zone_id, now_ms(ctx), row, col, def_id)
 }
 
 /// Write a single tile byte at `(row, col)` to `def_id`, stamping the
-/// new Zone version row at `time_secs`.
+/// new Zone version row at `time_ms`.
 ///
 /// Two pieces of bookkeeping beyond the obvious row write, both
 /// necessary for sane behaviour when actions on the same zone interleave
@@ -224,14 +237,14 @@ pub fn set_tile(
 /// in parallel):
 ///
 /// 1. **Read from the prior row, not the latest.** The new row's
-///    baseline is the row with the largest `valid_at_time ≤ time_secs`
+///    baseline is the row with the largest `valid_at_time ≤ time_ms`
 ///    — i.e., the state of the zone *just before* our write takes
 ///    effect. Reading `latest()` instead would pull in changes from
 ///    future-stamped rows that the client hasn't yet promoted to,
 ///    contaminating our row with not-yet-due changes.
 ///
 /// 2. **Forward-propagate the change.** After writing our row, walk
-///    every future row (`valid_at_time > time_secs`) in ascending
+///    every future row (`valid_at_time > time_ms`) in ascending
 ///    order. For each, if its byte at `(row, col)` still equals the
 ///    prior row's byte (i.e., the tile was inherited from before our
 ///    write — nobody deliberately changed it after us), overwrite it
@@ -247,7 +260,7 @@ pub fn set_tile(
 pub fn set_tile_at(
     ctx: &ReducerContext,
     zone_id: u32,
-    time_secs: u32,
+    time_ms: u64,
     row: u8,
     col: u8,
     def_id: u8,
@@ -256,13 +269,13 @@ pub fn set_tile_at(
         return None;
     }
 
-    // (1) Read the prior row: max valid_at_time ≤ time_secs.
+    // (1) Read the prior row: max valid_at_time ≤ time_ms.
     let mut prior = ctx
         .db
         .zones()
         .zone_id()
         .filter(zone_id)
-        .filter(|z| valid_at_time(z.valid_at) <= time_secs)
+        .filter(|z| valid_at_time(z.valid_at) <= time_ms)
         .max_by_key(|z| valid_at_time(z.valid_at))?;
     let old_def_id = packed::tile_byte(prior.tile_row(row).unwrap_or(0), col as usize);
 
@@ -276,11 +289,11 @@ pub fn set_tile_at(
     }
 
     // Build the new row on top of `prior`'s data + our one-byte change,
-    // then write at `time_secs`.
+    // then write at `time_ms`.
     let cur = prior.tile_row(row).unwrap_or(0);
     let next = packed::with_tile_byte(cur, col as usize, def_id);
     prior.assign_tile_row(row, next);
-    let written = write_at(ctx, prior, time_secs);
+    let written = write_at(ctx, prior, time_ms);
 
     // (2) Forward-propagate. Collect the future-row valid_ats first so
     // we're not holding an iterator across mutations of the same table.
@@ -289,7 +302,7 @@ pub fn set_tile_at(
         .zones()
         .zone_id()
         .filter(zone_id)
-        .filter(|z| valid_at_time(z.valid_at) > time_secs)
+        .filter(|z| valid_at_time(z.valid_at) > time_ms)
         .map(|z| z.valid_at)
         .collect();
     future.sort_unstable_by_key(|v| valid_at_time(*v));

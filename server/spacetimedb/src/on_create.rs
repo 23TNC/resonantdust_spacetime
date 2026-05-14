@@ -1,17 +1,19 @@
-use resonantdust_content::definition_core::{decode_definition, is_hex_type};
+use resonantdust_content::definition_core::{decode_definition, is_hex_type, CardDefinition};
 use resonantdust_content::recipe_core::{
     recipes_of_type, Duration, RecipeDef, RecipeType,
 };
-use spacetimedb::ReducerContext;
+use spacetimedb::{log, ReducerContext};
 
 use crate::action_completion;
 use crate::cards;
 use crate::magnetic;
-use crate::packed::valid_at_time;
-use crate::recipe_eval::{aspect_pool, entity_satisfied_pool, entity_specificity};
+use crate::packed::{valid_at_time, STACK_DIR_DOWN, STACK_DIR_UP};
+use crate::recipe_eval::{
+    aspect_pool, entity_satisfied_pool, entity_specificity, has_predicates_feasible,
+    has_specificity_bonus, soul_stack, HasCandidates,
+};
 
 // `cards/flags.json` bit positions we need to OR onto the new card row.
-const FLAG_POSITION_HOLD: u32 = 1 << 0;
 const FLAG_SLOT_HOLD: u32 = 1 << 5;
 
 /// Run `OnCreate` recipe matching against a freshly-created card and, if
@@ -24,14 +26,24 @@ const FLAG_SLOT_HOLD: u32 = 1 << 5;
 /// `action_completion::apply` today; any future creation site too. Each
 /// new card_id should fire this exactly once.
 ///
-/// **Card-secs basis.** The trigger reads the card's `valid_at` rather
-/// than `now`, so a future-stamped product (created via `create_at` at
-/// `completion_secs` of an earlier action) gets its OnCreate scheduled
-/// relative to its own `valid_at`, not relative to wall-clock at the
-/// moment the product was committed. This means the with-holds row
-/// goes on the create row's same `valid_at` (replacing it via
-/// `write_at`'s find/delete/insert) and the completion lands at
-/// `card.valid_at + duration`.
+/// **`time_secs` parameter.** Callers pass the `valid_at` of the
+/// card's create row — i.e., the time at which the card "exists" in
+/// the cards-table timeline. For immediate creates
+/// (`utilities::add_card`, `players::spawn_soul_for`, `bootstrap`)
+/// this is `now_secs(ctx)`; for action products created via
+/// `cards::create_at(...completion_secs)` it's `completion_secs`. The
+/// fetch uses `cards::prior_at(..., time_secs)` rather than
+/// `cards::latest(...)` so a future-stamped product is visible to
+/// the trigger (a `latest` call would filter it out by the
+/// `valid_at <= now` bound and silently return `None`, which is the
+/// bug this parameter exists to fix).
+///
+/// **Card-secs basis.** Downstream timing (with-holds row, completion
+/// schedule) is anchored to `card.valid_at` returned by `prior_at`.
+/// For an immediate create that equals `now`; for a future-stamped
+/// create it equals `completion_secs` of the parent action — so the
+/// OnCreate completion lands at `(parent completion) + duration`,
+/// not at `now + duration`.
 ///
 /// **Eligibility & ranking.** Mirrors `match_stack_recipe`'s shape: a
 /// recipe is eligible iff every declared entity is satisfied —
@@ -55,8 +67,9 @@ pub fn trigger(
     ctx: &ReducerContext,
     card_id: u32,
     caller_player_id: u32,
+    time_ms: u64,
 ) -> Result<(), String> {
-    let card = match cards::latest(ctx, card_id) {
+    let card = match cards::prior_at(ctx, card_id, time_ms) {
         Some(c) => c,
         None => return Ok(()),
     };
@@ -76,14 +89,49 @@ pub fn trigger(
         .map_err(|err| format!("on_create: recipes_of_type: {err}"))?;
     let magnetic_candidates = recipes_of_type(RecipeType::OnCreateMagnetic)
         .map_err(|err| format!("on_create: recipes_of_type: {err}"))?;
-    let candidates = self_candidates
+    let recipe_candidates = self_candidates
         .into_iter()
         .chain(magnetic_candidates.into_iter());
 
-    // Highest-specificity match wins. Tuple ordering: hex tier outranks
-    // root tier outright (matches `match_stack_recipe`'s convention).
-    let mut best: Option<((u32, u32), &'static RecipeDef)> = None;
-    'recipes: for recipe in candidates {
+    // Walk the owner's soul UP / DOWN stacks once so the has-specificity
+    // tiebreaker can score recipes against them without re-walking
+    // per-candidate. For on_create, root == actor (same owner), so the
+    // same defs feed `root_*` and `actor_*` slots of `HasCandidates`.
+    //
+    // World-owned cards (and any other case where the owner has no
+    // soul) yield empty stacks → recipes with `has` predicates are
+    // filtered out via `has_predicates_feasible` below, which is the
+    // correct behavior (a tree can't carry an axe).
+    let soul_id = crate::players::latest(ctx, card.owner_id)
+        .map(|p| p.soul_card_id)
+        .unwrap_or(0);
+    let stack_above = soul_stack(ctx, soul_id, card.owner_id, STACK_DIR_UP);
+    let stack_below = soul_stack(ctx, soul_id, card.owner_id, STACK_DIR_DOWN);
+    let defs_above: Vec<&CardDefinition> = stack_above
+        .iter()
+        .filter_map(|c| decode_definition(c.packed_definition).ok().flatten())
+        .collect();
+    let defs_below: Vec<&CardDefinition> = stack_below
+        .iter()
+        .filter_map(|c| decode_definition(c.packed_definition).ok().flatten())
+        .collect();
+    let has_candidates = HasCandidates {
+        root_above: defs_above.clone(),
+        actor_above: defs_above,
+        root_below: defs_below.clone(),
+        actor_below: defs_below,
+    };
+
+    // Highest-specificity match wins. Tuple ordering:
+    //   (hex_spec, root_spec, has_spec) lexicographic.
+    // hex tier outranks root tier outranks has tier (matches
+    // `match_stack_recipe`'s convention extended to has). `has_spec`
+    // sums best-match specificity across `has` + `has_below` +
+    // their `reagents.*` companions; only counted on recipes whose
+    // has-predicates are feasible against the current soul stacks
+    // (`has_predicates_feasible` skips otherwise).
+    let mut best: Option<((u32, u32, u32), &'static RecipeDef)> = None;
+    'recipes: for recipe in recipe_candidates {
         let hex_spec = match &recipe.hex {
             None => 0,
             Some(entity) => {
@@ -109,7 +157,14 @@ pub fn trigger(
                 s
             }
         };
-        let score = (hex_spec, root_spec);
+        // Skip recipes whose has-predicates can't possibly satisfy —
+        // doesn't apply to this card-creation context, so it
+        // shouldn't pre-empt a feasible lower-tier match.
+        if !has_predicates_feasible(recipe, &has_candidates) {
+            continue 'recipes;
+        }
+        let has_spec = has_specificity_bonus(recipe, &has_candidates);
+        let score = (hex_spec, root_spec, has_spec);
         if best.map_or(true, |(b, _)| score > b) {
             best = Some((score, recipe));
         }
@@ -158,10 +213,11 @@ pub fn trigger(
         }
     };
 
-    let card_secs = valid_at_time(card.valid_at);
-    let completion_secs = card_secs.saturating_add(duration_secs);
+    let card_ms = valid_at_time(card.valid_at);
+    // Recipe `duration` is authored in seconds (JSON int); convert to ms.
+    let completion_ms = card_ms.saturating_add((duration_secs as u64) * 1_000);
 
-    // Set holds on the card row at `card_secs`. write_at finds the
+    // Set holds on the card row at `card_ms`. write_at finds the
     // existing row at that pk, deletes, re-inserts — so the card's
     // first visible row to the client is the held version, not a
     // brief flagless flicker.
@@ -184,11 +240,7 @@ pub fn trigger(
     //
     // Same gating principle as `actions.rs`'s slot[0]/root spatial
     // writes (force_position only when there's something to pin to).
-    let position_hold = if recipe.hex.is_some() {
-        FLAG_POSITION_HOLD
-    } else {
-        0
-    };
+    let take_position_hold = recipe.hex.is_some();
     // `set_start.root` is always applied; `set_start.hex` only fires
     // when the recipe declared a hex entity. Author's set_start runs
     // *last* so it can override the auto-set holds above (e.g.
@@ -199,11 +251,20 @@ pub fn trigger(
     } else {
         resonantdust_content::recipe_core::FlagOps::default()
     };
-    cards::update_with_at(ctx, card_id, card_secs, |c| {
-        c.flags |= FLAG_SLOT_HOLD | position_hold;
+    cards::update_with_at(ctx, card_id, card_ms, |c| {
+        c.flags |= FLAG_SLOT_HOLD;
+        if take_position_hold {
+            c.flags = cards::increment_position_hold_count(c.flags);
+        }
         c.flags = set_start_root.apply(c.flags);
         c.flags = set_start_hex.apply(c.flags);
     });
+    if take_position_hold {
+        // Forward-prop the count bump to any future-stamped rows of
+        // this card (death rows, etc.). For a fresh-created card
+        // there usually aren't any, but the helper is cheap.
+        cards::propagate_position_hold_forward(ctx, card_id, card_ms, true);
+    }
 
     // Per recipe_core's "OnCreate (root == actor)" convention, the new
     // card is always the chain root — and the actor, since OnCreate has
@@ -214,15 +275,51 @@ pub fn trigger(
     let root = card_id;
     let hex = if recipe.hex.is_some() { card_id } else { 0 };
 
+    // OnCreate: root == actor (no slots), both owned by `card.owner_id`.
+    // Resolve any `has` / `reagents.has` (UP stack) and `has_below` /
+    // `reagents.has_below` (DOWN stack) predicates against that
+    // owner's soul.
+    //
+    // A `resolve_has` error here would otherwise abort the entire
+    // card-creation site (add_card / bootstrap / action_completion
+    // products / world_gen). on_create is best-effort — if the
+    // best-ranked recipe's has-predicates fail to greedy-bind
+    // (e.g., two identical entries with only one matching card —
+    // the ranker's `has_predicates_feasible` filter only catches
+    // the no-candidate case), we log and skip the install rather
+    // than fail the whole reducer.
+    let has_matches = match crate::recipe_eval::resolve_has(
+        ctx,
+        &recipe.id,
+        &recipe.has,
+        &recipe.reagents.has,
+        &recipe.has_below,
+        &recipe.reagents.has_below,
+        card.owner_id,
+        card.owner_id,
+        card_ms,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!(
+                "on_create: card {card_id}: recipe {} ({}) has-predicates didn't bind: {e}",
+                recipe.index,
+                recipe.id
+            );
+            return Ok(());
+        }
+    };
+
     action_completion::apply(
         ctx,
         recipe,
         hex,
         root,
         /* slots */ &[],
-        completion_secs,
+        completion_ms,
         caller_player_id,
         /* hex_location */ None,
+        has_matches,
     )?;
 
     Ok(())

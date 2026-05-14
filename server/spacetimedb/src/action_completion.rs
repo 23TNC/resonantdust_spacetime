@@ -8,6 +8,7 @@ use spacetimedb::{log, ReducerContext};
 
 use crate::cards;
 use crate::packed::{pack_valid_at, unpack_macro_zone};
+use crate::recipe_eval::HasMatches;
 use crate::world_gen;
 use crate::zones;
 
@@ -39,15 +40,18 @@ pub struct HexLocation {
 
 // Bit positions / fields from `cards/flags.json` (see content crate).
 // Typed as u32 to match `Card.flags`.
-const FLAG_POSITION_HOLD: u32 = 1 << 0;
 const FLAG_DROP_HOLD: u32 = 1 << 3;
 const FLAG_SLOT_HOLD: u32 = 1 << 5;
 const FLAG_DEAD: u32 = 1 << 7;
-/// Every `*_hold` bit, OR'd together. Used as the clearing mask for
-/// recipe-completion releases — anything in this mask gets cleared on
-/// the release row, on the policy "if you wanted a permanent variant,
-/// you'd have set `*_locked` instead." Append future hold bits here.
-const HOLD_FLAGS_MASK: u32 = FLAG_POSITION_HOLD | FLAG_DROP_HOLD | FLAG_SLOT_HOLD;
+/// Every non-counted `*_hold` bit, OR'd together. Used as the clearing
+/// mask for recipe-completion releases — anything in this mask gets
+/// cleared on the release row, on the policy "if you wanted a permanent
+/// variant, you'd have set `*_locked` instead." `position_hold` is
+/// intentionally absent — it's ref-counted via the `position_hold_count`
+/// field, so cleanup paths decrement-and-maybe-clear via
+/// `cards::release_position_hold` instead of mask-blast clearing it.
+/// Append future single-owner hold bits here.
+const HOLD_FLAGS_MASK: u32 = FLAG_DROP_HOLD | FLAG_SLOT_HOLD;
 /// `force_position` (bit 11). Set on every row `propose_action`
 /// repositions; cleared here at completion. Once the recipe finishes,
 /// the server has no view of where surviving cards belong (the chain
@@ -86,18 +90,18 @@ fn pack_progress_style(value: u32) -> u32 {
     (value & 0b111) << PROGRESS_STYLE_SHIFT
 }
 
-/// Grace period (seconds) between a card's death (its `dead`-bit flip)
-/// and the follow-up `schedule_delete_cards` sweep that wipes the card's
-/// remaining row. The dead row itself has `valid_at_time =
-/// completion_secs`; the sweep deletes rows with `valid_at_time < cutoff`
-/// (strict less-than), so we schedule it at `completion_secs + grace` to
+/// Grace period (milliseconds) between a card's death (its `dead`-bit
+/// flip) and the follow-up `schedule_delete_cards` sweep that wipes the
+/// card's remaining row. The dead row itself has `valid_at_time =
+/// completion_ms`; the sweep deletes rows with `valid_at_time < cutoff`
+/// (strict less-than), so we schedule it at `completion_ms + grace` to
 /// catch the dead row too. The grace is what clients use to see the dead
 /// bit and run a death animation before the row evaporates from the wire.
-const DEAD_ROW_GRACE_SECS: u32 = 10;
+const DEAD_ROW_GRACE_MS: u64 = 10_000;
 
 /// Apply a recipe's completion outcomes (reagent consumption, product
 /// generation, hold release) directly into the `cards` table with all
-/// writes stamped at `completion_secs`.
+/// writes stamped at `completion_ms`.
 ///
 /// **No scheduled reducer is involved.** SpacetimeDB's `valid_at` pattern
 /// already supports "this state becomes current at time T" via
@@ -106,9 +110,9 @@ const DEAD_ROW_GRACE_SECS: u32 = 10;
 /// `valid_at_time`. So all of an action's outcomes can be written
 /// synchronously inside `propose_action`'s single transaction:
 ///
-/// - Reagent consumption: a row at `completion_secs` with `dead` set.
-/// - Products: brand-new card rows at `completion_secs`.
-/// - Hold release: a row at `completion_secs` with `position_hold` /
+/// - Reagent consumption: a row at `completion_ms` with `dead` set.
+/// - Products: brand-new card rows at `completion_ms`.
+/// - Hold release: a row at `completion_ms` with `position_hold` /
 ///   `slot_hold` cleared.
 ///
 /// The owner-resolution falls back through Root → Actor → Hex → Action
@@ -118,9 +122,9 @@ const DEAD_ROW_GRACE_SECS: u32 = 10;
 /// retroactively affect already-resolved products.
 ///
 /// One `schedule_delete_cards` row is enqueued per consumed card at
-/// `completion_secs + DEAD_ROW_GRACE_SECS` so the dead row itself is
+/// `completion_ms + DEAD_ROW_GRACE_SECS` so the dead row itself is
 /// eventually swept. The implicit sweep enqueued by `update_with_at`
-/// (firing at `completion_secs`) clears every prior version but
+/// (firing at `completion_ms`) clears every prior version but
 /// preserves the dead row; this explicit second sweep catches it.
 #[allow(clippy::too_many_arguments)]
 pub fn apply(
@@ -129,12 +133,18 @@ pub fn apply(
     hex: u32,
     root: u32,
     slots: &[u32],
-    completion_secs: u32,
+    completion_ms: u64,
     caller_player_id: u32,
     // `hex_location` is `Some` when the action targets a tile-as-hex
     // (`hex == 0` plus `propose_action` resolved a synthetic hex).
     // `None` everywhere else — real hex cards, OnCreate, magnetic.
     hex_location: Option<HexLocation>,
+    // Card-ids resolved by `recipe_eval::resolve_has` for the
+    // recipe's `has` + `reagents.has` predicates. Empty when the
+    // recipe declares no has-predicates. The tail of each list
+    // (length = `recipe_def.reagents.has.X.len()`) is consumed at
+    // completion; the prefix is non-consumed (predicate-only).
+    has_matches: HasMatches,
 ) -> Result<(), String> {
     // ---- Identify the actor ------------------------------------------
     //
@@ -209,7 +219,7 @@ pub fn apply(
     // `dead` bit on a row that doesn't exist.
     let mut consumed: BTreeSet<u32> = BTreeSet::new();
     let mut consume_synthetic_hex = false;
-    for reagent in &recipe_def.reagents {
+    for &reagent in &recipe_def.reagents.slots {
         match reagent {
             Reagent::Root => {
                 if root != 0 {
@@ -226,13 +236,52 @@ pub fn apply(
             // 1-indexed: Slot(1) is the actor at slots[0]. Slot(0) and
             // out-of-range indices silently skip.
             Reagent::Slot(n) => {
-                let n = *n as usize;
+                let n = n as usize;
                 if n >= 1 {
                     if let Some(&id) = slots.get(n - 1) {
                         consumed.insert(id);
                     }
                 }
             }
+        }
+    }
+
+    // `reagents.has.*` / `reagents.has_below.*` consumption: the tail
+    // of each matches list (length = `recipe_def.reagents.has.X.len()`
+    // / `recipe_def.reagents.has_below.X.len()`) is what gets killed
+    // at completion. The head (length = `recipe_def.has.X.len()` /
+    // `recipe_def.has_below.X.len()`) is non-consumed (predicate-only)
+    // and stays alive — released via the loop further below.
+    for &id in has_matches
+        .above
+        .root_consumed(recipe_def.reagents.has.root.len())
+    {
+        if id != 0 {
+            consumed.insert(id);
+        }
+    }
+    for &id in has_matches
+        .above
+        .actor_consumed(recipe_def.reagents.has.actor.len())
+    {
+        if id != 0 {
+            consumed.insert(id);
+        }
+    }
+    for &id in has_matches
+        .below
+        .root_consumed(recipe_def.reagents.has_below.root.len())
+    {
+        if id != 0 {
+            consumed.insert(id);
+        }
+    }
+    for &id in has_matches
+        .below
+        .actor_consumed(recipe_def.reagents.has_below.actor.len())
+    {
+        if id != 0 {
+            consumed.insert(id);
         }
     }
 
@@ -253,23 +302,34 @@ pub fn apply(
     for &id in &consumed {
         let is_actor = id == actor_id;
         let style = if is_actor { actor_style } else { PROGRESS_STYLE_NONE };
-        cards::update_with_at(ctx, id, completion_secs, |c| {
+        cards::update_with_at(ctx, id, completion_ms, |c| {
             c.flags |= FLAG_DEAD;
-            // Clear holds + force_position + progress_style alongside
-            // the dead-bit bump. The row is dying; the action that
-            // claimed it is over, so `slot_hold` and friends shouldn't
-            // linger. Same mask the release loop below uses for
-            // non-consumed slots (`HOLD_FLAGS_MASK | FLAG_FORCE_POSITION
-            // | PROGRESS_STYLE_MASK`) — keeping the two paths in sync
-            // means "alive but released" and "dead" rows agree on the
-            // post-action flag baseline. The `progress_style` value
-            // that the actor card carries is then re-OR'd from
-            // `style` below.
+            // Clear non-counted holds + force_position + progress_style
+            // alongside the dead-bit bump. The row is dying; the action
+            // that claimed it is over, so `slot_hold` and friends
+            // shouldn't linger. Same mask the release loop below uses
+            // for non-consumed slots.
             c.flags &= !(HOLD_FLAGS_MASK | FLAG_FORCE_POSITION | PROGRESS_STYLE_MASK);
+            // `position_hold` is ref-counted — decrement this action's
+            // contribution inline; the matching forward-prop on future
+            // rows happens via the ctx-aware call below.
+            c.flags = cards::decrement_position_hold_count(c.flags);
             c.flags |= pack_progress_style(style);
         });
-        let cleanup_secs = completion_secs.saturating_add(DEAD_ROW_GRACE_SECS);
-        crate::schedule_delete_cards::enqueue(ctx, id, pack_valid_at(id, cleanup_secs));
+        // Forward-prop the -1 onto rows past `completion_ms` so any
+        // later action's release/death row still reflects "but I'm
+        // no longer here." Done after the inline mutation so the
+        // closure's count change is already in the row at
+        // completion_ms before we walk forward.
+        cards::propagate_position_hold_forward(ctx, id, completion_ms, false);
+        let cleanup_ms = completion_ms.saturating_add(DEAD_ROW_GRACE_MS);
+        // The enqueue helper reads `valid_at_time(packed)` to derive its
+        // own scheduling; we don't have (or need) the dead row's actual
+        // PK here since the schedule keys off card_id + scheduled_at.
+        // Just need a u64 whose `valid_at_time` decodes to `cleanup_ms`,
+        // i.e., the time portion is correct. Sequence portion = 0 is
+        // fine here (the schedule row doesn't go in the cards table).
+        crate::schedule_delete_cards::enqueue(ctx, id, pack_valid_at(cleanup_ms, 0));
     }
 
     // Synthetic-hex consumption: revert the tile byte to its
@@ -288,7 +348,7 @@ pub fn apply(
     // declaring a location output.
     //
     // `set_tile_at` future-stamps the Zone version row at
-    // `completion_secs`, so the client's promote-by-time logic keeps
+    // `completion_ms`, so the client's promote-by-time logic keeps
     // showing the original tile until the action actually completes —
     // matches the Card-death `update_with_at` discipline.
     if consume_synthetic_hex {
@@ -300,7 +360,7 @@ pub fn apply(
             zones::set_tile_at(
                 ctx,
                 loc.zone_id,
-                completion_secs,
+                completion_ms,
                 loc.row,
                 loc.col,
                 underlying,
@@ -333,7 +393,7 @@ pub fn apply(
                     cards::create_at(
                         ctx,
                         new_id,
-                        completion_secs,
+                        completion_ms,
                         /* surface         */ 1,
                         /* macro_zone      */ owner,
                         /* micro_zone      */ 0,
@@ -342,7 +402,15 @@ pub fn apply(
                         packed_def,
                         /* flags           */ 0,
                     );
-                    crate::on_create::trigger(ctx, new_id, caller_player_id)?;
+                    // Pass `completion_ms` (the product's own
+                    // `valid_at`) rather than `now`: the new card's
+                    // only row is future-stamped, and
+                    // `on_create::trigger`'s `cards::prior_at` call
+                    // needs the matching upper bound to see it. With
+                    // `now`, the fetch silently returns `None` and
+                    // the OnCreate recipe is never installed — see
+                    // `on_create::trigger`'s `time_secs` doc.
+                    crate::on_create::trigger(ctx, new_id, caller_player_id, completion_ms)?;
                 }
             }
             ProductPlace::Location => {
@@ -383,7 +451,7 @@ pub fn apply(
                 // alongside a `tile/default` zone to be consistent;
                 // a future enhancement can verify equality.
                 let def_id = (packed_def & 0xFF) as u8;
-                zones::set_tile_at(ctx, loc.zone_id, completion_secs, loc.row, loc.col, def_id);
+                zones::set_tile_at(ctx, loc.zone_id, completion_ms, loc.row, loc.col, def_id);
             }
         }
     }
@@ -403,6 +471,47 @@ pub fn apply(
     }
     for &id in slots {
         release.insert(id);
+    }
+    // Predicate-only (non-consumed) has-matches carry `position_hold`
+    // (stamped by `resolve_has` so equipment can't be dragged off the
+    // soul mid-action) but NOT `slot_hold` — so other concurrent
+    // recipes can predicate-only-match them too. They survive the
+    // action and need their `position_hold` released at
+    // `completion_ms` via the loop below, so we add them to the
+    // release set. Both directions (UP / DOWN) contribute. Consumed
+    // has-matches are already in `consumed` and have their holds
+    // cleared via the death-row mask.
+    for &id in has_matches
+        .above
+        .root_predicate_only(recipe_def.reagents.has.root.len())
+    {
+        if id != 0 {
+            release.insert(id);
+        }
+    }
+    for &id in has_matches
+        .above
+        .actor_predicate_only(recipe_def.reagents.has.actor.len())
+    {
+        if id != 0 {
+            release.insert(id);
+        }
+    }
+    for &id in has_matches
+        .below
+        .root_predicate_only(recipe_def.reagents.has_below.root.len())
+    {
+        if id != 0 {
+            release.insert(id);
+        }
+    }
+    for &id in has_matches
+        .below
+        .actor_predicate_only(recipe_def.reagents.has_below.actor.len())
+    {
+        if id != 0 {
+            release.insert(id);
+        }
     }
     for &id in &consumed {
         release.remove(&id);
@@ -426,7 +535,7 @@ pub fn apply(
     //
     // Leaving non-bottom cards' spatial alone keeps the server row
     // pointing at the (about-to-be-deleted) parent until the dead-row
-    // sweep at `completion_secs + DEAD_ROW_GRACE_SECS`. That's fine —
+    // sweep at `completion_ms + DEAD_ROW_GRACE_SECS`. That's fine —
     // by then the client has already transplanted, and the mirror's
     // orphan-slot defensive recovery handles any reload edge-case
     // where the parent vanishes before the local view caught up.
@@ -459,8 +568,14 @@ pub fn apply(
         let is_actor = id == actor_id;
         let is_bottom = bottom_id != 0 && id == bottom_id;
         let style = if is_actor { actor_style } else { PROGRESS_STYLE_NONE };
-        cards::update_with_at(ctx, id, completion_secs, |c| {
+        cards::update_with_at(ctx, id, completion_ms, |c| {
             c.flags = (c.flags & release_mask) | pack_progress_style(style);
+            // `position_hold` is ref-counted — decrement this action's
+            // contribution. The forward-prop afterward extends the
+            // -1 onto any rows past `completion_ms` (release rows
+            // from later actions that need to reflect the lower
+            // count).
+            c.flags = cards::decrement_position_hold_count(c.flags);
             if is_bottom && c.surface != 1 {
                 c.surface = 1;
                 c.macro_zone = c.owner_id;
@@ -468,6 +583,7 @@ pub fn apply(
                 c.micro_location = 0;
             }
         });
+        cards::propagate_position_hold_forward(ctx, id, completion_ms, false);
     }
 
     Ok(())

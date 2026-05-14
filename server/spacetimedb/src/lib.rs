@@ -10,6 +10,7 @@ pub mod players;
 pub mod recipe_eval;
 pub mod schedule_delete_cards;
 pub mod schedule_delete_players;
+pub mod sequence;
 pub mod souls;
 pub mod stacks;
 pub mod utilities;

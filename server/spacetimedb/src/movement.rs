@@ -1,27 +1,36 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
+use std::sync::OnceLock;
 
+use resonantdust_content::definition_core::{
+    decode_definition, trait_id as resolve_trait_id, TraitId,
+};
 use spacetimedb::{reducer, ReducerContext};
 
 use crate::cards;
 use crate::packed::{
-    pack_macro_zone, pack_micro_zone, tile_byte, unpack_macro_zone, unpack_micro_zone,
-    valid_at_time, StackedState,
+    pack_definition, pack_macro_zone, pack_micro_zone, tile_byte, unpack_macro_zone,
+    unpack_micro_zone, valid_at_time, StackedState,
 };
 use crate::players;
 use crate::zones::zones as _zones_table;
 
+// `cards/flags.json` bit position for the client-side movement-arrow
+// hint. Set on every queued path-step row so the client's
+// `DataManager.resolveCardTarget` recognises the row as a queued
+// destination (it requires both `move_smooth` and `position_dirty`
+// to mark a future row as a target). Teleport / push / recipe-pin
+// writes leave it clear so they don't render an arrow.
+const FLAG_MOVE_SMOOTH: u32 = 1 << 17;
+
 // ---- tuning ---------------------------------------------------------
 
-/// Soul speed in seconds-per-cost-unit. The per-step cost formula is
-/// `0.5 * SOUL_SPEED * (from.cost + to.cost)`, so with `SOUL_SPEED = 1`
-/// and every tile costing `1` each hex step takes exactly 1 second
-/// (the user's "1 tile per second" baseline).
-///
-/// Per-soul speed is the obvious next move — store on the soul card
-/// (aspect, flag, or new column) and resolve in `move_soul`. Today
-/// every soul shares this constant.
-const SOUL_SPEED: f32 = 1.0;
+/// Default soul speed when the soul's definition carries no `speed`
+/// trait. `speed` is measured in **cost units per second** — a soul
+/// with `speed: 10` traverses 10 cost-units of terrain every second,
+/// so a cost-10 tile takes 1 second, a cost-100 tile takes 10
+/// seconds. At `speed: 1` the same terrain takes 10× longer.
+const DEFAULT_SOUL_SPEED: f32 = 10.0;
 
 /// Max nodes the A* expansion will visit before giving up. Bounds
 /// pathological searches (target on the far side of an unreachable
@@ -80,30 +89,82 @@ fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u8> {
     Some(tile_byte(row_bytes, local_q as usize))
 }
 
-/// Traversal cost of a tile, as a multiplier into the
-/// `step_cost` formula. Today every populated tile is cost 1; def_id
-/// 0 (empty / cleared tile) is impassable.
-///
-/// Future: drive from the tile card definition's aspects (e.g. an
-/// `"cost"` aspect, defaulting to 1) so recipe authors can author
-/// terrain difficulty in JSON. The signature already returns
-/// `Option<f32>` so the impassable case stays clean once aspect
-/// lookup lands.
+/// `card_type` / `card_category` of the tile-card bucket. Tiles
+/// live under `tile/default` in `content/cards/data/tiles/*.json` —
+/// `forest_1`, `forest_2`, `tree`, `rock`. Re-encoded via
+/// `pack_definition(TILE_CARD_TYPE, TILE_CARD_CATEGORY, def_id)` to
+/// look up a tile's `CardDefinition` from its u8 def_id (which is
+/// what's stored in zone tile bytes).
+const TILE_CARD_TYPE: u8 = 7;
+const TILE_CARD_CATEGORY: u8 = 0;
+
+/// `cost` trait id, resolved once via `trait_id("cost")` and cached.
+/// Lazy-init avoids paying the trait-registry build on every
+/// pathfinding call (registry builds once per process via
+/// `OnceLock`, but the `BTreeMap` lookup still has a cost). `0` is
+/// the `TRAIT_NONE` sentinel — if the trait isn't declared in
+/// `traits.json`, the cache stays at `0` and `tile_cost` falls back
+/// to `DEFAULT_TILE_COST`.
+static COST_TRAIT_ID: OnceLock<TraitId> = OnceLock::new();
+fn cost_trait_id() -> TraitId {
+    *COST_TRAIT_ID.get_or_init(|| resolve_trait_id("cost").ok().flatten().unwrap_or(0))
+}
+
+/// `speed` trait id, same cache pattern as [`cost_trait_id`]. Soul
+/// definitions carry this trait (see `content/cards/data/souls/*.json`)
+/// to set their movement rate. Falls back to `0` when the trait isn't
+/// declared, in which case `soul_speed` returns `DEFAULT_SOUL_SPEED`.
+static SPEED_TRAIT_ID: OnceLock<TraitId> = OnceLock::new();
+fn speed_trait_id() -> TraitId {
+    *SPEED_TRAIT_ID.get_or_init(|| resolve_trait_id("speed").ok().flatten().unwrap_or(0))
+}
+
+/// Fallback when a tile def carries no `cost` trait. Cost is measured
+/// in the same units as `speed` (see [`DEFAULT_SOUL_SPEED`]) — `10`
+/// matches the catalog's plains baseline (`forest_1`), so an
+/// unannotated tile costs one second at default soul speed.
+const DEFAULT_TILE_COST: f32 = 10.0;
+
+/// Traversal cost of a tile, as a multiplier into the `step_cost`
+/// formula. `def_id == 0` (empty / cleared tile) is impassable;
+/// every other def_id resolves through the tile-card bucket to a
+/// `CardDefinition` and reads its `cost` trait. Authors annotate
+/// terrain difficulty in `content/cards/data/tiles/*.json` —
+/// `forest_1: cost = 1`, `forest_2: cost = 1.2`, `tree`/`rock:
+/// cost = 2`, etc. A def with no `cost` trait falls back to
+/// `DEFAULT_TILE_COST`; an unresolvable def_id (registry build
+/// failure, or a def_id not present in the catalog) is treated as
+/// impassable since the cost is undefined.
 fn tile_cost(def_id: u8) -> Option<f32> {
     if def_id == 0 {
-        None
-    } else {
-        Some(1.0)
+        return None;
     }
+    let packed = pack_definition(TILE_CARD_TYPE, TILE_CARD_CATEGORY, def_id);
+    let def = decode_definition(packed).ok().flatten()?;
+    Some(def.trait_value(cost_trait_id()).unwrap_or(DEFAULT_TILE_COST))
+}
+
+/// Read a soul card's `speed` trait (in cost-units-per-second),
+/// falling back to `DEFAULT_SOUL_SPEED` when the trait isn't set
+/// (or the definition can't be decoded).
+fn soul_speed(packed_def: u16) -> f32 {
+    decode_definition(packed_def)
+        .ok()
+        .flatten()
+        .and_then(|def| def.trait_value(speed_trait_id()))
+        .unwrap_or(DEFAULT_SOUL_SPEED)
 }
 
 /// Time (in seconds, before rounding to whole `valid_at` seconds) for
 /// a single hex step from a tile of cost `from` to a tile of cost
-/// `to`. Splits the cost equally between leaving the current tile
-/// and entering the next, matching the user's spec
-/// `0.5 * speed * (A.cost + B.cost)`.
-fn step_cost(from: f32, to: f32) -> f32 {
-    0.5 * SOUL_SPEED * (from + to)
+/// `to` at the given `speed`. Splits the cost equally between leaving
+/// the current tile and entering the next — each contributes half its
+/// cost — then divides by `speed` (cost-units-per-second). Net:
+/// `step_secs = (from/2 + to/2) / speed`. Uniform cost-10 terrain at
+/// speed 10 = 1 sec/hex; speed 20 halves that; cost 100 at speed 10
+/// = 10 sec/hex.
+fn step_cost(speed: f32, from: f32, to: f32) -> f32 {
+    0.5 * (from + to) / speed
 }
 
 /// A* over the world-hex grid. Returns the path inclusive of both
@@ -113,14 +174,17 @@ fn pathfind(
     surface: u8,
     start: Coord,
     goal: Coord,
+    speed: f32,
 ) -> Result<Vec<Coord>, String> {
-    // Heuristic scaling: with `tile_cost = 1` everywhere, the minimum
-    // possible step cost is `step_cost(1, 1) = SOUL_SPEED`. The
-    // heuristic `hex_distance * SOUL_SPEED` is therefore admissible
-    // (never overestimates). Bumping the minimum tile cost in the
-    // future will require lowering this multiplier (or computing it
-    // from the actual minimum) to keep admissibility.
-    let h_scale = SOUL_SPEED;
+    // Heuristic scaling: minimum possible per-step cost on this
+    // surface is `step_cost(speed, DEFAULT_TILE_COST, DEFAULT_TILE_COST)`
+    // — i.e., 1 second at the catalog's plains baseline (cost 10,
+    // speed 10). The heuristic `hex_distance * h_scale` is admissible
+    // (never overestimates) provided no tile in the world is cheaper
+    // than `DEFAULT_TILE_COST`. Today every catalog tile uses
+    // cost ≥ 10 so that holds; if a future tile dips below, lower
+    // this bound accordingly.
+    let h_scale = step_cost(speed, DEFAULT_TILE_COST, DEFAULT_TILE_COST);
 
     let mut open: BinaryHeap<(Reverse<i64>, Coord)> = BinaryHeap::new();
     let mut came_from: BTreeMap<Coord, Coord> = BTreeMap::new();
@@ -167,7 +231,7 @@ fn pathfind(
             let Some(neigh_cost) = tile_cost(neigh_def) else {
                 continue;
             };
-            let tentative = current_g + step_cost(curr_cost, neigh_cost);
+            let tentative = current_g + step_cost(speed, curr_cost, neigh_cost);
             let existing = g_score.get(&neighbor).copied().unwrap_or(f32::INFINITY);
             if tentative < existing {
                 came_from.insert(neighbor, current);
@@ -199,27 +263,28 @@ fn pathfind(
 /// 1. Resolve caller → `Player` → `soul_card_id` → soul `Card`.
 /// 2. A* on the world-hex grid between the soul's current global
 ///    coord and the target's global coord, on a single surface.
-///    Tile def 0 (empty) is impassable; everything else has uniform
-///    cost 1 today (placeholder for per-tile traversal costs).
+///    Tile def 0 (empty) is impassable; every other tile resolves
+///    its `cost` trait (see [`tile_cost`]).
 /// 3. For each step in the path, write a future-stamped Card version
 ///    row that updates the soul's `(surface, macro_zone, micro_zone,
 ///    micro_location)` to the next tile. Step time is the cumulative
-///    `0.5 * SOUL_SPEED * (from.cost + to.cost)` rounded up to the
-///    next whole second; consecutive steps are forced strictly
+///    `0.5 * (from.cost + to.cost) / speed` rounded up to the next
+///    whole second; `speed` (cost-units-per-second) comes from the
+///    soul def's `speed` trait. Consecutive steps are forced strictly
 ///    ascending to avoid PK collisions on the `(card_id, time_secs)`
 ///    valid_at key.
 ///
-/// **Limitation:** existing future-stamped soul rows are not cleared
-/// before queuing. If `move_soul` is called twice in quick
-/// succession the second path stacks on top of the first; once the
-/// second path completes, any remaining rows from the first
-/// (deeper-stamped) will resurrect and the soul will appear to
-/// teleport back along the first path. The simple cleanup is to
-/// delete every soul row at `valid_at_time > now` before queuing —
-/// but recipe-driven moves (no such thing yet, but coming) would
-/// also be wiped, so a `flags` bit distinguishing "movement" rows
-/// is the right escape hatch. Punted until the second feature
-/// actually exists.
+/// **Interrupts.** A second `move_soul` call before the first path
+/// completes is handled by
+/// [`cards::scrub_or_repath_position_forward`] just below the
+/// pathfind: pure-position queued steps (`position_dirty &&
+/// !data_dirty`) get DELETED, data-bearing rows get their position
+/// fields re-homed to the soul's `latest` row, and
+/// `position_preserve` rows stop the walk (recipe pins / magnetic
+/// anchors are author-pinned and movement can't yank them). Then
+/// the new step writes proceed from `now` using `soul.latest` as
+/// the path start — so the new path correctly resumes from whichever
+/// hex the soul had reached on the server timeline at interrupt time.
 #[reducer]
 pub fn move_soul(
     ctx: &ReducerContext,
@@ -274,10 +339,47 @@ pub fn move_soul(
         return Ok(());
     }
 
-    let path = pathfind(ctx, soul.surface, start, goal)?;
+    // Resolve this soul's movement speed from its definition's
+    // `speed` trait, falling back to `DEFAULT_SOUL_SPEED` for any
+    // soul-def that doesn't declare one. Used by `pathfind` and the
+    // per-step write loop below — both feed the same value into
+    // `step_cost` so the heuristic and the queued timings agree.
+    let speed = soul_speed(soul.packed_definition);
+    let path = pathfind(ctx, soul.surface, start, goal, speed)?;
 
     // Queue per-step soul-card writes at increasing future timestamps.
-    let now = (ctx.timestamp.to_micros_since_unix_epoch() / 1_000_000) as u32;
+    let now = cards::now_ms(ctx);
+
+    // Before queuing the new path, scrub or re-home any future rows
+    // on the soul card. Pure-position queued rows from a prior
+    // move_soul get deleted; rows carrying data (recipe completions,
+    // expiry events, etc.) keep their data but have their position
+    // fields re-homed to where the soul actually is *now* — without
+    // this, a future flag-change row would still carry stale position
+    // bytes from the old path. `position_preserve` rows (recipe slot
+    // pins, magnetic anchors) STOP the walk: those positions are
+    // author-pinned and movement can't yank them.
+    //
+    // Start position for re-homing is the soul's *current* state, not
+    // the path's destination — movement will redo the steps from now,
+    // re-stamping positions as it goes. Re-homing existing future
+    // rows to `now`'s position keeps any intermediate data-row visible
+    // at the soul's current spot until the new path's step writes
+    // sweep past it.
+    cards::scrub_or_repath_position_forward(
+        ctx,
+        soul.card_id,
+        now,
+        soul.surface,
+        soul.macro_zone,
+        soul.micro_zone,
+        soul.micro_location,
+    );
+
+    // Queue one row per path step at increasing future timestamps.
+    // The soul stays at its current row until the first step's
+    // valid_at promotes — that natural delay is what creates the
+    // "doesn't move, until it does" beat the client tweens between.
     let mut elapsed: f32 = 0.0;
     let mut last_time = now;
     for window in path.windows(2) {
@@ -299,12 +401,12 @@ pub fn move_soul(
                     to.q, to.r
                 )
             })?;
-        elapsed += step_cost(from_cost, to_cost);
-        // Round up so sub-second steps still advance the valid_at
-        // clock by at least one second, then clamp to strictly
-        // ascending so a path of cost-0.5 steps doesn't have two
-        // writes collide on the same second.
-        let mut step_time = now.saturating_add(elapsed.ceil() as u32);
+        elapsed += step_cost(speed, from_cost, to_cost);
+        // `elapsed` is real seconds (f32); convert to ms and round up
+        // so sub-ms drift still advances the valid_at clock by at least
+        // one ms, then clamp to strictly ascending so a burst of cheap
+        // steps doesn't collide on the same ms.
+        let mut step_time = now.saturating_add((elapsed * 1_000.0).ceil() as u64);
         if step_time <= last_time {
             step_time = last_time.saturating_add(1);
         }
@@ -327,6 +429,17 @@ pub fn move_soul(
             // world-rooted convention in `actions.rs` /
             // `world_gen.rs`.
             c.micro_location = 0;
+            // Client render hint: this row participates in a planned
+            // move. The arrow-overlay's target scan
+            // (`DataManager.resolveCardTarget`) only picks up future
+            // rows with BOTH `move_smooth` and `position_dirty` set
+            // — `position_dirty` is auto-set by `write_at` because
+            // the spatial fields above change row-over-row, but
+            // `move_smooth` must be set explicitly here. Without it
+            // the client can't tell a queued path step from any
+            // other position write (teleport, push, etc.) and the
+            // arrow never draws.
+            c.flags |= FLAG_MOVE_SMOOTH;
         });
     }
 
@@ -348,11 +461,18 @@ mod tests {
 
     #[test]
     fn step_cost_default() {
-        // Default tile cost 1 + speed 1 → 1 sec per step.
-        assert!((step_cost(1.0, 1.0) - 1.0).abs() < f32::EPSILON);
-        // Variable: 0.5 * 1 * (1 + 2) = 1.5
-        assert!((step_cost(1.0, 2.0) - 1.5).abs() < f32::EPSILON);
-        // Variable: 0.5 * 1 * (2 + 2) = 2
-        assert!((step_cost(2.0, 2.0) - 2.0).abs() < f32::EPSILON);
+        // speed = cost-units-per-second. Plains pair (cost=10) at
+        // speed 10 = 1 sec/hex.
+        assert!((step_cost(10.0, 10.0, 10.0) - 1.0).abs() < f32::EPSILON);
+        // Mixed plains↔forest (cost 10 ↔ 12): half-and-half average
+        // works out to 1.1 sec at speed 10.
+        assert!((step_cost(10.0, 10.0, 12.0) - 1.1).abs() < f32::EPSILON);
+        // Heavy tile pair (cost 30 ↔ 30) at speed 10 = 3 sec.
+        assert!((step_cost(10.0, 30.0, 30.0) - 3.0).abs() < f32::EPSILON);
+        // Faster soul: double the speed halves the time.
+        assert!((step_cost(20.0, 10.0, 10.0) - 0.5).abs() < f32::EPSILON);
+        // Slower soul: speed 1 over cost-100 terrain = 100 sec/hex
+        // (the user's reference example).
+        assert!((step_cost(1.0, 100.0, 100.0) - 100.0).abs() < f32::EPSILON);
     }
 }

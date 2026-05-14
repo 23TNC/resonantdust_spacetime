@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use crate::cards::{self, cards as _cards_table};
 use crate::packed::{pack_macro_zone, pack_micro_zone, pack_valid_at, valid_at_time, StackedState};
+use crate::sequence;
 
 /// World-layer surface threshold (mirrors the constant in
 /// `action_completion.rs` / `actions.rs`). Souls spawn on this surface
@@ -24,9 +25,10 @@ pub const FIRST_PLAYER_ID: u32 = 1024;
 #[spacetimedb::table(accessor = players, public)]
 #[derive(Debug, Clone)]
 pub struct Player {
-    /// Packed primary key — `[player_id: u32 | time_secs: u32]` (high | low).
-    /// Multiple rows per `player_id` form a version history; the latest is
-    /// the one with the largest `valid_at_time`.
+    /// Packed primary key — `[time_ms: u48 | seq: u16]` (high | low).
+    /// `player_id` is on the row column (see below). Multiple rows per
+    /// `player_id` form a version history; the latest is the one with
+    /// the largest `valid_at_time`.
     #[primary_key]
     pub valid_at: u64,
     #[index(btree)]
@@ -71,8 +73,8 @@ pub struct PlayerSession {
     pub player_id: u32,
 }
 
-fn now_secs(ctx: &ReducerContext) -> u32 {
-    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000_000) as u32
+fn now_ms(ctx: &ReducerContext) -> u64 {
+    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000) as u64
 }
 
 // Latest row for a player_id is the row with the largest time component of valid_at.
@@ -99,10 +101,23 @@ pub fn latest_by_name(ctx: &ReducerContext, name: &str) -> Option<Player> {
 // wall-clock second collide on the primary key; the existing row is replaced.
 // Also enqueues a one-shot delete schedule that prunes older versions.
 fn write(ctx: &ReducerContext, mut player: Player) -> Player {
-    player.valid_at = pack_valid_at(player.player_id, now_secs(ctx));
-    if ctx.db.players().valid_at().find(player.valid_at).is_some() {
-        ctx.db.players().valid_at().delete(player.valid_at);
+    // "Last write at this (player_id, time_ms) wins." See
+    // `cards::write_at` for the full rationale — same-time writes
+    // would otherwise accumulate distinct rows under the new
+    // sequence-bearing PK.
+    let time_ms = now_ms(ctx);
+    let stale: Vec<u64> = ctx
+        .db
+        .players()
+        .player_id()
+        .filter(player.player_id)
+        .filter(|p| valid_at_time(p.valid_at) == time_ms)
+        .map(|p| p.valid_at)
+        .collect();
+    for v in stale {
+        ctx.db.players().valid_at().delete(v);
     }
+    player.valid_at = pack_valid_at(time_ms, sequence::next_sequence(ctx));
     let inserted = ctx.db.players().insert(player);
     crate::schedule_delete_players::enqueue(ctx, inserted.player_id, inserted.valid_at);
     inserted
@@ -333,7 +348,7 @@ fn spawn_soul_for(ctx: &ReducerContext, player_id: u32) -> Result<u32, String> {
         soul_def,
         /* flags           */ 0,
     );
-    crate::on_create::trigger(ctx, soul_card_id, player_id)?;
+    crate::on_create::trigger(ctx, soul_card_id, player_id, now_ms(ctx))?;
     Ok(soul_card_id)
 }
 
