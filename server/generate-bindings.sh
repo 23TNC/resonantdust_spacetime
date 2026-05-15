@@ -1,27 +1,33 @@
 #!/bin/bash
+# Generate TypeScript bindings for one SpacetimeDB module.
+#
+# Usage: generate-bindings.sh <module-name>
+#
+# Reads the module from `/workspace/server/modules/<module>/` and
+# writes bindings to `/workspace/pixijs/src/server/spacetime/bindings/<module>/`.
+# Driven by `bin/st build` — see the bindings compose service.
 set -e
 
 SCRIPT_DIR="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
 
-SPACETIMEDB_DIR="$SCRIPT_DIR/spacetimedb"
-PIXI_OUT_DIR="$SCRIPT_DIR/../pixijs/src/server/spacetime/bindings"
-# RUST_OUT_DIR="$SCRIPT_DIR/../actionmanager/src/spacetime/bindings"
+MODULE="${1:-}"
+if [ -z "$MODULE" ]; then
+  echo "usage: generate-bindings.sh <module>"
+  echo "       e.g. generate-bindings.sh shard"
+  exit 1
+fi
 
-if [ ! -d "$SPACETIMEDB_DIR" ]; then
-  echo "Missing SpaceTimeDB project directory: $SPACETIMEDB_DIR"
+MODULE_DIR="$SCRIPT_DIR/modules/$MODULE"
+PIXI_OUT_DIR="$SCRIPT_DIR/../pixijs/src/server/spacetime/bindings/$MODULE"
+
+if [ ! -d "$MODULE_DIR" ]; then
+  echo "Missing module directory: $MODULE_DIR"
   exit 1
 fi
 
 mkdir -p "$PIXI_OUT_DIR"
-# mkdir -p "$RUST_OUT_DIR"
 
-echo "Generating TypeScript bindings..."
-spacetime generate --yes --lang typescript --out-dir "$PIXI_OUT_DIR" --module-path "$SPACETIMEDB_DIR"
+echo "Generating TypeScript bindings for module: $MODULE"
+spacetime generate --yes --lang typescript --out-dir "$PIXI_OUT_DIR" --module-path "$MODULE_DIR"
 echo "Done."
 echo "TypeScript bindings: $PIXI_OUT_DIR"
-
-# echo "Generating Rust bindings..."
-# rustup component add rustfmt 2>/dev/null || true
-# spacetime generate --lang rust --out-dir "$RUST_OUT_DIR" --module-path "$SPACETIMEDB_DIR"
-# echo "Done."
-# echo "Rust bindings: $RUST_OUT_DIR"

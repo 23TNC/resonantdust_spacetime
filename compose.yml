@@ -13,38 +13,44 @@ services:
       - ./keys:/etc/spacetimedb
       - ./config:/home/spacetime/.config/spacetime
       - ./data:/home/spacetime/.local/share/spacetime/data
-      - ../content:/workspace/server/spacetimedb/content
+      - ../content:/workspace/server/modules/shard/content
       - ./server:/workspace/server
       - ../pixijs:/workspace/pixijs
     working_dir: /workspace/server
     command:
       - start
       - --listen-addr=0.0.0.0:3000
-      - --jwt-priv-key-path 
+      - --jwt-priv-key-path
       - /etc/spacetimedb/id_ecdsa
-      - --jwt-pub-key-path 
+      - --jwt-pub-key-path
       - /etc/spacetimedb/id_ecdsa.pub
 
+  # Per-module wasm build. `bin/st build [<module>]` invokes this with
+  # `--workdir /workspace/server/modules/<module>` so `cargo build`
+  # targets the right crate. The `../content` mount is shard-specific —
+  # other modules that don't depend on the content crate (e.g. chat)
+  # simply ignore it.
   build:
     image: clockworklabs/spacetime:latest
     volumes:
       - ./server:/workspace/server
-      - ./data:/workspace/server/spacetimedb/data
-      - ../content:/workspace/server/spacetimedb/content
+      - ../content:/workspace/server/modules/shard/content
       - ../pixijs:/workspace/pixijs
     working_dir: /workspace/server
     command:
       - build
 
+  # Per-module TypeScript bindings codegen. `bin/st build` invokes
+  # `generate-bindings.sh <module>`, which fans out the spacetime
+  # generate call per module path. Output lands under
+  # `pixijs/src/server/spacetime/bindings/<module>/`.
   bindings:
     image: clockworklabs/spacetime:latest
     volumes:
       - ./server:/workspace/server
-      - ./data:/workspace/server/spacetimedb/data
-      - ../content:/workspace/server/spacetimedb/content
+      - ../content:/workspace/server/modules/shard/content
       - ../pixijs:/workspace/pixijs
     working_dir: /workspace/server
     entrypoint: ["/bin/bash"]
     command:
       - generate-bindings.sh
-
