@@ -20,9 +20,11 @@
 //                     `micro_zone.direction`)
 //     OnHex         → parent hex card_id (walk up via `micro_location`
 //                     to find root hex; hex chains aren't migrated)
-//   packed_def       u16 = [card_type: u4 | card_category: u4 | def_id: u8]
-//   zone_def         u8  = [card_type: u4 | card_category: u4]
+//   packed_def       u16 = [card_type: u4 | def_id: u12]
+//   zone_def         u8  = [card_type: u4 | 0: u4] (lower nibble reserved)
 //   tile row         u64 = 8 little-endian u8 def_ids (byte i = column i)
+//                       (Phase 2 of the category-retire / tile-expand
+//                        rewrite widens this to u12 per tile.)
 //   recipe           u16 = [recipe_type: u3 | recipe_category: u3 | recipe_id: u10]
 //
 // Rect chains (state = OnRoot) use the (root_id, position, direction)
@@ -263,29 +265,38 @@ pub fn unpack_micro_location_card_id(v: u32) -> u32 {
 }
 
 // ---- packed_definition -------------------------------------------------
+//
+// u16 layout: `[ card_type: u4 | def_id: u12 ]`. The `card_category`
+// dimension was retired (see
+// docs/CATEGORY_RETIRE_AND_TILE_EXPAND.md); its 4-bit slot now
+// belongs to `def_id`. Subscription mask `packed_definition < 0x4000`
+// (public types 0..=3) still works because the top 4 bits are still
+// `card_type`.
 
-pub fn pack_definition(card_type: u8, card_category: u8, def_id: u8) -> u16 {
-    (((card_type & 0xF) as u16) << 12)
-        | (((card_category & 0xF) as u16) << 8)
-        | (def_id as u16)
+pub const DEF_ID_MAX: u16 = 0x0FFF;
+pub const DEF_ID_MASK: u16 = 0x0FFF;
+pub const CARD_TYPE_MASK: u16 = 0xF000;
+
+pub fn pack_definition(card_type: u8, def_id: u16) -> u16 {
+    (((card_type & 0xF) as u16) << 12) | (def_id & DEF_ID_MASK)
 }
 
-pub fn unpack_definition(v: u16) -> (u8, u8, u8) {
-    (
-        ((v >> 12) & 0xF) as u8,
-        ((v >> 8) & 0xF) as u8,
-        (v & 0xFF) as u8,
-    )
+pub fn unpack_definition(v: u16) -> (u8, u16) {
+    (((v >> 12) & 0xF) as u8, v & DEF_ID_MASK)
 }
 
-// ---- zone_definition (u8 = u4 card_type | u4 card_category) -----------
+// ---- zone_definition (u8 = u4 card_type | u4 0) -----------------------
+//
+// Lower nibble is reserved (formerly `card_category`). Kept u8 for
+// schema stability rather than narrowing the `Zone.packed_definition`
+// column to u4.
 
-pub fn pack_zone_definition(card_type: u8, card_category: u8) -> u8 {
-    ((card_type & 0xF) << 4) | (card_category & 0xF)
+pub fn pack_zone_definition(card_type: u8) -> u8 {
+    (card_type & 0xF) << 4
 }
 
-pub fn unpack_zone_definition(v: u8) -> (u8, u8) {
-    ((v >> 4) & 0xF, v & 0xF)
+pub fn unpack_zone_definition(v: u8) -> u8 {
+    (v >> 4) & 0xF
 }
 
 // ---- recipe (u16 = u3 type | u3 category | u10 id) -------------------
@@ -307,24 +318,68 @@ pub fn unpack_recipe(v: u16) -> (u8, u8, u16) {
     )
 }
 
-// ---- tile rows (u64 holds 8 u8 def_ids, little-endian) ----------------
+// ---- zone tile storage (12 u64 holding 64 u12 def_ids) ---------------
+//
+// See docs/CATEGORY_RETIRE_AND_TILE_EXPAND.md. Mirrors the helpers in
+// `content/src/packed.rs` — the chat module has its own independent
+// copy of this file by convention.
 
-pub fn pack_tiles(tiles: [u8; 8]) -> u64 {
-    u64::from_le_bytes(tiles)
+pub const ZONE_TILE_U64_COUNT: usize = 12;
+pub const ZONE_TILE_COUNT: usize = 64;
+pub const ZONE_TILE_BITS: usize = 12;
+pub const ZONE_TILE_MAX: u16 = DEF_ID_MAX;
+
+pub fn tile_at(packed: &[u64; ZONE_TILE_U64_COUNT], idx: usize) -> u16 {
+    debug_assert!(idx < ZONE_TILE_COUNT, "tile index {} out of range", idx);
+    let start_bit = ZONE_TILE_BITS * idx;
+    let u64_idx = start_bit / 64;
+    let bit_offset = start_bit % 64;
+    if bit_offset + ZONE_TILE_BITS <= 64 {
+        ((packed[u64_idx] >> bit_offset) & 0xFFF) as u16
+    } else {
+        let low_bits = 64 - bit_offset;
+        let high_bits = ZONE_TILE_BITS - low_bits;
+        let low = (packed[u64_idx] >> bit_offset) & ((1u64 << low_bits) - 1);
+        let high = packed[u64_idx + 1] & ((1u64 << high_bits) - 1);
+        ((high << low_bits) | low) as u16
+    }
 }
 
-pub fn unpack_tiles(v: u64) -> [u8; 8] {
-    v.to_le_bytes()
+pub fn set_tile(packed: &mut [u64; ZONE_TILE_U64_COUNT], idx: usize, def_id: u16) {
+    debug_assert!(idx < ZONE_TILE_COUNT, "tile index {} out of range", idx);
+    let def_id = (def_id as u64) & 0xFFF;
+    let start_bit = ZONE_TILE_BITS * idx;
+    let u64_idx = start_bit / 64;
+    let bit_offset = start_bit % 64;
+    if bit_offset + ZONE_TILE_BITS <= 64 {
+        let mask: u64 = 0xFFF << bit_offset;
+        packed[u64_idx] = (packed[u64_idx] & !mask) | (def_id << bit_offset);
+    } else {
+        let low_bits = 64 - bit_offset;
+        let high_bits = ZONE_TILE_BITS - low_bits;
+        let low_mask = ((1u64 << low_bits) - 1) << bit_offset;
+        let high_mask = (1u64 << high_bits) - 1;
+        let low = def_id & ((1u64 << low_bits) - 1);
+        let high = def_id >> low_bits;
+        packed[u64_idx] = (packed[u64_idx] & !low_mask) | (low << bit_offset);
+        packed[u64_idx + 1] = (packed[u64_idx + 1] & !high_mask) | high;
+    }
 }
 
-pub fn tile_byte(v: u64, idx: usize) -> u8 {
-    v.to_le_bytes()[idx]
+pub fn tile_row(packed: &[u64; ZONE_TILE_U64_COUNT], row: usize) -> [u16; 8] {
+    let mut out = [0u16; 8];
+    let base = row * 8;
+    for col in 0..8 {
+        out[col] = tile_at(packed, base + col);
+    }
+    out
 }
 
-pub fn with_tile_byte(v: u64, idx: usize, b: u8) -> u64 {
-    let mut bs = v.to_le_bytes();
-    bs[idx] = b;
-    u64::from_le_bytes(bs)
+pub fn set_tile_row(packed: &mut [u64; ZONE_TILE_U64_COUNT], row: usize, tiles: &[u16; 8]) {
+    let base = row * 8;
+    for col in 0..8 {
+        set_tile(packed, base + col, tiles[col]);
+    }
 }
 
 #[cfg(test)]
@@ -402,8 +457,14 @@ mod tests {
 
     #[test]
     fn definition_roundtrip() {
-        let v = pack_definition(0xA, 0x5, 0xC3);
-        assert_eq!(unpack_definition(v), (0xA, 0x5, 0xC3));
+        let v = pack_definition(0xA, 0xABC);
+        assert_eq!(unpack_definition(v), (0xA, 0xABC));
+        let v = pack_definition(0x7, 0xFFF);
+        assert_eq!(unpack_definition(v), (0x7, 0xFFF));
+        let v = pack_definition(0x3, 0x1234);
+        assert_eq!(unpack_definition(v), (0x3, 0x234));
+        assert!(pack_definition(0x3, 0xFFF) < 0x4000);
+        assert!(pack_definition(0x4, 0x000) >= 0x4000);
     }
 
     #[test]
@@ -420,19 +481,44 @@ mod tests {
 
     #[test]
     fn zone_definition_roundtrip() {
-        let v = pack_zone_definition(0xC, 0x3);
-        assert_eq!(unpack_zone_definition(v), (0xC, 0x3));
+        let v = pack_zone_definition(0xC);
+        assert_eq!(unpack_zone_definition(v), 0xC);
+        assert_eq!(v & 0xF, 0x0);
     }
 
     #[test]
-    fn tile_roundtrip() {
-        let row = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        let v = pack_tiles(row);
-        assert_eq!(unpack_tiles(v), row);
-        assert_eq!(tile_byte(v, 0), 1);
-        assert_eq!(tile_byte(v, 7), 8);
-        let v2 = with_tile_byte(v, 3, 99);
-        assert_eq!(tile_byte(v2, 3), 99);
-        assert_eq!(tile_byte(v2, 0), 1);
+    fn tile_at_set_roundtrip() {
+        let mut packed = [0u64; ZONE_TILE_U64_COUNT];
+        for i in 0..ZONE_TILE_COUNT {
+            set_tile(&mut packed, i, (i + 1) as u16);
+        }
+        for i in 0..ZONE_TILE_COUNT {
+            assert_eq!(tile_at(&packed, i), (i + 1) as u16);
+        }
+    }
+
+    #[test]
+    fn tile_set_max_def_id() {
+        let mut packed = [0u64; ZONE_TILE_U64_COUNT];
+        set_tile(&mut packed, 0, ZONE_TILE_MAX);
+        set_tile(&mut packed, 63, ZONE_TILE_MAX);
+        assert_eq!(tile_at(&packed, 0), ZONE_TILE_MAX);
+        assert_eq!(tile_at(&packed, 63), ZONE_TILE_MAX);
+        set_tile(&mut packed, 5, 0x1FFF);
+        assert_eq!(tile_at(&packed, 5), 0xFFF);
+    }
+
+    #[test]
+    fn tile_straddle_boundaries() {
+        let mut packed = [0u64; ZONE_TILE_U64_COUNT];
+        for &idx in &[4, 5, 6, 10, 16, 21, 53, 58, 63] {
+            set_tile(&mut packed, idx, 0xABC);
+        }
+        for &idx in &[3, 7, 9, 11, 22] {
+            assert_eq!(tile_at(&packed, idx), 0);
+        }
+        for &idx in &[4, 5, 6, 10, 16, 21, 53, 58, 63] {
+            assert_eq!(tile_at(&packed, idx), 0xABC);
+        }
     }
 }

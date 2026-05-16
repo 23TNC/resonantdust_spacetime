@@ -6,7 +6,10 @@ use spacetimedb::{log, ReducerContext};
 
 use crate::action_completion;
 use crate::cards;
-use crate::magnetic;
+// Magnetic state is stamped on the card row via definition-flag
+// inheritance in `cards::create_at`; there is no separate on_create
+// recipe path for magnetic cards. See
+// [docs/MAGNETIC_REWRITE.md](../../../../../docs/MAGNETIC_REWRITE.md).
 use crate::packed::{valid_at_time, STACK_DIR_DOWN, STACK_DIR_UP};
 use crate::recipe_eval::{
     aspect_pool, entity_satisfied_pool, entity_specificity, has_predicates_feasible,
@@ -52,14 +55,8 @@ const FLAG_SLOT_HOLD: u32 = 1 << 5;
 /// satisfying the entity. Among eligible recipes the highest
 /// `(hex_spec, root_spec)` lexicographic tuple wins.
 ///
-/// **Magnetic recipes** (`recipe.magnetic.is_some()`) take a separate
-/// path: [`magnetic::install`] applies `set_start.hex` + the auto
-/// `magnetic_hold`, inserts a `MagneticAction` row, and returns. The
-/// non-magnetic completion-schedule code below does not run for them.
-///
-/// **Conditional durations** are rejected with `Err` for the
-/// non-magnetic path (same policy as `propose_action`). The magnetic
-/// path enforces the same restriction inside `magnetic::install`.
+/// **Conditional durations** are rejected with `Err` (same policy as
+/// `propose_action`).
 ///
 /// A no-match result is `Ok(())` — most card creations won't match any
 /// OnCreate recipe and that's fine.
@@ -80,18 +77,9 @@ pub fn trigger(
         None => return Ok(()),
     };
 
-    // Both `on_create/self` and `on_create/magnetic` recipes fire on
-    // card creation — the latter are magnetic outers, which we still
-    // surface here so the TODO skip-and-return branch below catches
-    // them. The two lists are concatenated; the specificity comparison
-    // below picks the best regardless of category.
-    let self_candidates = recipes_of_type(RecipeType::OnCreate)
-        .map_err(|err| format!("on_create: recipes_of_type: {err}"))?;
-    let magnetic_candidates = recipes_of_type(RecipeType::OnCreateMagnetic)
-        .map_err(|err| format!("on_create: recipes_of_type: {err}"))?;
-    let recipe_candidates = self_candidates
-        .into_iter()
-        .chain(magnetic_candidates.into_iter());
+    let recipe_candidates = recipes_of_type(RecipeType::OnCreate)
+        .map_err(|err| format!("on_create: recipes_of_type: {err}"))?
+        .into_iter();
 
     // Walk the owner's soul UP / DOWN stacks once so the has-specificity
     // tiebreaker can score recipes against them without re-walking
@@ -174,13 +162,10 @@ pub fn trigger(
         None => return Ok(()),
     };
 
-    if recipe.magnetic.is_some() {
-        // Magnetic path. `install` handles `set_start.hex` + auto
-        // `magnetic_hold` on the anchor and inserts the MagneticAction
-        // row; the non-magnetic completion-schedule code below is
-        // intentionally skipped.
-        return magnetic::install(ctx, recipe, card_id, caller_player_id);
-    }
+    // Pre-rewrite there was a magnetic-install branch here. Magnetic
+    // install now happens in `cards::create_at` via definition-flag
+    // inheritance + the `lifecycle_pending` hook; no separate
+    // recipe-driven path.
 
     let duration_secs = match &recipe.duration {
         Some(Duration::Fixed(s)) => *s,

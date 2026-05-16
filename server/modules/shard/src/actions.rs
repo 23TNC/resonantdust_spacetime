@@ -93,15 +93,16 @@ fn derive_synthetic_hex(
         .filter(macro_zone)
         .filter(|z| z.surface == surface)
         .max_by_key(|z| valid_at_time(z.valid_at))?;
-    let tile_byte = packed::tile_byte(zone.tile_row(r).unwrap_or(0), q as usize);
-    if tile_byte == 0 {
+    let tile_def_id = zone.tile_at(r, q).unwrap_or(0);
+    if tile_def_id == 0 {
         return None;
     }
-    // `packed_definition` layout: `[card_type:u4 | card_category:u4 |
-    // def_id:u8]`. The zone's `packed_definition` is `[type:u4 |
-    // category:u4]` already packed into a u8 — shift it up by 8 to
-    // open the low byte for the tile def_id.
-    let packed_def = ((zone.packed_definition as u16) << 8) | (tile_byte as u16);
+    // `packed_definition` layout: `[card_type:u4 | def_id:u12]`. The
+    // zone's `packed_definition` is `[type:u4 | 0:u4]` packed into a
+    // u8 — its high nibble holds the type, so a `<< 8` lands the
+    // type bits at u16 positions 12..=15. `tile_def_id` is u12 and
+    // ORs cleanly into the low 12 bits.
+    let packed_def = ((zone.packed_definition as u16) << 8) | tile_def_id;
     let location = action_completion::HexLocation {
         zone_id: zone.zone_id,
         macro_zone: zone.macro_zone,
@@ -291,7 +292,8 @@ fn process_stack(
     chain.extend(stack.stack_up.iter().copied());
 
     // Apply per-card writes. Each goes through cards::update_with so
-    // valid_at = now and the schedule_delete_cards sweep is enqueued.
+    // valid_at = now; retention is handled by the periodic
+    // `crate::gc` sweep.
     for (i, &card_id) in chain.iter().enumerate() {
         let (mut state, mut micro_location) = if i == 0 {
             (StackedState::Free, stack.micro_location)
@@ -553,11 +555,55 @@ pub fn propose_action(
     let recipe_def = recipe(recipe_id)
         .map_err(|e| format!("recipe lookup: {e}"))?
         .ok_or_else(|| format!("recipe {recipe_id} not registered"))?;
-    if !matches!(recipe_def.recipe_type, RecipeType::Stack(_)) {
+    let is_magnetic = matches!(recipe_def.recipe_type, RecipeType::Magnetic(_));
+    if !matches!(recipe_def.recipe_type, RecipeType::Stack(_)) && !is_magnetic {
         return Err(format!(
-            "recipe {recipe_id} is not a stack recipe ({:?})",
+            "recipe {recipe_id} is not a stack or magnetic recipe ({:?})",
             recipe_def.recipe_type
         ));
+    }
+    // Magnetic-recipe validation. For a magnetic recipe to be a
+    // legitimate resolution attempt, three things must hold:
+    //   1. The root card carries `FLAG_LIFECYCLE_PENDING` (it's an
+    //      active lifecycle anchor — required for any magnetic-recipe
+    //      submission).
+    //   2. The recipe's packed id matches `root.def.lifecycle_recipe_key`'s
+    //      resolved packed id. Stops clients from invoking some other
+    //      lifecycle recipe against this card.
+    //   3. (Implicitly handled below by existing slot validation.)
+    if is_magnetic {
+        if root == 0 {
+            return Err(format!(
+                "magnetic recipe {recipe_id} requires a root card; none provided",
+            ));
+        }
+        let root_card = cards::latest(ctx, root)
+            .ok_or_else(|| format!("root card {root} not found"))?;
+        const FLAG_LIFECYCLE_PENDING: u32 = 1 << 12;
+        if root_card.flags & FLAG_LIFECYCLE_PENDING == 0 {
+            return Err(format!(
+                "magnetic recipe {recipe_id}: root card {root} is not lifecycle-pending"
+            ));
+        }
+        let root_def_full = decode_definition(root_card.packed_definition)
+            .map_err(|err| format!("decode root def: {err}"))?
+            .ok_or_else(|| format!("root card {root} has unknown definition"))?;
+        match resonantdust_content::definition_core::lifecycle_recipe_for_def(root_def_full)
+            .map_err(|e| format!("lifecycle recipe lookup on root def: {e}"))?
+        {
+            None => {
+                return Err(format!(
+                    "magnetic recipe {recipe_id}: root card {root}'s def declares no lifecycle_recipe",
+                ));
+            }
+            Some(expected_id) if expected_id != recipe_id => {
+                return Err(format!(
+                    "magnetic recipe {recipe_id}: doesn't match root card {root}'s def \
+                     (expected recipe {expected_id})",
+                ));
+            }
+            Some(_) => {}
+        }
     }
 
     // Eligibility: every entity in the recipe must be satisfied by the
@@ -624,16 +670,21 @@ pub fn propose_action(
         }
     }
 
-    // Resolve direction once from the recipe — Stack(Up) → STACK_DIR_UP,
-    // Stack(Down) → STACK_DIR_DOWN. Used by both the slot chain
-    // (state-1) and the actor-on-root pin (state-2) so they share a
-    // direction. The recipe_type guard above already established this
-    // is `Stack(_)`, so the unreachable arm only fires if that guard
-    // is later relaxed without updating this.
+    // Resolve direction once from the recipe — Stack/Magnetic(Up) →
+    // STACK_DIR_UP, Stack/Magnetic(Down) → STACK_DIR_DOWN. Used by
+    // both the slot chain (state-1) and the actor-on-root pin
+    // (state-2) so they share a direction. The recipe_type guard
+    // above already established this is `Stack(_)` or `Magnetic(_)`,
+    // so the unreachable arm only fires if that guard is later
+    // relaxed without updating this.
     let direction = match recipe_def.recipe_type {
-        RecipeType::Stack(StackDirection::Up) => crate::packed::STACK_DIR_UP,
-        RecipeType::Stack(StackDirection::Down) => crate::packed::STACK_DIR_DOWN,
-        _ => unreachable!("recipe_type guard above ensures Stack(_)"),
+        RecipeType::Stack(StackDirection::Up) | RecipeType::Magnetic(StackDirection::Up) => {
+            crate::packed::STACK_DIR_UP
+        }
+        RecipeType::Stack(StackDirection::Down) | RecipeType::Magnetic(StackDirection::Down) => {
+            crate::packed::STACK_DIR_DOWN
+        }
+        _ => unreachable!("recipe_type guard above ensures Stack(_) or Magnetic(_)"),
     };
 
     // Apply per-card writes per the lock-phase contract:
@@ -976,6 +1027,25 @@ pub fn propose_action(
         start_ms,
     )?;
 
+    // Magnetic block check: if the caller has expired magnetic
+    // actions past the grace window, reject unless this call is
+    // attempting to resolve one. The carve-out is permissive — any
+    // of (hex, root, slots) overlapping the caller's blocked
+    // card_ids counts as a resolution attempt. If the recipe
+    // doesn't actually transform the magnetic card, the row stays
+    // and the next non-resolving call gets blocked again.
+    let involved: Vec<u32> = std::iter::once(hex)
+        .chain(std::iter::once(root))
+        .chain(slots.iter().copied())
+        .filter(|&id| id != 0)
+        .collect();
+    crate::lifecycle_pending::block_check(
+        ctx,
+        caller_player_id,
+        crate::cards::now_ms(ctx),
+        &involved,
+    )?;
+
     action_completion::apply(
         ctx,
         recipe_def,
@@ -1007,7 +1077,6 @@ fn entity_satisfied(entity: &Entity, def: &CardDefinition) -> bool {
             val >= *min
         }
         Entity::Type(type_id) => def.card_type == *type_id,
-        Entity::Category(cat_id) => def.card_category == *cat_id,
         Entity::Flag(bit) => def.flags & (1u32 << bit) != 0,
         Entity::Any => true,
         Entity::And(children) => children.iter().all(|c| entity_satisfied(c, def)),

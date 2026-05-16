@@ -1,6 +1,7 @@
 use resonantdust_content::definition_core::decode_definition;
 use spacetimedb::{table, ReducerContext, Table};
 
+use crate::lifecycle_pending::lifecycle_pending;
 use crate::packed::{pack_valid_at, valid_at_time};
 use crate::sequence;
 
@@ -43,6 +44,23 @@ const POSITION_HOLD_COUNT_MAX: u32 = 0b111;
 /// until it hits a row carrying this bit and returns that row's
 /// `owner_id` as the player.
 pub const FLAG_OWNED_BY_PLAYER: u32 = 1 << 20;
+
+/// `dead` (bit 7). Set by action_completion when a card is consumed
+/// as a recipe reagent. Used here for the magnetic-cleanup hook —
+/// when `FLAG_DEAD` flips 0 → 1 on a write, any lifecycle_pending
+/// row for the card is removed and the owner's PlayerProfile
+/// summary is re-synced. See [`crate::lifecycle_pending`].
+/// Also consumed by the GC sweep ([`crate::gc`]) to identify dead
+/// rows eligible for retention-bounded reaping.
+pub const FLAG_DEAD: u32 = 1 << 7;
+
+/// `lifecycle_pending` (bit 12; JSON name `magnetic` for stable-id
+/// discipline until Phase 6 of the lifecycle rewrite). Set on the
+/// install row of a card whose def declares a `lifecycle:` block,
+/// via definition-flag inheritance. Detected here on first-row
+/// writes to decide whether to insert a `lifecycle_pending` detail
+/// row.
+const FLAG_LIFECYCLE_PENDING: u32 = 1 << 12;
 
 /// Reserved sentinel player_id meaning "the world" (no real player
 /// owns this). Server players `0..=1023` are reserved for pseudo-
@@ -184,9 +202,10 @@ pub fn prior_at(ctx: &ReducerContext, card_id: u32, time_ms: u64) -> Option<Card
 }
 
 /// Delete every row for `card_id` whose `valid_at_time` matches
-/// exactly `time_ms`. Used by callers (e.g., `magnetic::end_magnetic_phase`)
-/// that want to remove a previously-future-stamped row by its time
-/// without knowing the opaque `sequence` portion of its PK. There's
+/// exactly `time_ms`. Used by `write_at` to purge a stale row at the
+/// same time before re-stamping, so in-reducer accumulation patterns
+/// (e.g., `souls::apply_slot_delta` firing N times at one `now_ms`)
+/// don't leave behind duplicates with stale seq values. There's
 /// usually 0 or 1 match; if multiple rows somehow share a time (which
 /// shouldn't happen under the global sequence allocator), every match
 /// is deleted to preserve "no leftover at this time" semantics.
@@ -292,12 +311,93 @@ fn write_at(ctx: &ReducerContext, mut card: Card, time_ms: u64) -> Card {
         ctx.db.cards().valid_at().delete(card.valid_at);
     }
     let inserted = ctx.db.cards().insert(card);
-    crate::schedule_delete_cards::enqueue(ctx, inserted.card_id, inserted.valid_at);
+    // No per-write delete schedule — reaping is handled by the
+    // periodic GC sweep ([`crate::gc`]) which applies retention
+    // rules over the whole cards table.
     crate::souls::on_card_write(ctx, prev_latest.as_ref(), &inserted, time_ms);
     if let Some(prev) = prev_latest.as_ref() {
         propagate_flag_diff_forward(ctx, &inserted, prev.flags, time_ms);
     }
+    on_card_write_lifecycle(ctx, prev_latest.as_ref(), &inserted, time_ms);
     inserted
+}
+
+/// Lifecycle-pending bookkeeping hook fired from `write_at` after the
+/// row is inserted and the souls / flag-prop hooks have run.
+///
+/// Two transitions to handle, both gated on prev-vs-new flag state:
+///
+/// - **Install (first row for a lifecycle card).** `prev_latest` is
+///   `None` AND the new row carries `FLAG_LIFECYCLE_PENDING`. Read
+///   `def.lifecycle_duration_ms` to derive `expires_at`, walk
+///   `owning_player` to find the responsible player, insert the
+///   detail row, re-sync the owner's `PlayerProfile` summary.
+///
+/// - **Dead transition.** `prev.flags & FLAG_DEAD == 0` AND
+///   `new.flags & FLAG_DEAD != 0`. The card is being consumed —
+///   remove any lifecycle_pending row (no-op if not lifecycle) and
+///   re-sync the owner's summary.
+///
+/// Out-of-band transitions (def-change without death, lifecycle
+/// flag cleared without death) are NOT covered here — current
+/// content design has recipes consume their lifecycle root, so
+/// death is the canonical cleanup trigger. If a recipe-of-the-
+/// future transforms without killing, that path needs its own hook.
+fn on_card_write_lifecycle(
+    ctx: &ReducerContext,
+    prev: Option<&Card>,
+    new_row: &Card,
+    _time_ms: u64,
+) {
+    let prev_dead = prev.map_or(false, |p| p.flags & FLAG_DEAD != 0);
+    let new_dead = new_row.flags & FLAG_DEAD != 0;
+    let became_dead = !prev_dead && new_dead;
+
+    // Install: first-ever row carrying the lifecycle flag.
+    let is_first_row = prev.is_none();
+    let is_lifecycle = new_row.flags & FLAG_LIFECYCLE_PENDING != 0;
+    if is_first_row && is_lifecycle && !new_dead {
+        // Pull `lifecycle_duration_ms` off the def. Decode failures
+        // are silently skipped here (content-authoring errors should
+        // surface via `validate_lifecycle_recipes` at test time
+        // rather than crash the write path). A lifecycle card whose
+        // def has no duration is malformed but the cards table
+        // itself remains consistent.
+        if let Some(duration_ms) = decode_definition(new_row.packed_definition)
+            .ok()
+            .flatten()
+            .and_then(|def| def.lifecycle_duration_ms)
+        {
+            let install_ms = valid_at_time(new_row.valid_at);
+            let expires_at_ms = install_ms.saturating_add(duration_ms as u64);
+            // owning_player walks up the owner chain to find a row
+            // carrying FLAG_OWNED_BY_PLAYER. World-owned cards return
+            // WORLD_PLAYER_ID (= 0); the detail row is still inserted
+            // but the block-check filters player_id=0 rows out (no
+            // one to block).
+            let player_id = owning_player(ctx, new_row.card_id).unwrap_or(WORLD_PLAYER_ID);
+            crate::lifecycle_pending::install(ctx, new_row.card_id, expires_at_ms, player_id);
+            crate::players::resync_lifecycle_summary(ctx, player_id);
+        }
+    }
+
+    // Dead transition: clean up regardless of whether the card was
+    // lifecycle. The remove is a no-op for non-lifecycle cards.
+    if became_dead {
+        // Find the player_id BEFORE removing the row (the row's
+        // player_id field is the authoritative attribution; the
+        // current owner chain may have shifted).
+        let player_id = ctx
+            .db
+            .lifecycle_pending()
+            .card_id()
+            .find(new_row.card_id)
+            .map(|r| r.player_id);
+        crate::lifecycle_pending::remove(ctx, new_row.card_id);
+        if let Some(pid) = player_id {
+            crate::players::resync_lifecycle_summary(ctx, pid);
+        }
+    }
 }
 
 /// Forward-propagate the flag delta between `prev_flags` (the row our

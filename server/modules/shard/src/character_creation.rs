@@ -42,7 +42,7 @@
 //! under the soul cap. That's what supports "delete a character and
 //! roll another from the same pack."
 
-use spacetimedb::{reducer, ReducerContext, Table};
+use spacetimedb::{reducer, ReducerContext};
 
 use resonantdust_content::definition_core::find_packed_by_key;
 use resonantdust_content::starter_pack_core::{starter_pack, StarterPackId};
@@ -113,6 +113,10 @@ pub fn create_character(
     starter_pack_id: StarterPackId,
 ) -> Result<(), String> {
     let player_id = players::resolve_caller(ctx)?;
+    // Magnetic block gate — no carve-out. Spawning a new character
+    // is card-progression and gated until expired magnetic actions
+    // are resolved on the caller's existing souls.
+    crate::lifecycle_pending::block_check(ctx, player_id, now_ms(ctx), &[])?;
 
     let pack = starter_pack(starter_pack_id)
         .map_err(|e| format!("create_character: registry: {e}"))?

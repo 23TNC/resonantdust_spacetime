@@ -1,15 +1,13 @@
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::OnceLock;
 
 use resonantdust_content::definition_core::{
     decode_definition, trait_id as resolve_trait_id, TraitId,
 };
-use spacetimedb::{reducer, ReducerContext};
+use spacetimedb::{reducer, ReducerContext, SpacetimeType};
 
 use crate::cards;
 use crate::packed::{
-    pack_definition, pack_macro_zone, pack_micro_zone, tile_byte, unpack_macro_zone,
+    pack_definition, pack_macro_zone, pack_micro_zone, unpack_macro_zone,
     unpack_micro_zone, valid_at_time, StackedState,
 };
 use crate::players;
@@ -24,26 +22,12 @@ use crate::zones::zones as _zones_table;
 /// seconds. At `speed: 1` the same terrain takes 10× longer.
 const DEFAULT_SOUL_SPEED: f32 = 10.0;
 
-/// Max nodes the A* expansion will visit before giving up. Bounds
-/// pathological searches (target on the far side of an unreachable
-/// chasm, malformed input) so the reducer doesn't burn unlimited
-/// instructions. Tune against typical path lengths; a radius-2
-/// bootstrap world is ~300 hexes, so 1000 leaves comfortable slack.
-const MAX_PATH_NODES: usize = 1_000;
-
-/// Axial-hex neighbor offsets (six directions). Layout convention:
-/// `(dq, dr)` deltas in the same axial space the rest of the codebase
-/// uses for `global_q / global_r`.
-const HEX_DIRS: [(i32, i32); 6] = [
-    (1, 0),
-    (-1, 0),
-    (0, 1),
-    (0, -1),
-    (1, -1),
-    (-1, 1),
-];
-
-// ---- pathfinding ----------------------------------------------------
+// ---- pathfinding helpers ------------------------------------------
+//
+// A* itself moved to the client ([pixijs/src/game/world/pathfind.ts]);
+// the helpers below stay because the server-side validator
+// (`move_soul_path`) reuses them per-step. See
+// [docs/MOVEMENT_REWRITE.md](../../../../../docs/MOVEMENT_REWRITE.md).
 
 /// Global axial-hex coordinate. `q = macro_q * 8 + local_q`, same for
 /// `r` — flattens out the zone-level layout so A* doesn't care about
@@ -72,7 +56,7 @@ fn hex_distance(a: Coord, b: Coord) -> i32 {
 /// the hex is treated as impassable (`None`) — the mini_zone occludes
 /// whatever's underneath. This matches `actions::derive_synthetic_hex`'s
 /// resolver so pathfinding and recipe-target lookups agree.
-fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u8> {
+fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u16> {
     let macro_q = c.q.div_euclid(8);
     let macro_r = c.r.div_euclid(8);
     let local_q = c.q.rem_euclid(8) as u8;
@@ -94,11 +78,10 @@ fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u8> {
             // Mini_zone grid is centered at (3, 3) in 7×7 layout.
             let mz_q = (3 + dq) as u8;
             let mz_r = (3 + dr) as u8;
-            let row_bytes = zone.tile_row(mz_r)?;
-            let byte = tile_byte(row_bytes, mz_q as usize);
+            let def_id = zone.tile_at(mz_r, mz_q)?;
             // `0` = empty mini_zone cell. Treat as impassable — the
             // mini_zone occludes the underlying world tile.
-            return if byte == 0 { None } else { Some(byte) };
+            return if def_id == 0 { None } else { Some(def_id) };
         }
     }
 
@@ -109,18 +92,16 @@ fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u8> {
         .filter(macro_zone)
         .filter(|z| z.surface == surface)
         .max_by_key(|z| valid_at_time(z.valid_at))?;
-    let row_bytes = zone.tile_row(local_r)?;
-    Some(tile_byte(row_bytes, local_q as usize))
+    zone.tile_at(local_r, local_q)
 }
 
-/// `card_type` / `card_category` of the tile-card bucket. Tiles
-/// live under `tile/default` in `content/cards/data/tiles/*.json` —
-/// `forest_1`, `forest_2`, `tree`, `rock`. Re-encoded via
-/// `pack_definition(TILE_CARD_TYPE, TILE_CARD_CATEGORY, def_id)` to
-/// look up a tile's `CardDefinition` from its u8 def_id (which is
-/// what's stored in zone tile bytes).
+/// `card_type` of the tile-card bucket. Tiles live under `tile/` in
+/// `content/cards/data/tiles/*.json` — `forest_1`, `forest_2`,
+/// `tree`, `rock`. Re-encoded via `pack_definition(TILE_CARD_TYPE,
+/// def_id)` to look up a tile's `CardDefinition` from its u8 def_id
+/// (Phase 2 of the category-retire / tile-expand rewrite will widen
+/// the per-tile field to u12).
 const TILE_CARD_TYPE: u8 = 7;
-const TILE_CARD_CATEGORY: u8 = 0;
 
 /// `cost` trait id, resolved once via `trait_id("cost")` and cached.
 /// Lazy-init avoids paying the trait-registry build on every
@@ -159,11 +140,11 @@ const DEFAULT_TILE_COST: f32 = 10.0;
 /// `DEFAULT_TILE_COST`; an unresolvable def_id (registry build
 /// failure, or a def_id not present in the catalog) is treated as
 /// impassable since the cost is undefined.
-fn tile_cost(def_id: u8) -> Option<f32> {
+fn tile_cost(def_id: u16) -> Option<f32> {
     if def_id == 0 {
         return None;
     }
-    let packed = pack_definition(TILE_CARD_TYPE, TILE_CARD_CATEGORY, def_id);
+    let packed = pack_definition(TILE_CARD_TYPE, def_id);
     let def = decode_definition(packed).ok().flatten()?;
     Some(def.trait_value(cost_trait_id()).unwrap_or(DEFAULT_TILE_COST))
 }
@@ -191,149 +172,75 @@ fn step_cost(speed: f32, from: f32, to: f32) -> f32 {
     0.5 * (from + to) / speed
 }
 
-/// A* over the world-hex grid. Returns the path inclusive of both
-/// endpoints — `[start, …, goal]` — ordered by traversal.
-fn pathfind(
-    ctx: &ReducerContext,
-    surface: u8,
-    start: Coord,
-    goal: Coord,
-    speed: f32,
-) -> Result<Vec<Coord>, String> {
-    // Heuristic scaling: minimum possible per-step cost on this
-    // surface is `step_cost(speed, DEFAULT_TILE_COST, DEFAULT_TILE_COST)`
-    // — i.e., 1 second at the catalog's plains baseline (cost 10,
-    // speed 10). The heuristic `hex_distance * h_scale` is admissible
-    // (never overestimates) provided no tile in the world is cheaper
-    // than `DEFAULT_TILE_COST`. Today every catalog tile uses
-    // cost ≥ 10 so that holds; if a future tile dips below, lower
-    // this bound accordingly.
-    let h_scale = step_cost(speed, DEFAULT_TILE_COST, DEFAULT_TILE_COST);
-
-    let mut open: BinaryHeap<(Reverse<i64>, Coord)> = BinaryHeap::new();
-    let mut came_from: BTreeMap<Coord, Coord> = BTreeMap::new();
-    let mut g_score: BTreeMap<Coord, f32> = BTreeMap::new();
-
-    g_score.insert(start, 0.0);
-    open.push((Reverse(0), start));
-
-    let mut expanded = 0usize;
-    while let Some((_, current)) = open.pop() {
-        if current == goal {
-            // Reconstruct path from `came_from`.
-            let mut path = vec![current];
-            let mut cur = current;
-            while let Some(&prev) = came_from.get(&cur) {
-                path.push(prev);
-                cur = prev;
-            }
-            path.reverse();
-            return Ok(path);
-        }
-        expanded += 1;
-        if expanded > MAX_PATH_NODES {
-            return Err(format!(
-                "movement: path search exceeded {MAX_PATH_NODES} nodes (start=({}, {}) goal=({}, {}))",
-                start.q, start.r, goal.q, goal.r,
-            ));
-        }
-        let current_g = g_score.get(&current).copied().unwrap_or(f32::INFINITY);
-        let Some(curr_def) = tile_def_at(ctx, surface, current) else {
-            continue;
-        };
-        let Some(curr_cost) = tile_cost(curr_def) else {
-            continue;
-        };
-        for &(dq, dr) in &HEX_DIRS {
-            let neighbor = Coord {
-                q: current.q + dq,
-                r: current.r + dr,
-            };
-            let Some(neigh_def) = tile_def_at(ctx, surface, neighbor) else {
-                continue;
-            };
-            let Some(neigh_cost) = tile_cost(neigh_def) else {
-                continue;
-            };
-            let tentative = current_g + step_cost(speed, curr_cost, neigh_cost);
-            let existing = g_score.get(&neighbor).copied().unwrap_or(f32::INFINITY);
-            if tentative < existing {
-                came_from.insert(neighbor, current);
-                g_score.insert(neighbor, tentative);
-                let f = tentative + hex_distance(neighbor, goal) as f32 * h_scale;
-                // BinaryHeap is a max-heap; `Reverse(i64)` flips it
-                // into a min-heap. Scale by 1000 to preserve sub-
-                // second cost precision through the i64 round.
-                open.push((Reverse((f * 1000.0) as i64), neighbor));
-            }
-        }
-    }
-    Err(format!(
-        "movement: no path from ({}, {}) to ({}, {}) on surface {surface}",
-        start.q, start.r, goal.q, goal.r,
-    ))
-}
 
 // ---- reducer --------------------------------------------------------
 
-/// Move the caller's soul card to the tile at `(target_surface,
-/// target_macro_zone, target_micro_zone)`.
+/// Cap on the number of steps the client-submitted path may contain.
+/// DoS guard: each step costs one zone btree lookup + a tile-cost
+/// resolve + a per-step row write, so the validation walk is linear
+/// in path length. 256 is generous for plausible cross-zone treks
+/// (8×8 tiles per zone, multiple zones) while keeping worst-case
+/// reducer time well under a millisecond. Tune against measured
+/// path lengths once a real load profile exists.
+const MAX_VALIDATION_STEPS: usize = 256;
+
+/// One step in a client-submitted path. Mirrors the
+/// `(surface, macro_zone, micro_zone)` triplet the soul row already
+/// carries — same packing, same `micro_zone` `state == OnHex`
+/// requirement. `micro_location` isn't on the wire (world-hex
+/// placements always use `0`).
 ///
-/// `soul_id` identifies which of the caller's souls to move — under
-/// the multi-character model a player may own several. Validation:
-///   - Caller resolves to a `player_id` via `resolve_caller`.
-///   - `soul_id` exists in `cards`.
-///   - The soul card's `owner_id` equals the calling `player_id`
-///     (post-flag-20 card-owner convention: a soul's `owner_id` is
-///     a `player_id`). Closes the "move someone else's soul"
-///     loophole.
-/// `player.soul_card_id` is *not* consulted here — multiple souls
-/// can move independently, and forcing them through any "currently
-/// active" slot would serialize control of the player's avatars.
+/// Per-step `surface` is carried so the wire format stays
+/// forward-compatible with cross-surface pathing (portals, etc.).
+/// Today the validator rejects any path where a step's `surface`
+/// differs from the soul's current surface.
+#[derive(SpacetimeType, Debug, Clone, Copy)]
+pub struct TilePoint {
+    pub surface: u8,
+    pub macro_zone: u32,
+    pub micro_zone: u8,
+}
+
+/// Move the caller's soul along a client-computed path.
 ///
-/// `target_micro_zone` must carry `state == OnHex` with the local
-/// `(q, r)` of the destination tile in its upper bits — the same
-/// encoding `propose_action` uses for hex-rooted action coords.
+/// The client runs A* against its `data.zonesLocal` mirror
+/// (see [pixijs/src/game/world/pathfind.ts]) and submits the
+/// resulting tile sequence here; the server validates adjacency +
+/// traversability + length and queues the per-step row writes.
+/// See [docs/MOVEMENT_REWRITE.md](../../../../../docs/MOVEMENT_REWRITE.md).
 ///
-/// Procedure:
-/// 1. Resolve caller → `player_id`. Look up `soul_id` card, verify
-///    ownership.
-/// 2. A* on the world-hex grid between the soul's current global
-///    coord and the target's global coord, on a single surface.
-///    Tile def 0 (empty) is impassable; every other tile resolves
-///    its `cost` trait (see [`tile_cost`]).
-/// 3. For each step in the path, write a future-stamped Card version
-///    row that updates the soul's `(surface, macro_zone, micro_zone,
-///    micro_location)` to the next tile. Step time is the cumulative
-///    `0.5 * (from.cost + to.cost) / speed` rounded up to the next
-///    whole second; `speed` (cost-units-per-second) comes from the
-///    soul def's `speed` trait. Consecutive steps are forced strictly
-///    ascending to avoid PK collisions on the `(card_id, time_secs)`
-///    valid_at key.
+/// Validation per step:
+///   - `surface` matches the soul's current surface (cross-surface
+///     transitions not supported).
+///   - `micro_zone`'s state bits == `OnHex`.
+///   - Axially adjacent to the predecessor (the soul's current tile
+///     for step 0; the previous step otherwise).
+///   - The tile is traversable — `tile_def_at` returns a def_id and
+///     `tile_cost` returns `Some(_)`. Empty tiles (`def_id == 0`) and
+///     impassable defs (no `cost` trait resolves) reject the path.
 ///
-/// **Interrupts.** A second `move_soul` call before the first path
-/// completes is handled by
-/// [`cards::scrub_or_repath_position_forward`] just below the
-/// pathfind: pure-position queued steps (`position_dirty &&
-/// !data_dirty`) get DELETED, data-bearing rows get their position
-/// fields re-homed to the soul's `latest` row, and
-/// `position_preserve` rows stop the walk (recipe pins / magnetic
-/// anchors are author-pinned and movement can't yank them). Then
-/// the new step writes proceed from `now` using `soul.latest` as
-/// the path start — so the new path correctly resumes from whichever
-/// hex the soul had reached on the server timeline at interrupt time.
+/// On any validation failure the reducer aborts before any row
+/// writes — partial paths don't get queued. On success the queue
+/// loop matches the cost / scheduling discipline the old
+/// server-side A* `move_soul` produced (same `step_cost` formula,
+/// same `valid_at` strictly-ascending clamp, same
+/// `scrub_or_repath_position_forward` cleanup).
+///
+/// **Interrupts.** A second `move_soul` call before the first
+/// path's last step lands invokes
+/// [`cards::scrub_or_repath_position_forward`] below: pure-position
+/// queued steps get DELETED; data-bearing rows have their position
+/// fields re-homed to the soul's `latest` row; `position_preserve`
+/// rows (recipe pins / magnetic anchors) stop the walk.
 #[reducer]
 pub fn move_soul(
     ctx: &ReducerContext,
     soul_id: u32,
-    target_surface: u8,
-    target_macro_zone: u32,
-    target_micro_zone: u8,
+    path: Vec<TilePoint>,
 ) -> Result<(), String> {
     let player_id = players::resolve_caller(ctx)?;
-    let soul = cards::latest(ctx, soul_id).ok_or_else(|| {
-        format!("movement: soul card {soul_id} not found")
-    })?;
+    let soul = cards::latest(ctx, soul_id)
+        .ok_or_else(|| format!("movement: soul card {soul_id} not found"))?;
     if soul.owner_id != player_id {
         return Err(format!(
             "movement: soul card {soul_id} is owned by player {} (not {player_id})",
@@ -341,65 +248,95 @@ pub fn move_soul(
         ));
     }
 
-    if soul.surface != target_surface {
+    if path.is_empty() {
+        return Err("movement: empty path".to_string());
+    }
+    if path.len() > MAX_VALIDATION_STEPS {
         return Err(format!(
-            "movement: cross-surface move not supported (soul on {}, target on {target_surface})",
-            soul.surface
+            "movement: path length {} exceeds cap {MAX_VALIDATION_STEPS}",
+            path.len()
         ));
     }
 
-    // Decode start (soul's current row).
+    // Decode the soul's current tile — this is the implicit step-0
+    // predecessor for the adjacency walk.
     let (s_lq, s_lr, _) = unpack_micro_zone(soul.micro_zone);
     let (s_mq, s_mr) = unpack_macro_zone(soul.macro_zone);
-    let start = Coord {
+    let mut prev = Coord {
         q: s_mq as i32 * 8 + s_lq as i32,
         r: s_mr as i32 * 8 + s_lr as i32,
     };
 
-    // Decode target.
-    let (t_lq, t_lr, t_state) = unpack_micro_zone(target_micro_zone);
-    if t_state != StackedState::OnHex {
-        return Err(format!(
-            "movement: target micro_zone state must be OnHex (got {t_state:?})"
-        ));
-    }
-    let (t_mq, t_mr) = unpack_macro_zone(target_macro_zone);
-    let goal = Coord {
-        q: t_mq as i32 * 8 + t_lq as i32,
-        r: t_mr as i32 * 8 + t_lr as i32,
-    };
-
-    if start == goal {
-        return Ok(());
-    }
-
-    // Resolve this soul's movement speed from its definition's
-    // `speed` trait, falling back to `DEFAULT_SOUL_SPEED` for any
-    // soul-def that doesn't declare one. Used by `pathfind` and the
-    // per-step write loop below — both feed the same value into
-    // `step_cost` so the heuristic and the queued timings agree.
     let speed = soul_speed(soul.packed_definition);
-    let path = pathfind(ctx, soul.surface, start, goal, speed)?;
 
-    // Queue per-step soul-card writes at increasing future timestamps.
-    let now = cards::now_ms(ctx);
-
-    // Before queuing the new path, scrub or re-home any future rows
-    // on the soul card. Pure-position queued rows from a prior
-    // move_soul get deleted; rows carrying data (recipe completions,
-    // expiry events, etc.) keep their data but have their position
-    // fields re-homed to where the soul actually is *now* — without
-    // this, a future flag-change row would still carry stale position
-    // bytes from the old path. `position_preserve` rows (recipe slot
-    // pins, magnetic anchors) STOP the walk: those positions are
-    // author-pinned and movement can't yank them.
+    // First pass: full validation walk. Resolve every step's tile cost
+    // up-front so we don't write rows for a path that turns out to be
+    // invalid halfway through.
     //
-    // Start position for re-homing is the soul's *current* state, not
-    // the path's destination — movement will redo the steps from now,
-    // re-stamping positions as it goes. Re-homing existing future
-    // rows to `now`'s position keeps any intermediate data-row visible
-    // at the soul's current spot until the new path's step writes
-    // sweep past it.
+    // Per-step costs are stored alongside the decoded coord so the
+    // write loop below doesn't repeat the zone lookups. Two passes
+    // because the write loop needs the cost of the PREVIOUS tile too
+    // (for `step_cost`), and stashing both with each step keeps the
+    // loop straightforward.
+    let mut decoded: Vec<(TilePoint, Coord, f32)> = Vec::with_capacity(path.len());
+    let start_cost = tile_def_at(ctx, soul.surface, prev)
+        .and_then(tile_cost)
+        .ok_or_else(|| {
+            format!(
+                "movement: soul's current tile ({}, {}) is not traversable",
+                prev.q, prev.r,
+            )
+        })?;
+    let mut prev_cost = start_cost;
+
+    for (idx, &point) in path.iter().enumerate() {
+        if point.surface != soul.surface {
+            return Err(format!(
+                "movement: step {idx} surface {} differs from soul surface {} (cross-surface not supported)",
+                point.surface, soul.surface,
+            ));
+        }
+        let (lq, lr, state) = unpack_micro_zone(point.micro_zone);
+        if state != StackedState::OnHex {
+            return Err(format!(
+                "movement: step {idx} micro_zone state must be OnHex (got {state:?})"
+            ));
+        }
+        let (mq, mr) = unpack_macro_zone(point.macro_zone);
+        let coord = Coord {
+            q: mq as i32 * 8 + lq as i32,
+            r: mr as i32 * 8 + lr as i32,
+        };
+        if hex_distance(prev, coord) != 1 {
+            return Err(format!(
+                "movement: step {idx} ({}, {}) not axially adjacent to predecessor ({}, {})",
+                coord.q, coord.r, prev.q, prev.r,
+            ));
+        }
+        let to_def = tile_def_at(ctx, point.surface, coord).ok_or_else(|| {
+            format!(
+                "movement: step {idx} ({}, {}) — no zone data (off-map or subscription gap server-side)",
+                coord.q, coord.r,
+            )
+        })?;
+        let to_cost = tile_cost(to_def).ok_or_else(|| {
+            format!(
+                "movement: step {idx} ({}, {}) is impassable (def_id={to_def})",
+                coord.q, coord.r,
+            )
+        })?;
+        decoded.push((point, coord, to_cost));
+        prev = coord;
+        prev_cost = to_cost;
+    }
+    // Silence unused-warning in the rare case the loop body is empty
+    // (path.is_empty() is rejected above, so this is purely defensive).
+    let _ = prev_cost;
+
+    // Validation passed — scrub any future-stamped rows on the soul
+    // from a prior path so the new path's writes start from a clean
+    // future. Same call site / semantics as today's `move_soul`.
+    let now = cards::now_ms(ctx);
     cards::scrub_or_repath_position_forward(
         ctx,
         soul.card_id,
@@ -410,60 +347,28 @@ pub fn move_soul(
         soul.micro_location,
     );
 
-    // Queue one row per path step at increasing future timestamps.
-    // The soul stays at its current row until the first step's
-    // valid_at promotes — that natural delay is what creates the
-    // "doesn't move, until it does" beat the client tweens between.
+    // Write loop. Per step: accumulate elapsed time via the same
+    // `step_cost` formula `move_soul` uses, force strictly-ascending
+    // `valid_at` to dodge PK collisions on cheap consecutive steps.
     let mut elapsed: f32 = 0.0;
     let mut last_time = now;
-    for window in path.windows(2) {
-        let from = window[0];
-        let to = window[1];
-        let from_cost = tile_def_at(ctx, soul.surface, from)
-            .and_then(tile_cost)
-            .ok_or_else(|| {
-                format!(
-                    "movement: step from ({}, {}) lands on impassable tile",
-                    from.q, from.r
-                )
-            })?;
-        let to_cost = tile_def_at(ctx, soul.surface, to)
-            .and_then(tile_cost)
-            .ok_or_else(|| {
-                format!(
-                    "movement: step to ({}, {}) lands on impassable tile",
-                    to.q, to.r
-                )
-            })?;
+    let mut from_cost = start_cost;
+    for (point, _coord, to_cost) in decoded {
         elapsed += step_cost(speed, from_cost, to_cost);
-        // `elapsed` is real seconds (f32); convert to ms and round up
-        // so sub-ms drift still advances the valid_at clock by at least
-        // one ms, then clamp to strictly ascending so a burst of cheap
-        // steps doesn't collide on the same ms.
         let mut step_time = now.saturating_add((elapsed * 1_000.0).ceil() as u64);
         if step_time <= last_time {
             step_time = last_time.saturating_add(1);
         }
         last_time = step_time;
 
-        // Re-encode `to` into zone-relative form for the row write.
-        let to_macro_q = to.q.div_euclid(8) as i16;
-        let to_macro_r = to.r.div_euclid(8) as i16;
-        let to_local_q = to.q.rem_euclid(8) as u8;
-        let to_local_r = to.r.rem_euclid(8) as u8;
-        let to_macro_zone = pack_macro_zone(to_macro_q, to_macro_r);
-        let to_micro_zone = pack_micro_zone(to_local_q, to_local_r, StackedState::OnHex);
-
         cards::update_with_at(ctx, soul.card_id, step_time, |c| {
-            c.surface = target_surface;
-            c.macro_zone = to_macro_zone;
-            c.micro_zone = to_micro_zone;
-            // World-hex placements use `micro_location = 0` (no parent
-            // card — the hex tile itself isn't a card). Mirrors the
-            // world-rooted convention in `actions.rs` /
-            // `world_gen.rs`.
+            c.surface = point.surface;
+            c.macro_zone = point.macro_zone;
+            c.micro_zone = point.micro_zone;
             c.micro_location = 0;
         });
+
+        from_cost = to_cost;
     }
 
     Ok(())

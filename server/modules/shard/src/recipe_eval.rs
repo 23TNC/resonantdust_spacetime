@@ -103,11 +103,10 @@ pub fn entity_satisfied_pool(
         }
         Entity::Card(_)
         | Entity::Type(_)
-        | Entity::Category(_)
         | Entity::Flag(_) => Err(
             "conditional duration entities can only reference aspects \
-             (or boolean combinators of them); card / type / category / \
-             flag predicates aren't meaningful in an aspect-pool context"
+             (or boolean combinators of them); card / type / flag \
+             predicates aren't meaningful in an aspect-pool context"
                 .to_string(),
         ),
     }

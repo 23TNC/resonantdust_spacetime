@@ -114,6 +114,20 @@ pub struct PlayerProfile {
     /// today's rules; "removing" a pack would require a tombstone
     /// policy we don't have yet.
     pub starter_packs: u64,
+    /// Number of active magnetic actions owned by this player —
+    /// summary of the `lifecycle_pending` detail table, kept on the
+    /// row so the block-check in `propose_action` doesn't need a
+    /// separate query in the common case. Maintained by
+    /// `cards::write_at` on the magnetic-install / dead-transition
+    /// paths. `0` means "no active magnetic actions" and the
+    /// `earliest_lifecycle_expires_ms` field is then meaningless.
+    pub lifecycle_count: u32,
+    /// Earliest `expires_at_ms` among this player's active magnetic
+    /// actions, or `0` when `lifecycle_count == 0`. The block-check
+    /// reads only this field to determine whether to engage the
+    /// gate (`now_ms > earliest + GRACE`). Recomputed from the
+    /// `lifecycle_pending` detail rows whenever an entry changes.
+    pub earliest_lifecycle_expires_ms: u64,
 }
 
 fn now_ms(ctx: &ReducerContext) -> u64 {
@@ -162,7 +176,8 @@ fn write(ctx: &ReducerContext, mut player: Player) -> Player {
     }
     player.valid_at = pack_valid_at(time_ms, sequence::next_sequence(ctx));
     let inserted = ctx.db.players().insert(player);
-    crate::schedule_delete_players::enqueue(ctx, inserted.player_id, inserted.valid_at);
+    // No per-write delete schedule — see `crate::gc` for the
+    // unified periodic sweep that handles prior-version reap.
     inserted
 }
 
@@ -222,6 +237,40 @@ pub fn validate_player_name(name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// ---- magnetic summary --------------------------------------------------
+
+/// Re-summarize a player's magnetic-action state by walking the
+/// `lifecycle_pending` detail table and writing the new
+/// `(count, earliest_expires_ms)` pair onto their `PlayerProfile`.
+/// No-op if the player has no profile row (shouldn't happen in
+/// normal flow — every player_id with lifecycle_pending entries
+/// came through `claim_or_login`'s profile-seed path).
+///
+/// Called from `cards::write_at` after magnetic-install /
+/// dead-transition events. Idempotent: re-running yields the same
+/// state for unchanged input.
+pub fn resync_lifecycle_summary(ctx: &ReducerContext, player_id: u32) {
+    if player_id == 0 {
+        // World-owned magnetics — no profile to update.
+        return;
+    }
+    let (count, earliest) = crate::lifecycle_pending::summarize_for_player(ctx, player_id);
+    let Some(mut profile) = ctx.db.player_profiles().player_id().find(player_id) else {
+        return;
+    };
+    if profile.lifecycle_count == count && profile.earliest_lifecycle_expires_ms == earliest {
+        return;
+    }
+    profile.lifecycle_count = count;
+    profile.earliest_lifecycle_expires_ms = earliest;
+    // PlayerProfile is mutated in place (one row per player, not
+    // history-style), so a delete+insert keyed by player_id is the
+    // pattern. Same as the existing starter_packs update path (if
+    // one existed).
+    ctx.db.player_profiles().player_id().delete(player_id);
+    ctx.db.player_profiles().insert(profile);
 }
 
 // ---- session resolution ----------------------------------------------
@@ -423,6 +472,8 @@ pub fn claim_or_login(ctx: &ReducerContext, name: String) -> Result<(), String> 
             ctx.db.player_profiles().insert(PlayerProfile {
                 player_id: new_id,
                 starter_packs: 1,
+                lifecycle_count: 0,
+                earliest_lifecycle_expires_ms: 0,
             });
             new_id
         }

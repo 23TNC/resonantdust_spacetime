@@ -1,6 +1,6 @@
 use spacetimedb::{reducer, ReducerContext, Table};
 
-use crate::packed::{pack_macro_zone, pack_tiles, pack_zone_definition, valid_at_time};
+use crate::packed::{self, pack_macro_zone, pack_zone_definition, valid_at_time};
 // Module + the generated `zones()` accessor trait. Without the trait
 // import, `ctx.db.zones()` fails to resolve outside `zones.rs` itself.
 // Same pattern as `magnetic.rs` uses for the cards accessor.
@@ -31,10 +31,10 @@ const TILE_ROCK: u8 = 4;
 
 // Zone-row `packed_definition` encodes which definition catalog its
 // tile bytes index into. For terrain that's `tile/default` —
-// `card_type = 7` ("tile") and `card_category = 0` ("default"). Same
-// pair `utilities::bootstrap` uses for its seed zones.
+// `card_type = 7` ("tile"). Same id `utilities::bootstrap` uses for
+// its seed zones. (The `card_category` dimension was retired — see
+// docs/CATEGORY_RETIRE_AND_TILE_EXPAND.md.)
 const TILE_ZONE_TYPE: u8 = 7;
-const TILE_ZONE_CATEGORY: u8 = 0;
 
 // First world surface. Surfaces `< 64` are reserved for inventory-ish
 // layers (the `q == 1` force rule in `actions.rs` and the inventory
@@ -159,14 +159,15 @@ pub const WORLD_SEED: u64 = 0xF05E_5700_DEAD_BEEF;
 /// generator used, so the revert is byte-equivalent to what
 /// `generate_forest_terrain` originally placed before the variant
 /// roll.
-pub fn biome_for(global_q: i32, global_r: i32) -> u8 {
+pub fn biome_for(global_q: i32, global_r: i32) -> u16 {
     let x = global_q as f32 * FOREST_BASE_SCALE;
     let y = global_r as f32 * FOREST_BASE_SCALE;
-    if fbm(x, y, WORLD_SEED) <= FOREST_THRESHOLD {
+    let def_id = if fbm(x, y, WORLD_SEED) <= FOREST_THRESHOLD {
         TILE_FOREST_1
     } else {
         TILE_FOREST_2
-    }
+    };
+    def_id as u16
 }
 
 /// Pick a tile `def_id` for the given world-hex coordinate.
@@ -233,18 +234,22 @@ pub fn tile_for(global_q: i32, global_r: i32, seed: u64) -> u8 {
 /// coord `(Q, R)` starts at world hex `(Q*8, R*8)`. Noise is sampled
 /// in world-hex coordinates, so biome blobs span zone boundaries
 /// instead of restarting at each zone's edge.
-pub fn generate_zone_tiles(macro_q: i16, macro_r: i16, seed: u64) -> [u64; 8] {
+pub fn generate_zone_tiles(
+    macro_q: i16,
+    macro_r: i16,
+    seed: u64,
+) -> [u64; packed::ZONE_TILE_U64_COUNT] {
     let base_q = macro_q as i32 * 8;
     let base_r = macro_r as i32 * 8;
-    let mut rows = [0u64; 8];
+    let mut packed = [0u64; packed::ZONE_TILE_U64_COUNT];
     for r in 0..8u8 {
-        let mut row = [TILE_FOREST_1; 8];
+        let mut row = [TILE_FOREST_1 as u16; 8];
         for c in 0..8u8 {
-            row[c as usize] = tile_for(base_q + c as i32, base_r + r as i32, seed);
+            row[c as usize] = tile_for(base_q + c as i32, base_r + r as i32, seed) as u16;
         }
-        rows[r as usize] = pack_tiles(row);
+        packed::set_tile_row(&mut packed, r as usize, &row);
     }
-    rows
+    packed
 }
 
 // ---- reducer ---------------------------------------------------------
@@ -257,11 +262,11 @@ pub fn generate_zone_tiles(macro_q: i16, macro_r: i16, seed: u64) -> [u64; 8] {
 /// - **Zone exists at that macro coord**: a new `valid_at` version row
 ///   is written with the regenerated tile bytes. `zone_id` is kept.
 /// - **No zone there yet**: a fresh zone is created with
-///   `surface = 64`, `packed_definition = (card_type=7,
-///   card_category=0)` (tile/default), and a freshly-allocated
-///   `zone_id`. Allocation walks `max(zone_id) + 1` at reducer entry
-///   and increments locally — fine while the table is small; promote
-///   to a counter table if the zone history grows hot.
+///   `surface = 64`, `packed_definition = pack_zone_definition(
+///   card_type=7)` (tile), and a freshly-allocated `zone_id`.
+///   Allocation walks `max(zone_id) + 1` at reducer entry and
+///   increments locally — fine while the table is small; promote to
+///   a counter table if the zone history grows hot.
 ///
 /// Then for each forest hex in each zone, [`forest_object_for`] rolls
 /// for a tree (40%), rock (10%), or nothing (50%). Hits become world
@@ -289,7 +294,7 @@ pub fn generate_forest_terrain(
         return Err("radius must be >= 0".to_string());
     }
 
-    let zone_def = pack_zone_definition(TILE_ZONE_TYPE, TILE_ZONE_CATEGORY);
+    let zone_def = pack_zone_definition(TILE_ZONE_TYPE);
 
     // Allocate zone_ids starting from max+1 at reducer entry. The
     // history-style schema means `iter()` returns every version row,

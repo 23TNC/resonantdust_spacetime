@@ -191,14 +191,14 @@ pub fn tile_at_anchor(
     let dr = target_global.1 - anchor_global.1;
     let mz_q = (MINI_ZONE_CENTER + dq) as u8;
     let mz_r = (MINI_ZONE_CENTER + dr) as u8;
-    let tile_byte = packed::tile_byte(zone.tile_row(mz_r).unwrap_or(0), mz_q as usize);
-    if tile_byte == 0 {
+    let tile_def_id = zone.tile_at(mz_r, mz_q).unwrap_or(0);
+    if tile_def_id == 0 {
         return None;
     }
     // Same packed_def synthesis world zones use: shift the zone's
-    // `[card_type:u4 | category:u4]` byte into the high u8 of the
-    // packed_def, OR the tile byte (def_id) into the low u8.
-    let packed_def = ((zone.packed_definition as u16) << 8) | (tile_byte as u16);
+    // `[card_type:u4 | 0:u4]` byte left 8 — the type bits land at
+    // u16 positions 12..15, leaving room for the u12 def_id below.
+    let packed_def = ((zone.packed_definition as u16) << 8) | tile_def_id;
     let location = action_completion::HexLocation {
         zone_id: zone.zone_id,
         macro_zone: zone.macro_zone,
@@ -240,6 +240,15 @@ pub fn deploy_mini_zone(
 ) -> Result<(), String> {
     // ---- caller resolution ----------------------------------------
     let caller_player_id = players::resolve_caller(ctx)?;
+    // Magnetic block gate — no carve-out. Deploying a mini-zone is
+    // an economic progression action and gated on expired-magnetic
+    // resolution.
+    crate::lifecycle_pending::block_check(
+        ctx,
+        caller_player_id,
+        cards::now_ms(ctx),
+        &[],
+    )?;
 
     // ---- anchor validation ----------------------------------------
     let anchor = cards::latest(ctx, anchor_card_id).ok_or_else(|| {
@@ -350,13 +359,13 @@ pub fn deploy_mini_zone(
     // mechanism (template on def / seed reducer / etc.).
     //
     // `packed_definition` on the Zone: matches the world-zone shape
-    // `pack_zone_definition(card_type=tile, card_category=default)`
-    // so tile-byte lookups (which OR the zone's packed_definition
-    // with the tile byte to build a full packed_def) produce a
-    // tile-kind card_def the recipe matcher can resolve. `card_type
-    // id 7 == "tile"` per content/cards/types.json; keep this in
-    // sync if those ids ever change.
-    let tile_zone_packed_def = pack_zone_definition(/* tile */ 7, /* default */ 0);
+    // `pack_zone_definition(card_type=tile)` so tile-byte lookups
+    // (which OR the zone's packed_definition with the tile byte to
+    // build a full packed_def) produce a tile-kind card_def the
+    // recipe matcher can resolve. `card_type id 7 == "tile"` per
+    // content/cards/types.json; keep this in sync if those ids ever
+    // change.
+    let tile_zone_packed_def = pack_zone_definition(/* tile */ 7);
     let zone_id = zones::next_zone_id(ctx);
     zones::create(
         ctx,
@@ -369,7 +378,7 @@ pub fn deploy_mini_zone(
         // contents. (No `FLAG_OWNED_BY_PLAYER` analog on Zone rows;
         // they're always card_id-keyed.)
         /* owner_id */ anchor_card_id,
-        /* tiles */ [0; 8],
+        /* tiles */ [0; crate::packed::ZONE_TILE_U64_COUNT],
     );
 
     Ok(())

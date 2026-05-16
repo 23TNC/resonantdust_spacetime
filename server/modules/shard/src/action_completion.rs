@@ -7,7 +7,7 @@ use resonantdust_content::recipe_core::{
 use spacetimedb::{log, ReducerContext};
 
 use crate::cards;
-use crate::packed::{pack_valid_at, unpack_macro_zone};
+use crate::packed::unpack_macro_zone;
 use crate::recipe_eval::HasMatches;
 use crate::world_gen;
 use crate::zones;
@@ -90,15 +90,6 @@ fn pack_progress_style(value: u32) -> u32 {
     (value & 0b111) << PROGRESS_STYLE_SHIFT
 }
 
-/// Grace period (milliseconds) between a card's death (its `dead`-bit
-/// flip) and the follow-up `schedule_delete_cards` sweep that wipes the
-/// card's remaining row. The dead row itself has `valid_at_time =
-/// completion_ms`; the sweep deletes rows with `valid_at_time < cutoff`
-/// (strict less-than), so we schedule it at `completion_ms + grace` to
-/// catch the dead row too. The grace is what clients use to see the dead
-/// bit and run a death animation before the row evaporates from the wire.
-const DEAD_ROW_GRACE_MS: u64 = 10_000;
-
 /// Apply a recipe's completion outcomes (reagent consumption, product
 /// generation, hold release) directly into the `cards` table with all
 /// writes stamped at `completion_ms`.
@@ -121,11 +112,9 @@ const DEAD_ROW_GRACE_MS: u64 = 10_000;
 /// committed atomically; later changes to those cards' owners do not
 /// retroactively affect already-resolved products.
 ///
-/// One `schedule_delete_cards` row is enqueued per consumed card at
-/// `completion_ms + DEAD_ROW_GRACE_SECS` so the dead row itself is
-/// eventually swept. The implicit sweep enqueued by `update_with_at`
-/// (firing at `completion_ms`) clears every prior version but
-/// preserves the dead row; this explicit second sweep catches it.
+/// Dead rows are reaped by the unified [`crate::gc`] sweep, not by a
+/// per-write schedule. The dead row at `valid_at_time = completion_ms`
+/// is what GC keys off when applying retention rules.
 #[allow(clippy::too_many_arguments)]
 pub fn apply(
     ctx: &ReducerContext,
@@ -158,8 +147,8 @@ pub fn apply(
     // slots[0] when the recipe declares slots. `root` is only the
     // actor in the OnCreate shape, where slots is empty and root is
     // the new card itself ("OnCreate root == actor" convention). The
-    // hex fallback covers degenerate on_create.magnetic shapes where
-    // only the anchor is resolved.
+    // hex fallback covers degenerate on_create shapes where only the
+    // anchor is resolved.
     //
     // For stack recipes with both root and slots — e.g.
     // `root: A, slots: B+C` — actor is B (slots[0]), not A. Root in
@@ -351,14 +340,11 @@ pub fn apply(
         // closure's count change is already in the row at
         // completion_ms before we walk forward.
         cards::propagate_position_hold_forward(ctx, id, completion_ms, false);
-        let cleanup_ms = completion_ms.saturating_add(DEAD_ROW_GRACE_MS);
-        // The enqueue helper reads `valid_at_time(packed)` to derive its
-        // own scheduling; we don't have (or need) the dead row's actual
-        // PK here since the schedule keys off card_id + scheduled_at.
-        // Just need a u64 whose `valid_at_time` decodes to `cleanup_ms`,
-        // i.e., the time portion is correct. Sequence portion = 0 is
-        // fine here (the schedule row doesn't go in the cards table).
-        crate::schedule_delete_cards::enqueue(ctx, id, pack_valid_at(cleanup_ms, 0));
+        // No explicit dead-row delete schedule — the periodic
+        // `crate::gc` sweep handles dead-row retention with its
+        // own policy (player-aware grace, 30-day hard cap). The
+        // dead row's `valid_at_time = completion_ms` is what the
+        // sweep keys off when deciding eligibility.
     }
 
     // Synthetic-hex consumption: revert the tile byte to its
@@ -472,14 +458,13 @@ pub fn apply(
                     continue;
                 };
                 let packed_def = resolve_product_entity(entity)?;
-                // packed_definition: [card_type:u4 | card_category:u4 |
-                // def_id:u8]. Tile bytes store only the def_id — low
-                // 8 bits. The high byte (type+category) must match
-                // the destination zone's `packed_definition`, but we
-                // trust the recipe author's `Entity::Card("tree")`
-                // alongside a `tile/default` zone to be consistent;
-                // a future enhancement can verify equality.
-                let def_id = (packed_def & 0xFF) as u8;
+                // packed_definition: [card_type:u4 | def_id:u12].
+                // Tile slots store only the def_id — low 12 bits. The
+                // high u4 (type) must match the destination zone's
+                // `packed_definition`, but we trust the recipe author's
+                // `Entity::Card("tree")` alongside a `tile` zone to be
+                // consistent; a future enhancement can verify equality.
+                let def_id = packed_def & 0x0FFF;
                 zones::set_tile_at(ctx, loc.zone_id, completion_ms, loc.row, loc.col, def_id);
             }
         }
@@ -576,9 +561,9 @@ pub fn apply(
     // released card stays put — their `micro_location` parent pointers
     // make them follow the bottom automatically. The bottom of the
     // released chain is `root` if a root was provided, else `slots[0]`
-    // if there are slots. The hex-only context (no root, no slots —
-    // e.g. an on_create.magnetic anchor) has no chain bottom to
-    // relocate (`bottom_id = 0`); hex tiles don't move regardless.
+    // if there are slots. The hex-only context (no root, no slots) has
+    // no chain bottom to relocate (`bottom_id = 0`); hex tiles don't
+    // move regardless.
     //
     // The relocate writes `surface=1, macro_zone=c.owner_id,
     // micro_zone=0, micro_location=0` — i.e. loose-at-default-position
@@ -650,13 +635,12 @@ fn resolve_product_entity(entity: &Entity) -> Result<u16, String> {
         }
         Entity::Any
         | Entity::Type(_)
-        | Entity::Category(_)
         | Entity::Flag(_)
         | Entity::Aspect(_, _)
         | Entity::And(_)
         | Entity::Not(_) => Err(format!(
             "product entity must be a Card or alternation; \
-             matcher entities (Any/Type/Category/Flag/Aspect/And/Not) cannot \
+             matcher entities (Any/Type/Flag/Aspect/And/Not) cannot \
              resolve to a single output card"
         )),
     }

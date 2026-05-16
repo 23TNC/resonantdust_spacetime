@@ -24,6 +24,10 @@ pub struct Zone {
     /// similarly carry their anchor's card_id so tile-as-hex outputs
     /// inherit the right container.
     pub owner_id: u32,
+    // 64 tiles × u12 def_id = 768 bits = 12 u64s. Bit packing
+    // crosses u64 boundaries; use `packed::tile_at` / `set_tile` to
+    // read / write individual tiles. See
+    // docs/CATEGORY_RETIRE_AND_TILE_EXPAND.md.
     pub t0: u64,
     pub t1: u64,
     pub t2: u64,
@@ -32,35 +36,59 @@ pub struct Zone {
     pub t5: u64,
     pub t6: u64,
     pub t7: u64,
+    pub t8: u64,
+    pub t9: u64,
+    pub t10: u64,
+    pub t11: u64,
 }
 
 impl Zone {
-    pub fn tile_row(&self, row: u8) -> Option<u64> {
-        Some(match row {
-            0 => self.t0,
-            1 => self.t1,
-            2 => self.t2,
-            3 => self.t3,
-            4 => self.t4,
-            5 => self.t5,
-            6 => self.t6,
-            7 => self.t7,
-            _ => return None,
-        })
+    /// Collect the 12 u64 tile fields into the fixed-size array the
+    /// `packed::tile_at` / `set_tile` helpers operate on.
+    pub fn tiles(&self) -> [u64; packed::ZONE_TILE_U64_COUNT] {
+        [
+            self.t0, self.t1, self.t2, self.t3,
+            self.t4, self.t5, self.t6, self.t7,
+            self.t8, self.t9, self.t10, self.t11,
+        ]
     }
 
-    pub fn assign_tile_row(&mut self, row: u8, value: u64) -> bool {
-        match row {
-            0 => self.t0 = value,
-            1 => self.t1 = value,
-            2 => self.t2 = value,
-            3 => self.t3 = value,
-            4 => self.t4 = value,
-            5 => self.t5 = value,
-            6 => self.t6 = value,
-            7 => self.t7 = value,
-            _ => return false,
-        }
+    /// Write the 12-u64 tile array back into the struct fields.
+    pub fn set_tiles(&mut self, tiles: &[u64; packed::ZONE_TILE_U64_COUNT]) {
+        self.t0 = tiles[0]; self.t1 = tiles[1]; self.t2 = tiles[2]; self.t3 = tiles[3];
+        self.t4 = tiles[4]; self.t5 = tiles[5]; self.t6 = tiles[6]; self.t7 = tiles[7];
+        self.t8 = tiles[8]; self.t9 = tiles[9]; self.t10 = tiles[10]; self.t11 = tiles[11];
+    }
+
+    /// Decode one row (0..=7) of 8 u12 tile def_ids.
+    pub fn tile_row(&self, row: u8) -> Option<[u16; 8]> {
+        if row >= 8 { return None; }
+        Some(packed::tile_row(&self.tiles(), row as usize))
+    }
+
+    /// Read a single tile by `(row, col)`. Returns `None` if either
+    /// coordinate is out of range (0..=7).
+    pub fn tile_at(&self, row: u8, col: u8) -> Option<u16> {
+        if row >= 8 || col >= 8 { return None; }
+        Some(packed::tile_at(&self.tiles(), (row * 8 + col) as usize))
+    }
+
+    /// Write one row of 8 u12 tile def_ids. Returns `false` for an
+    /// out-of-range row, mirroring the old `assign_tile_row` contract.
+    pub fn assign_tile_row(&mut self, row: u8, tiles: [u16; 8]) -> bool {
+        if row >= 8 { return false; }
+        let mut packed = self.tiles();
+        packed::set_tile_row(&mut packed, row as usize, &tiles);
+        self.set_tiles(&packed);
+        true
+    }
+
+    /// Write a single tile by `(row, col)`.
+    pub fn assign_tile(&mut self, row: u8, col: u8, def_id: u16) -> bool {
+        if row >= 8 || col >= 8 { return false; }
+        let mut packed = self.tiles();
+        packed::set_tile(&mut packed, (row * 8 + col) as usize, def_id);
+        self.set_tiles(&packed);
         true
     }
 }
@@ -150,7 +178,7 @@ pub fn create(
     macro_zone: u32,
     packed_definition: u8,
     owner_id: u32,
-    tiles: [u64; 8],
+    tiles: [u64; packed::ZONE_TILE_U64_COUNT],
 ) -> Zone {
     write(
         ctx,
@@ -161,14 +189,9 @@ pub fn create(
             macro_zone,
             packed_definition,
             owner_id,
-            t0: tiles[0],
-            t1: tiles[1],
-            t2: tiles[2],
-            t3: tiles[3],
-            t4: tiles[4],
-            t5: tiles[5],
-            t6: tiles[6],
-            t7: tiles[7],
+            t0: tiles[0],  t1: tiles[1],  t2: tiles[2],  t3: tiles[3],
+            t4: tiles[4],  t5: tiles[5],  t6: tiles[6],  t7: tiles[7],
+            t8: tiles[8],  t9: tiles[9],  t10: tiles[10], t11: tiles[11],
         },
     )
 }
@@ -224,45 +247,38 @@ pub fn set_owner_id(ctx: &ReducerContext, zone_id: u32, owner_id: u32) -> Option
 }
 
 // Replace all 8 tiles in row `row` (0..8).
-pub fn set_tile_row(ctx: &ReducerContext, zone_id: u32, row: u8, value: u64) -> Option<Zone> {
+pub fn set_tile_row(ctx: &ReducerContext, zone_id: u32, row: u8, tiles: [u16; 8]) -> Option<Zone> {
     if row >= 8 {
         return None;
     }
     update_with(ctx, zone_id, |z| {
-        z.assign_tile_row(row, value);
+        z.assign_tile_row(row, tiles);
     })
 }
 
-// Replace all 8 tile rows at once.
-pub fn set_tile_rows(ctx: &ReducerContext, zone_id: u32, tiles: [u64; 8]) -> Option<Zone> {
+// Replace all 64 tiles at once.
+pub fn set_tile_rows(ctx: &ReducerContext, zone_id: u32, tiles: [u64; packed::ZONE_TILE_U64_COUNT]) -> Option<Zone> {
     update_with(ctx, zone_id, |z| {
-        z.t0 = tiles[0];
-        z.t1 = tiles[1];
-        z.t2 = tiles[2];
-        z.t3 = tiles[3];
-        z.t4 = tiles[4];
-        z.t5 = tiles[5];
-        z.t6 = tiles[6];
-        z.t7 = tiles[7];
+        z.set_tiles(&tiles);
     })
 }
 
-// Replace one byte (one hex def_id) within row `row` at column `col`
-// (each 0..8). Stamps the new version row at *now*. Delegates to
-// `set_tile_at` so both the prior-row read and the forward-propagation
-// of the change apply uniformly — wall-clock writes are just the
+// Replace one tile (one hex def_id) at `(row, col)` (each 0..8).
+// Stamps the new version row at *now*. Delegates to `set_tile_at` so
+// both the prior-row read and the forward-propagation of the change
+// apply uniformly — wall-clock writes are just the
 // `time_ms = now_ms` special case.
 pub fn set_tile(
     ctx: &ReducerContext,
     zone_id: u32,
     row: u8,
     col: u8,
-    def_id: u8,
+    def_id: u16,
 ) -> Option<Zone> {
     set_tile_at(ctx, zone_id, now_ms(ctx), row, col, def_id)
 }
 
-/// Write a single tile byte at `(row, col)` to `def_id`, stamping the
+/// Write a single tile at `(row, col)` to `def_id`, stamping the
 /// new Zone version row at `time_ms`.
 ///
 /// Two pieces of bookkeeping beyond the obvious row write, both
@@ -279,10 +295,10 @@ pub fn set_tile(
 ///
 /// 2. **Forward-propagate the change.** After writing our row, walk
 ///    every future row (`valid_at_time > time_ms`) in ascending
-///    order. For each, if its byte at `(row, col)` still equals the
-///    prior row's byte (i.e., the tile was inherited from before our
-///    write — nobody deliberately changed it after us), overwrite it
-///    with `def_id`. Stop at the first row where the byte already
+///    order. For each, if its tile at `(row, col)` still equals the
+///    prior row's value (i.e., the tile was inherited from before
+///    our write — nobody deliberately changed it after us), overwrite
+///    it with `def_id`. Stop at the first row where the tile already
 ///    differs — that's a deliberate change made by another action;
 ///    clobbering it would corrupt the other action's outcome.
 ///
@@ -297,7 +313,7 @@ pub fn set_tile_at(
     time_ms: u64,
     row: u8,
     col: u8,
-    def_id: u8,
+    def_id: u16,
 ) -> Option<Zone> {
     if row >= 8 || col >= 8 {
         return None;
@@ -311,22 +327,19 @@ pub fn set_tile_at(
         .filter(zone_id)
         .filter(|z| valid_at_time(z.valid_at) <= time_ms)
         .max_by_key(|z| valid_at_time(z.valid_at))?;
-    let old_def_id = packed::tile_byte(prior.tile_row(row).unwrap_or(0), col as usize);
+    let old_def_id = prior.tile_at(row, col).unwrap_or(0);
 
-    // If the prior row already has this byte, our write is a no-op at
-    // the baseline. Skip the write but still run forward-propagation —
-    // there may be future rows that diverged for some other reason and
-    // we'd want to leave them alone (the propagation's stop-on-change
-    // rule does that), so this is a clean early-return.
+    // If the prior row already has this value, our write is a no-op
+    // at the baseline. Skip the write — there's no propagation to do
+    // either (every future row will already differ from `old_def_id`
+    // in some way that doesn't involve our change).
     if old_def_id == def_id {
         return Some(prior);
     }
 
-    // Build the new row on top of `prior`'s data + our one-byte change,
-    // then write at `time_ms`.
-    let cur = prior.tile_row(row).unwrap_or(0);
-    let next = packed::with_tile_byte(cur, col as usize, def_id);
-    prior.assign_tile_row(row, next);
+    // Build the new row on top of `prior`'s data + our one-tile
+    // change, then write at `time_ms`.
+    prior.assign_tile(row, col, def_id);
     let written = write_at(ctx, prior, time_ms);
 
     // (2) Forward-propagate. Collect the future-row valid_ats first so
@@ -344,9 +357,8 @@ pub fn set_tile_at(
         let Some(z) = ctx.db.zones().valid_at().find(v) else {
             continue;
         };
-        let row_bytes = z.tile_row(row).unwrap_or(0);
-        let cur_byte = packed::tile_byte(row_bytes, col as usize);
-        if cur_byte != old_def_id {
+        let cur_def = z.tile_at(row, col).unwrap_or(0);
+        if cur_def != old_def_id {
             // Deliberate change in this row (or one before it that we
             // already passed) — stop. Anything after this row is
             // presumed downstream of *that* deliberate change, not
@@ -354,8 +366,7 @@ pub fn set_tile_at(
             break;
         }
         let mut updated = z;
-        let new_row_bytes = packed::with_tile_byte(row_bytes, col as usize, def_id);
-        updated.assign_tile_row(row, new_row_bytes);
+        updated.assign_tile(row, col, def_id);
         ctx.db.zones().valid_at().delete(v);
         ctx.db.zones().insert(updated);
     }

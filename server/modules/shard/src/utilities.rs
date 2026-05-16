@@ -30,10 +30,12 @@ const BOOTSTRAP_WORLD_RADIUS: i16 = 2;
 
 /// Add a single card to a specific soul's inventory bucket.
 ///
-/// `soul_card_id` selects the destination soul. Caller must own
-/// that soul (`cards::owning_player(soul_card_id) == caller's
-/// player_id`); a player can't add cards to someone else's soul.
-/// Multi-character players pick which soul receives the card.
+/// Dev/admin tool — invoked from the CLI, not the client. The
+/// production client uses `propose_action` and never calls this. No
+/// caller-identity check: the CLI sends an anonymous identity that
+/// doesn't resolve to a player. The acting player for on-create
+/// downstream is derived from `soul_card_id`'s `owning_player`
+/// instead.
 ///
 /// `card_key` is the bare key from the card definition catalog (e.g.
 /// `"attack"`, `"fatigue"`) — the same identifier used in
@@ -41,10 +43,6 @@ const BOOTSTRAP_WORLD_RADIUS: i16 = 2;
 /// `resonantdust_content::definition_core::find_packed_by_key`. Pass the
 /// path-form `"type/category/key"` and you'll get a "unknown card key" error
 /// — use the bare key here.
-///
-/// Caller identity resolves to the acting player via `resolve_caller`
-/// — the client never sends a `player_id`, matching the
-/// `move_soul` / `equip_card` auth pattern.
 ///
 /// Card placement uses the inventory convention:
 /// - `surface = 1` (inventory surface)
@@ -66,15 +64,9 @@ pub fn add_card(
     let packed_definition = find_packed_by_key(&card_key)?
         .ok_or_else(|| format!("unknown card key {:?}", card_key))?;
 
-    let caller_player_id = players::resolve_caller(ctx)?;
     let soul_player = cards::owning_player(ctx, soul_card_id).ok_or_else(|| {
         format!("add_card: soul card {soul_card_id} not found or world-owned")
     })?;
-    if soul_player != caller_player_id {
-        return Err(format!(
-            "add_card: soul {soul_card_id} is owned by player {soul_player} (not {caller_player_id})"
-        ));
-    }
 
     let card_id = cards::next_card_id(ctx);
 
@@ -93,7 +85,8 @@ pub fn add_card(
     // Run OnCreate recipe matching against the new card. If a recipe
     // matches, holds get stamped on the card's row and a completion is
     // scheduled (`action_completion::apply` at card.valid_at + duration).
-    crate::on_create::trigger(ctx, card_id, caller_player_id, now_ms(ctx))?;
+    // Acting player = the soul's owner (CLI has no caller identity).
+    crate::on_create::trigger(ctx, card_id, soul_player, now_ms(ctx))?;
 
     Ok(())
 }

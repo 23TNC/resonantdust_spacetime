@@ -131,12 +131,8 @@ fn write_at(ctx: &ReducerContext, mut soul: Soul, time_ms: u64) -> Soul {
     }
     soul.valid_at = pack_valid_at(time_ms, sequence::next_sequence(ctx));
     let inserted = ctx.db.souls().insert(soul);
-    // Enqueue a one-shot sweeper to prune older soul versions
-    // `DELETE_DELAY_MS` after this row's `valid_at`. Without this,
-    // the souls history grows unboundedly — every `apply_slot_delta`
-    // call leaves another row behind. Mirrors the cards-table
-    // schedule_delete pattern.
-    crate::schedule_delete_souls::enqueue(ctx, inserted.card_id, inserted.valid_at);
+    // No per-write delete schedule — `crate::gc` handles
+    // prior-version reap on its periodic sweep.
     inserted
 }
 
