@@ -1,1 +1,0 @@
-/workspace/server/modules/chat/target/wasm32-unknown-unknown/release/resonantdust_chat.wasm: /workspace/server/modules/chat/src/chat.rs /workspace/server/modules/chat/src/lib.rs /workspace/server/modules/chat/src/packed.rs /workspace/server/modules/chat/src/sequence.rs
