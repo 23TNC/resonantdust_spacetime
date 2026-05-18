@@ -77,7 +77,18 @@ pub fn entity_satisfied_pool(
 ) -> Result<bool, String> {
     match entity {
         Entity::Aspect(aspect, min) => {
-            let val = pool.get(aspect).copied().unwrap_or(0);
+            // Sub-aspect widening: a pool with `berries: 2` satisfies
+            // a `food, min: 1` predicate because berries descends
+            // from food. Sum every pool entry whose aspect IS or
+            // descends from the predicate's target.
+            let mut val: i32 = 0;
+            for (a, v) in pool {
+                if resonantdust_content::definition_core::is_aspect_descendant(*a, *aspect)
+                    .unwrap_or(false)
+                {
+                    val += *v;
+                }
+            }
             Ok(val >= *min)
         }
         Entity::Any => Ok(true),

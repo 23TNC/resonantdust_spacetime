@@ -1,9 +1,10 @@
 use resonantdust_content::definition_core::find_packed_by_key;
 use spacetimedb::{reducer, ReducerContext};
 
-use crate::cards;
+use crate::cards::{self, cards as _cards_table};
 use crate::packed::{
-    pack_slot_micro_zone, pack_stack_micro_zone, unpack_micro_zone, StackedState, STACK_DIR_UP,
+    micro_zone_direction, pack_micro_location_xy, pack_micro_zone, pack_slot_micro_zone,
+    pack_stack_micro_zone, unpack_micro_zone, StackedState, INVENTORY_LAYER, STACK_DIR_UP,
 };
 use crate::players;
 use crate::recipe_eval::soul_stack;
@@ -239,4 +240,166 @@ pub fn equip_card(
     });
 
     Ok(())
+}
+
+/// Unequip a card from a soul's UP-stack — inverse of [`equip_card`].
+///
+/// The card AND everything currently above it in the chain detach as
+/// a single sub-chain into the soul's inventory bucket. The unequipped
+/// card becomes `Free` (loose) at `(target_x, target_y)`; descendants
+/// keep their parent-pointer back to it (a `Free`-rooted chain is a
+/// normal inventory stack shape). Descendants are re-stamped onto the
+/// inventory surface so they stay inside the soul's subscription scope.
+///
+/// **Mid-chain semantics:** unequipping a card with cards stacked
+/// above it pulls all of them along. Matches the drag UX where
+/// grabbing a chain member detaches the rest with it.
+///
+/// **Eligibility:**
+/// - Card must exist; `owning_soul` must resolve; soul must belong to
+///   the caller.
+/// - Card must currently be `OnRoot` or `Slot` in the UP direction.
+/// - Neither the card nor any descendant in its sub-chain may carry
+///   `FLAG_SLOT_HOLD` (rejecting mid-recipe unequip).
+#[reducer]
+pub fn unequip_card(
+    ctx: &ReducerContext,
+    card_id: u32,
+    target_x: i16,
+    target_y: i16,
+) -> Result<(), String> {
+    let caller_player_id = players::resolve_caller(ctx)?;
+    let card = cards::latest(ctx, card_id)
+        .ok_or_else(|| format!("unequip_card: card {card_id} not found"))?;
+
+    let soul_card_id = cards::owning_soul(ctx, card_id).ok_or_else(|| {
+        format!("unequip_card: card {card_id} has no owning soul (world-owned or orphaned)")
+    })?;
+    let soul_player = cards::owning_player(ctx, soul_card_id).unwrap_or(cards::WORLD_PLAYER_ID);
+    if soul_player != caller_player_id {
+        return Err(format!(
+            "unequip_card: card {card_id}'s soul {soul_card_id} is owned by player {soul_player} (not {caller_player_id})"
+        ));
+    }
+    if card_id == soul_card_id {
+        return Err(format!("unequip_card: can't unequip soul card {card_id}"));
+    }
+
+    // Only currently-chained cards can be unequipped.
+    let (_, _, state) = unpack_micro_zone(card.micro_zone);
+    if !matches!(state, StackedState::OnRoot | StackedState::Slot) {
+        return Err(format!(
+            "unequip_card: card {card_id} is not chained (state {state:?})"
+        ));
+    }
+    // Direction filter: this reducer is for the UP (equipment) chain.
+    // Action-stack (DOWN) cards aren't player-detachable.
+    if micro_zone_direction(card.micro_zone) != STACK_DIR_UP {
+        return Err(format!(
+            "unequip_card: card {card_id} is not on the UP (equipment) chain"
+        ));
+    }
+    if card.flags & FLAG_SLOT_HOLD != 0 {
+        return Err(format!(
+            "unequip_card: card {card_id} is claimed by an in-flight action"
+        ));
+    }
+
+    // Collect descendants (sub-chain above `card_id`). Any descendant
+    // carrying FLAG_SLOT_HOLD blocks the unequip — detaching it would
+    // orphan it mid-recipe.
+    let descendants = chain_descendants(ctx, soul_card_id, card_id);
+    for d in &descendants {
+        if d.flags & FLAG_SLOT_HOLD != 0 {
+            return Err(format!(
+                "unequip_card: descendant card {} is claimed by an in-flight action",
+                d.card_id
+            ));
+        }
+    }
+
+    // Detach this card → Free in inventory at the supplied target xy.
+    cards::update_with(ctx, card_id, |c| {
+        c.surface = INVENTORY_LAYER;
+        c.macro_zone = soul_card_id;
+        c.micro_zone = pack_micro_zone(0, 0, StackedState::Free);
+        c.micro_location = pack_micro_location_xy(target_x, target_y);
+        c.owner_id = soul_card_id;
+    });
+
+    // Re-stamp descendants into the inventory bucket. They keep their
+    // existing micro_zone / micro_location (parent-pointer to `card_id`
+    // is still valid; the chain shape is "Free root + Slot children",
+    // which is exactly a normal inventory stack). Only surface and
+    // macro_zone need updating because equip_card put them on the
+    // soul's world surface.
+    for d in &descendants {
+        cards::update_with(ctx, d.card_id, |c| {
+            c.surface = INVENTORY_LAYER;
+            c.macro_zone = soul_card_id;
+            c.owner_id = soul_card_id;
+        });
+    }
+
+    Ok(())
+}
+
+/// BFS-walk the cards owned by `soul_card_id` to collect the sub-chain
+/// rooted at `start_card_id` — every card whose chain of parent-
+/// pointers (`micro_location`) walks back through `start_card_id`.
+/// The starting card itself is NOT included.
+///
+/// Used by `unequip_card` to (1) pre-validate that no descendant
+/// carries `FLAG_SLOT_HOLD` and (2) re-stamp surface / macro_zone
+/// after detach. Mirrors the BFS shape of `recipe_eval::soul_stack`
+/// but starts from an arbitrary chain member rather than the soul,
+/// and intentionally skips the state / dead / slot_hold filters so
+/// callers can inspect those for themselves.
+fn chain_descendants(
+    ctx: &ReducerContext,
+    soul_card_id: u32,
+    start_card_id: u32,
+) -> Vec<cards::Card> {
+    use std::collections::{BTreeMap, BTreeSet};
+    const DEPTH_CAP: usize = 32;
+
+    // Build parent → children map from soul-owned cards. Iteration via
+    // the owner_id btree index keeps this cheap; same access pattern
+    // as soul_stack.
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    let mut children_of: BTreeMap<u32, Vec<cards::Card>> = BTreeMap::new();
+    for row in ctx.db.cards().owner_id().filter(soul_card_id) {
+        if !seen.insert(row.card_id) {
+            continue;
+        }
+        let Some(latest) = cards::latest(ctx, row.card_id) else {
+            continue;
+        };
+        if latest.micro_location == 0 {
+            continue;
+        }
+        children_of
+            .entry(latest.micro_location)
+            .or_default()
+            .push(latest);
+    }
+
+    let mut out: Vec<cards::Card> = Vec::new();
+    let mut frontier: Vec<u32> = vec![start_card_id];
+    for _ in 0..DEPTH_CAP {
+        let mut next: Vec<u32> = Vec::new();
+        for parent in &frontier {
+            if let Some(children) = children_of.remove(parent) {
+                for child in children {
+                    next.push(child.card_id);
+                    out.push(child);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    out
 }

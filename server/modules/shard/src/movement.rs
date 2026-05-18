@@ -78,7 +78,7 @@ fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u16> {
             // Mini_zone grid is centered at (3, 3) in 7×7 layout.
             let mz_q = (3 + dq) as u8;
             let mz_r = (3 + dr) as u8;
-            let def_id = zone.tile_at(mz_r, mz_q)?;
+            let def_id = zone.tile_def_id_at(mz_r, mz_q)?;
             // `0` = empty mini_zone cell. Treat as impassable — the
             // mini_zone occludes the underlying world tile.
             return if def_id == 0 { None } else { Some(def_id) };
@@ -92,7 +92,7 @@ fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u16> {
         .filter(macro_zone)
         .filter(|z| z.surface == surface)
         .max_by_key(|z| valid_at_time(z.valid_at))?;
-    zone.tile_at(local_r, local_q)
+    zone.tile_def_id_at(local_r, local_q)
 }
 
 /// `card_type` of the tile-card bucket. Tiles live under `tile/` in

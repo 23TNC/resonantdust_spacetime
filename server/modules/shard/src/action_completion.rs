@@ -347,6 +347,112 @@ pub fn apply(
         // sweep keys off when deciding eligibility.
     }
 
+    // Apply stock-consume clauses (`consume.hex.aspect.<name>: N`).
+    // Each clause decrements the targeted tile's row stock value for
+    // a specific aspect by `delta`, saturating at 0. Unlike
+    // `consume_synthetic_hex` (which replaces the whole tile def),
+    // this preserves the tile's def_id — the forest stays a forest,
+    // just with less wood. Runs before the def-revert so authors who
+    // declare both (which they shouldn't) see the def-revert win;
+    // documenting "don't mix" is cheaper than adding a parse-time
+    // mutual-exclusion check today.
+    //
+    // Pre-flight stock availability was already checked in
+    // `propose_action`; the same path here is the in-frame mutation.
+    // Forward-prop happens through `set_tile_stock_at`'s rewrite of
+    // future-stamped rows.
+    if !recipe_def.consume.is_empty() {
+        if let Some(loc) = &hex_location {
+            if let Some(zone) = zones::latest(ctx, loc.zone_id) {
+                let def_id = zone.tile_def_id_at(loc.row, loc.col).unwrap_or(0);
+                // Reconstruct the full packed_def the matcher saw at
+                // proposal so the def's stock_slot_index lookup is
+                // unambiguous. Same recipe as `derive_synthetic_hex`.
+                let packed_def = ((zone.packed_definition as u16) << 8) | def_id;
+                let def_full = resonantdust_content::definition_core::decode_definition(packed_def)
+                    .ok()
+                    .flatten();
+                if let Some(def_full) = def_full {
+                    for clause in &recipe_def.consume {
+                        let resonantdust_content::recipe_core::ConsumeRole::Hex = clause.role;
+                        match clause.op {
+                            resonantdust_content::recipe_core::StockOp::Sub => {
+                                // Sub-aspect widening: drain across every
+                                // descendant slot in declaration order
+                                // until `delta` is satisfied. The
+                                // pre-flight check in `actions.rs`
+                                // guaranteed the sum is sufficient, but
+                                // we saturate at 0 per slot defensively.
+                                let slot_indices = def_full
+                                    .descendant_stock_slot_indices(clause.aspect_id);
+                                if slot_indices.is_empty() {
+                                    continue;
+                                }
+                                let mut remaining = clause.delta;
+                                for slot_idx in slot_indices {
+                                    if remaining == 0 { break; }
+                                    let current = zone
+                                        .tile_stock_at(loc.row, loc.col, slot_idx)
+                                        .unwrap_or(0);
+                                    let drain = current.min(remaining);
+                                    let next = current.saturating_sub(drain);
+                                    zones::set_tile_stock_at(
+                                        ctx,
+                                        loc.zone_id,
+                                        completion_ms,
+                                        loc.row,
+                                        loc.col,
+                                        slot_idx,
+                                        next,
+                                    );
+                                    remaining = remaining.saturating_sub(drain);
+                                }
+                            }
+                            resonantdust_content::recipe_core::StockOp::Add
+                            | resonantdust_content::recipe_core::StockOp::Set => {
+                                // Add / Set require an exact aspect
+                                // match — semantics get ambiguous
+                                // across multiple descendant slots
+                                // (which one gets the increment?), so
+                                // authors must name the slot directly.
+                                let Some(slot_idx) = def_full.stock_slot_index(clause.aspect_id) else {
+                                    continue;
+                                };
+                                let slot_max = def_full
+                                    .stock
+                                    .iter()
+                                    .find(|s| s.aspect_id == clause.aspect_id)
+                                    .map(|s| s.max)
+                                    .unwrap_or(crate::packed::ZONE_TILE_STOCK_MAX);
+                                let current = zone
+                                    .tile_stock_at(loc.row, loc.col, slot_idx)
+                                    .unwrap_or(0);
+                                let next = match clause.op {
+                                    resonantdust_content::recipe_core::StockOp::Add => {
+                                        current.saturating_add(clause.delta).min(slot_max)
+                                    }
+                                    resonantdust_content::recipe_core::StockOp::Set => {
+                                        clause.delta.min(slot_max)
+                                    }
+                                    resonantdust_content::recipe_core::StockOp::Sub => unreachable!(),
+                                };
+                                zones::set_tile_stock_at(
+                                    ctx,
+                                    loc.zone_id,
+                                    completion_ms,
+                                    loc.row,
+                                    loc.col,
+                                    slot_idx,
+                                    next,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Synthetic-hex consumption: revert the tile byte to its
     // *underlying biome* — what `world_gen::tile_for` would have
     // produced before the per-tile variant roll. Chopping a tree
@@ -372,6 +478,12 @@ pub fn apply(
             let global_q = macro_q as i32 * 8 + loc.col as i32;
             let global_r = macro_r as i32 * 8 + loc.row as i32;
             let underlying = world_gen::biome_for(global_q, global_r);
+            // Revert to the underlying biome with zero stocks — the
+            // tile is "depleted" of whatever was here. Phase 4 of the
+            // tile-aspects rewrite will refine this once chop_tree /
+            // break_rock migrate to stock-consume (the revert may
+            // shift to "decrement stock by 1" rather than "replace
+            // the whole tile").
             zones::set_tile_at(
                 ctx,
                 loc.zone_id,
@@ -379,6 +491,8 @@ pub fn apply(
                 loc.row,
                 loc.col,
                 underlying,
+                0,
+                0,
             );
         }
     }
@@ -459,13 +573,25 @@ pub fn apply(
                 };
                 let packed_def = resolve_product_entity(entity)?;
                 // packed_definition: [card_type:u4 | def_id:u12].
-                // Tile slots store only the def_id — low 12 bits. The
-                // high u4 (type) must match the destination zone's
+                // Tile slots store only the def_id — low 12 bits — and
+                // `set_tile_at_with_defaults` seeds the row's stock
+                // bits from the destination def's declared defaults so
+                // a freshly-spawned `tree` tile starts with wood = 3
+                // (or whatever its `stock` block declares). Falls back
+                // to 0 / 0 when the def can't be decoded.
+                //
+                // The high u4 (type) must match the destination zone's
                 // `packed_definition`, but we trust the recipe author's
                 // `Entity::Card("tree")` alongside a `tile` zone to be
                 // consistent; a future enhancement can verify equality.
-                let def_id = packed_def & 0x0FFF;
-                zones::set_tile_at(ctx, loc.zone_id, completion_ms, loc.row, loc.col, def_id);
+                zones::set_tile_at_with_defaults(
+                    ctx,
+                    loc.zone_id,
+                    completion_ms,
+                    loc.row,
+                    loc.col,
+                    packed_def,
+                );
             }
         }
     }

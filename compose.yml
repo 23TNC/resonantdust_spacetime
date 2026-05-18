@@ -28,8 +28,8 @@ services:
   # Per-module wasm build. `bin/st build [<module>]` invokes this with
   # `--workdir /workspace/server/modules/<module>` so `cargo build`
   # targets the right crate. The `../content` mount is shard-specific —
-  # other modules that don't depend on the content crate (e.g. chat)
-  # simply ignore it.
+  # chat has no `resonantdust-content` path-dep today, so it simply
+  # ignores the mount target's absence.
   build:
     image: clockworklabs/spacetime:latest
     volumes:

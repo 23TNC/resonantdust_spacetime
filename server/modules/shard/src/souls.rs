@@ -14,6 +14,27 @@ use crate::sequence;
 // to a shared flags module when there's a real consumer count.
 const FLAG_DEAD: u32 = 1 << 7;
 
+/// Bit position of the 4-bit `portrait_id` field in `Card.flags`
+/// (bits 28..=31). See `content/cards/flags.json` → `cards.portrait_id`.
+pub const FLAG_PORTRAIT_SHIFT: u32 = 28;
+/// Mask covering the `portrait_id` nibble.
+pub const FLAG_PORTRAIT_MASK: u32 = 0xF << FLAG_PORTRAIT_SHIFT;
+
+/// Read the soul portrait index (0..=15) out of a `Card.flags` value.
+/// Meaningful only on soul cards; non-soul callers should ignore the
+/// result.
+pub fn portrait_id(flags: u32) -> u8 {
+    ((flags & FLAG_PORTRAIT_MASK) >> FLAG_PORTRAIT_SHIFT) as u8
+}
+
+/// Stamp the soul portrait index into a `Card.flags` value, clearing
+/// any prior value first. `id` is masked to 4 bits, so callers don't
+/// have to range-check; passing `id >= 16` silently truncates to the
+/// low nibble — consistent with the [`quad_set`] helper above.
+pub fn with_portrait(flags: u32, id: u8) -> u32 {
+    (flags & !FLAG_PORTRAIT_MASK) | (((id as u32) & 0xF) << FLAG_PORTRAIT_SHIFT)
+}
+
 /// Soul row — one per soul card, public so clients can subscribe.
 ///
 /// Positional fields (`surface`, `macro_zone`, `micro_zone`,
@@ -493,5 +514,20 @@ mod tests {
         assert_eq!(quad_get(v2, 1), 99);
         assert_eq!(quad_get(v2, 0), 10);
         assert_eq!(quad_get(v2, 2), 30);
+    }
+
+    #[test]
+    fn portrait_round_trip_and_isolation() {
+        // Each portrait id reads back through the high-nibble.
+        for id in 0u8..16 {
+            assert_eq!(portrait_id(with_portrait(0, id)), id);
+        }
+        // Overlay onto an existing flag word leaves the lower bits alone.
+        let base: u32 = (1 << 12) | (1 << 20) | 0b111 << 8;
+        let v = with_portrait(base, 0xA);
+        assert_eq!(portrait_id(v), 0xA);
+        assert_eq!(v & !FLAG_PORTRAIT_MASK, base);
+        // Out-of-range ids truncate to the low nibble (consistent with `quad_set`).
+        assert_eq!(portrait_id(with_portrait(0, 0xFF)), 0xF);
     }
 }

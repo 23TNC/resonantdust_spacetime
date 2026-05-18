@@ -8,3 +8,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 spacetimedb = { version = "=2.1.0" }
+# Chat has no card / zone / definition state to share with the
+# content crate. The two helpers it does need from `content/src/packed.rs`
+# (`pack_valid_at` / `valid_at_time`) are inlined into `src/packed.rs`
+# instead of paid for with a path-dep + bind-mount. Re-add
+# `resonantdust-content = { path = "content" }` here and the
+# matching `../content:/workspace/server/modules/chat/content`
+# mounts in `../../../compose.yml` if chat ever needs the
+# definition / recipe registries.

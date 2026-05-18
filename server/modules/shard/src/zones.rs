@@ -24,70 +24,117 @@ pub struct Zone {
     /// similarly carry their anchor's card_id so tile-as-hex outputs
     /// inherit the right container.
     pub owner_id: u32,
-    // 64 tiles × u12 def_id = 768 bits = 12 u64s. Bit packing
-    // crosses u64 boundaries; use `packed::tile_at` / `set_tile` to
-    // read / write individual tiles. See
-    // docs/CATEGORY_RETIRE_AND_TILE_EXPAND.md.
-    pub t0: u64,
-    pub t1: u64,
-    pub t2: u64,
-    pub t3: u64,
-    pub t4: u64,
-    pub t5: u64,
-    pub t6: u64,
-    pub t7: u64,
-    pub t8: u64,
-    pub t9: u64,
-    pub t10: u64,
-    pub t11: u64,
+    // 64 tiles × u16 slot = 1024 bits = 16 u64. Each slot packs
+    // `[def_id:u12 | stock0:u2 | stock1:u2]`. Use the helpers below
+    // (`tile_at`, `tile_stock`, `assign_tile`, `assign_tile_stock`)
+    // rather than touching the u64 fields directly. See
+    // docs/TILE_ASPECTS.md.
+    pub t0: u64,  pub t1: u64,  pub t2: u64,  pub t3: u64,
+    pub t4: u64,  pub t5: u64,  pub t6: u64,  pub t7: u64,
+    pub t8: u64,  pub t9: u64,  pub t10: u64, pub t11: u64,
+    pub t12: u64, pub t13: u64, pub t14: u64, pub t15: u64,
 }
 
 impl Zone {
-    /// Collect the 12 u64 tile fields into the fixed-size array the
-    /// `packed::tile_at` / `set_tile` helpers operate on.
+    /// Collect the 16 u64 tile fields into the fixed-size array the
+    /// `packed::tile_*` helpers operate on.
     pub fn tiles(&self) -> [u64; packed::ZONE_TILE_U64_COUNT] {
         [
-            self.t0, self.t1, self.t2, self.t3,
-            self.t4, self.t5, self.t6, self.t7,
-            self.t8, self.t9, self.t10, self.t11,
+            self.t0,  self.t1,  self.t2,  self.t3,
+            self.t4,  self.t5,  self.t6,  self.t7,
+            self.t8,  self.t9,  self.t10, self.t11,
+            self.t12, self.t13, self.t14, self.t15,
         ]
     }
 
-    /// Write the 12-u64 tile array back into the struct fields.
+    /// Write the 16-u64 tile array back into the struct fields.
     pub fn set_tiles(&mut self, tiles: &[u64; packed::ZONE_TILE_U64_COUNT]) {
-        self.t0 = tiles[0]; self.t1 = tiles[1]; self.t2 = tiles[2]; self.t3 = tiles[3];
-        self.t4 = tiles[4]; self.t5 = tiles[5]; self.t6 = tiles[6]; self.t7 = tiles[7];
-        self.t8 = tiles[8]; self.t9 = tiles[9]; self.t10 = tiles[10]; self.t11 = tiles[11];
+        self.t0  = tiles[0];  self.t1  = tiles[1];  self.t2  = tiles[2];  self.t3  = tiles[3];
+        self.t4  = tiles[4];  self.t5  = tiles[5];  self.t6  = tiles[6];  self.t7  = tiles[7];
+        self.t8  = tiles[8];  self.t9  = tiles[9];  self.t10 = tiles[10]; self.t11 = tiles[11];
+        self.t12 = tiles[12]; self.t13 = tiles[13]; self.t14 = tiles[14]; self.t15 = tiles[15];
     }
 
-    /// Decode one row (0..=7) of 8 u12 tile def_ids.
-    pub fn tile_row(&self, row: u8) -> Option<[u16; 8]> {
+    /// Decode one row (0..=7) — returns `(def_id, stock0, stock1)`
+    /// per column. `None` for out-of-range row.
+    pub fn tile_row(&self, row: u8) -> Option<[(u16, u8, u8); 8]> {
         if row >= 8 { return None; }
         Some(packed::tile_row(&self.tiles(), row as usize))
     }
 
-    /// Read a single tile by `(row, col)`. Returns `None` if either
-    /// coordinate is out of range (0..=7).
-    pub fn tile_at(&self, row: u8, col: u8) -> Option<u16> {
+    /// Read a single tile by `(row, col)`. Returns
+    /// `(def_id, stock0, stock1)`; `None` if either coord out of
+    /// range.
+    pub fn tile_at(&self, row: u8, col: u8) -> Option<(u16, u8, u8)> {
         if row >= 8 || col >= 8 { return None; }
-        Some(packed::tile_at(&self.tiles(), (row * 8 + col) as usize))
+        Some(packed::tile_full(&self.tiles(), (row * 8 + col) as usize))
     }
 
-    /// Write one row of 8 u12 tile def_ids. Returns `false` for an
-    /// out-of-range row, mirroring the old `assign_tile_row` contract.
-    pub fn assign_tile_row(&mut self, row: u8, tiles: [u16; 8]) -> bool {
-        if row >= 8 { return false; }
+    /// Read just the def_id at `(row, col)`. Convenience for
+    /// callers that don't need stock.
+    pub fn tile_def_id_at(&self, row: u8, col: u8) -> Option<u16> {
+        if row >= 8 || col >= 8 { return None; }
+        Some(packed::tile_def_id(&self.tiles(), (row * 8 + col) as usize))
+    }
+
+    /// Read one stock slot (0 or 1) at `(row, col)`. Returns
+    /// `None` for out-of-range coords or slot index.
+    pub fn tile_stock_at(&self, row: u8, col: u8, slot: usize) -> Option<u8> {
+        if row >= 8 || col >= 8 || slot >= packed::ZONE_TILE_STOCK_SLOTS {
+            return None;
+        }
+        Some(packed::tile_stock(&self.tiles(), (row * 8 + col) as usize, slot))
+    }
+
+    /// Write a single tile by `(row, col)`: def_id + both stock
+    /// slots in one call. Returns `false` for out-of-range coords.
+    pub fn assign_tile(
+        &mut self,
+        row: u8,
+        col: u8,
+        def_id: u16,
+        stock0: u8,
+        stock1: u8,
+    ) -> bool {
+        if row >= 8 || col >= 8 { return false; }
         let mut packed = self.tiles();
-        packed::set_tile_row(&mut packed, row as usize, &tiles);
+        packed::set_tile_full(
+            &mut packed,
+            (row * 8 + col) as usize,
+            def_id,
+            stock0,
+            stock1,
+        );
         self.set_tiles(&packed);
         true
     }
 
-    /// Write a single tile by `(row, col)`.
-    pub fn assign_tile(&mut self, row: u8, col: u8, def_id: u16) -> bool {
+    /// Write a single tile's def_id at `(row, col)` while
+    /// preserving its stock slots.
+    pub fn assign_tile_def(&mut self, row: u8, col: u8, def_id: u16) -> bool {
         if row >= 8 || col >= 8 { return false; }
         let mut packed = self.tiles();
-        packed::set_tile(&mut packed, (row * 8 + col) as usize, def_id);
+        let idx = (row * 8 + col) as usize;
+        let (_, s0, s1) = packed::tile_full(&packed, idx);
+        packed::set_tile_full(&mut packed, idx, def_id, s0, s1);
+        self.set_tiles(&packed);
+        true
+    }
+
+    /// Write one stock slot at `(row, col)`. Other fields on the
+    /// tile (def_id + the other stock) are left untouched.
+    pub fn assign_tile_stock(
+        &mut self,
+        row: u8,
+        col: u8,
+        slot: usize,
+        value: u8,
+    ) -> bool {
+        if row >= 8 || col >= 8 || slot >= packed::ZONE_TILE_STOCK_SLOTS {
+            return false;
+        }
+        let mut packed = self.tiles();
+        packed::set_tile_stock(&mut packed, (row * 8 + col) as usize, slot, value);
         self.set_tiles(&packed);
         true
     }
@@ -189,9 +236,10 @@ pub fn create(
             macro_zone,
             packed_definition,
             owner_id,
-            t0: tiles[0],  t1: tiles[1],  t2: tiles[2],  t3: tiles[3],
-            t4: tiles[4],  t5: tiles[5],  t6: tiles[6],  t7: tiles[7],
-            t8: tiles[8],  t9: tiles[9],  t10: tiles[10], t11: tiles[11],
+            t0:  tiles[0],  t1:  tiles[1],  t2:  tiles[2],  t3:  tiles[3],
+            t4:  tiles[4],  t5:  tiles[5],  t6:  tiles[6],  t7:  tiles[7],
+            t8:  tiles[8],  t9:  tiles[9],  t10: tiles[10], t11: tiles[11],
+            t12: tiles[12], t13: tiles[13], t14: tiles[14], t15: tiles[15],
         },
     )
 }
@@ -246,13 +294,21 @@ pub fn set_owner_id(ctx: &ReducerContext, zone_id: u32, owner_id: u32) -> Option
     update_with(ctx, zone_id, |z| z.owner_id = owner_id)
 }
 
-// Replace all 8 tiles in row `row` (0..8).
-pub fn set_tile_row(ctx: &ReducerContext, zone_id: u32, row: u8, tiles: [u16; 8]) -> Option<Zone> {
+// Replace all 8 tiles in row `row` (0..8). Each entry is
+// `(def_id, stock0, stock1)`.
+pub fn set_tile_row(
+    ctx: &ReducerContext,
+    zone_id: u32,
+    row: u8,
+    tiles: [(u16, u8, u8); 8],
+) -> Option<Zone> {
     if row >= 8 {
         return None;
     }
     update_with(ctx, zone_id, |z| {
-        z.assign_tile_row(row, tiles);
+        for (col, &(def_id, s0, s1)) in tiles.iter().enumerate() {
+            z.assign_tile(row, col as u8, def_id, s0, s1);
+        }
     })
 }
 
@@ -263,23 +319,23 @@ pub fn set_tile_rows(ctx: &ReducerContext, zone_id: u32, tiles: [u64; packed::ZO
     })
 }
 
-// Replace one tile (one hex def_id) at `(row, col)` (each 0..8).
-// Stamps the new version row at *now*. Delegates to `set_tile_at` so
-// both the prior-row read and the forward-propagation of the change
-// apply uniformly — wall-clock writes are just the
-// `time_ms = now_ms` special case.
+// Replace one tile at `(row, col)` — def + both stocks. Stamps the
+// new version row at *now*. Delegates to `set_tile_at` so both the
+// prior-row read and the forward-propagation apply uniformly.
 pub fn set_tile(
     ctx: &ReducerContext,
     zone_id: u32,
     row: u8,
     col: u8,
     def_id: u16,
+    stock0: u8,
+    stock1: u8,
 ) -> Option<Zone> {
-    set_tile_at(ctx, zone_id, now_ms(ctx), row, col, def_id)
+    set_tile_at(ctx, zone_id, now_ms(ctx), row, col, def_id, stock0, stock1)
 }
 
-/// Write a single tile at `(row, col)` to `def_id`, stamping the
-/// new Zone version row at `time_ms`.
+/// Write a single tile at `(row, col)` — def + both stocks —
+/// stamping the new Zone version row at `time_ms`.
 ///
 /// Two pieces of bookkeeping beyond the obvious row write, both
 /// necessary for sane behaviour when actions on the same zone interleave
@@ -295,18 +351,20 @@ pub fn set_tile(
 ///
 /// 2. **Forward-propagate the change.** After writing our row, walk
 ///    every future row (`valid_at_time > time_ms`) in ascending
-///    order. For each, if its tile at `(row, col)` still equals the
-///    prior row's value (i.e., the tile was inherited from before
-///    our write — nobody deliberately changed it after us), overwrite
-///    it with `def_id`. Stop at the first row where the tile already
-///    differs — that's a deliberate change made by another action;
-///    clobbering it would corrupt the other action's outcome.
+///    order. For each, if its full tile slot at `(row, col)` (def +
+///    stocks together) still equals the prior row's value (i.e., the
+///    tile was inherited from before our write — nobody deliberately
+///    changed any field of it after us), overwrite it. Stop at the
+///    first row where the slot already differs — that's a deliberate
+///    change made by another action; clobbering it would corrupt the
+///    other action's outcome.
 ///
 /// The "stop on first deliberate change" rule keeps the propagation
 /// safe in the presence of multiple actions on the same tile across
-/// different times. The current world model doesn't let two players
-/// target the same tile yet, but the safety net is cheap and prevents
-/// a class of bugs from showing up later.
+/// different times. The comparison covers the full u16 slot so a
+/// stock-only mutation registers as a deliberate change too — see
+/// `set_tile_stock_at` for stock-only writes that share this
+/// machinery.
 pub fn set_tile_at(
     ctx: &ReducerContext,
     zone_id: u32,
@@ -314,6 +372,8 @@ pub fn set_tile_at(
     row: u8,
     col: u8,
     def_id: u16,
+    stock0: u8,
+    stock1: u8,
 ) -> Option<Zone> {
     if row >= 8 || col >= 8 {
         return None;
@@ -327,19 +387,15 @@ pub fn set_tile_at(
         .filter(zone_id)
         .filter(|z| valid_at_time(z.valid_at) <= time_ms)
         .max_by_key(|z| valid_at_time(z.valid_at))?;
-    let old_def_id = prior.tile_at(row, col).unwrap_or(0);
+    let old_slot = prior.tile_at(row, col).unwrap_or((0, 0, 0));
+    let new_slot = (def_id & 0x0FFF, stock0 & 0x3, stock1 & 0x3);
 
-    // If the prior row already has this value, our write is a no-op
-    // at the baseline. Skip the write — there's no propagation to do
-    // either (every future row will already differ from `old_def_id`
-    // in some way that doesn't involve our change).
-    if old_def_id == def_id {
+    // If the prior row already has this slot, our write is a no-op.
+    if old_slot == new_slot {
         return Some(prior);
     }
 
-    // Build the new row on top of `prior`'s data + our one-tile
-    // change, then write at `time_ms`.
-    prior.assign_tile(row, col, def_id);
+    prior.assign_tile(row, col, def_id, stock0, stock1);
     let written = write_at(ctx, prior, time_ms);
 
     // (2) Forward-propagate. Collect the future-row valid_ats first so
@@ -357,19 +413,86 @@ pub fn set_tile_at(
         let Some(z) = ctx.db.zones().valid_at().find(v) else {
             continue;
         };
-        let cur_def = z.tile_at(row, col).unwrap_or(0);
-        if cur_def != old_def_id {
-            // Deliberate change in this row (or one before it that we
-            // already passed) — stop. Anything after this row is
-            // presumed downstream of *that* deliberate change, not
-            // ours, so we leave it alone.
+        let cur_slot = z.tile_at(row, col).unwrap_or((0, 0, 0));
+        if cur_slot != old_slot {
             break;
         }
         let mut updated = z;
-        updated.assign_tile(row, col, def_id);
+        updated.assign_tile(row, col, def_id, stock0, stock1);
         ctx.db.zones().valid_at().delete(v);
         ctx.db.zones().insert(updated);
     }
 
     Some(written)
+}
+
+/// Look up the declared `stock.default` values for a packed tile
+/// def. Returns `(0, 0)` when the def is unknown or declares no
+/// stock slots. Shared by every zone-generation path so the
+/// "freshly-placed tile starts at its def's defaults" rule has one
+/// source of truth — worldgen seeds tiles this way, and
+/// `action_completion` uses it when a recipe spawns a tile via
+/// `ProductPlace::Location`.
+///
+/// `packed_def` is the full `[card_type:u4 | def_id:u12]` value.
+/// Callers with only a bare tile def_id should combine it with the
+/// tile card_type first (`pack_definition(7, def_id)` for world
+/// tiles); zones don't carry a card_type axis themselves.
+pub fn stock_defaults_for(packed_def: u16) -> (u8, u8) {
+    resonantdust_content::definition_core::decode_definition(packed_def)
+        .ok()
+        .flatten()
+        .map(|d| {
+            let s0 = d.stock.first().map(|s| s.default).unwrap_or(0);
+            let s1 = d.stock.get(1).map(|s| s.default).unwrap_or(0);
+            (s0, s1)
+        })
+        .unwrap_or((0, 0))
+}
+
+/// `set_tile_at` variant that seeds the stock bits from the def's
+/// declared defaults. Use this for fresh placements (worldgen,
+/// product spawns); use the explicit-stock [`set_tile_at`] when
+/// the caller is preserving / overriding row values (mutation
+/// passes, biome reverts that explicitly clear stocks).
+pub fn set_tile_at_with_defaults(
+    ctx: &ReducerContext,
+    zone_id: u32,
+    time_ms: u64,
+    row: u8,
+    col: u8,
+    packed_def: u16,
+) -> Option<Zone> {
+    let (s0, s1) = stock_defaults_for(packed_def);
+    set_tile_at(ctx, zone_id, time_ms, row, col, packed_def & 0x0FFF, s0, s1)
+}
+
+/// Surgical stock-only mutation: change `slot` (0 or 1) at
+/// `(row, col)` to `value`, preserving the tile's def_id and the
+/// other stock slot. Shares forward-prop discipline with
+/// [`set_tile_at`] — the propagator compares the full tile slot, so
+/// a stock-only write counts as a deliberate change against later
+/// rows.
+pub fn set_tile_stock_at(
+    ctx: &ReducerContext,
+    zone_id: u32,
+    time_ms: u64,
+    row: u8,
+    col: u8,
+    slot: usize,
+    value: u8,
+) -> Option<Zone> {
+    if row >= 8 || col >= 8 || slot >= packed::ZONE_TILE_STOCK_SLOTS {
+        return None;
+    }
+    let prior = ctx
+        .db
+        .zones()
+        .zone_id()
+        .filter(zone_id)
+        .filter(|z| valid_at_time(z.valid_at) <= time_ms)
+        .max_by_key(|z| valid_at_time(z.valid_at))?;
+    let (def_id, s0, s1) = prior.tile_at(row, col).unwrap_or((0, 0, 0));
+    let (new_s0, new_s1) = if slot == 0 { (value, s1) } else { (s0, value) };
+    set_tile_at(ctx, zone_id, time_ms, row, col, def_id, new_s0, new_s1)
 }

@@ -183,7 +183,7 @@ pub fn tile_at_anchor(
     anchor: &Card,
     world_macro_zone: u32,
     world_micro_zone: u8,
-) -> Option<(u16, action_completion::HexLocation)> {
+) -> Option<(u16, (u8, u8), action_completion::HexLocation)> {
     let zone = zones::latest_for(ctx, MINI_ZONE_LAYER, anchor.card_id)?;
     let target_global = global_hex(world_macro_zone, world_micro_zone);
     let anchor_global = global_hex(anchor.macro_zone, anchor.micro_zone);
@@ -191,7 +191,7 @@ pub fn tile_at_anchor(
     let dr = target_global.1 - anchor_global.1;
     let mz_q = (MINI_ZONE_CENTER + dq) as u8;
     let mz_r = (MINI_ZONE_CENTER + dr) as u8;
-    let tile_def_id = zone.tile_at(mz_r, mz_q).unwrap_or(0);
+    let (tile_def_id, stock0, stock1) = zone.tile_at(mz_r, mz_q).unwrap_or((0, 0, 0));
     if tile_def_id == 0 {
         return None;
     }
@@ -206,7 +206,7 @@ pub fn tile_at_anchor(
         row: mz_r,
         owner_id: zone.owner_id,
     };
-    Some((packed_def, location))
+    Some((packed_def, (stock0, stock1), location))
 }
 
 /// Deploy a mini_zone-anchor card from the caller's inventory onto

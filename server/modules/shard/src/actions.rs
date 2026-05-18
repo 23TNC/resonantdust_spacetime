@@ -67,7 +67,7 @@ fn derive_synthetic_hex(
     surface: u8,
     macro_zone: u32,
     micro_zone: u8,
-) -> Option<(u16, action_completion::HexLocation)> {
+) -> Option<(u16, (u8, u8), action_completion::HexLocation)> {
     if surface < SYNTHETIC_HEX_MIN_SURFACE {
         return None;
     }
@@ -93,7 +93,7 @@ fn derive_synthetic_hex(
         .filter(macro_zone)
         .filter(|z| z.surface == surface)
         .max_by_key(|z| valid_at_time(z.valid_at))?;
-    let tile_def_id = zone.tile_at(r, q).unwrap_or(0);
+    let (tile_def_id, stock0, stock1) = zone.tile_at(r, q).unwrap_or((0, 0, 0));
     if tile_def_id == 0 {
         return None;
     }
@@ -110,7 +110,7 @@ fn derive_synthetic_hex(
         row: r,
         owner_id: zone.owner_id,
     };
-    Some((packed_def, location))
+    Some((packed_def, (stock0, stock1), location))
 }
 /// Mask for the `progress_style` 3-bit field at bits 8..=10. With-holds
 /// rows clear this so any value inherited from a prior completion row
@@ -242,9 +242,15 @@ fn process_stack(
     let up_defs = pack_chain_defs(ctx, &stack.stack_up);
     let down_defs = pack_chain_defs(ctx, &stack.stack_down);
 
-    let up_match = match_stack_recipe(hex_def, root_def, &up_defs, StackDirection::Up)
+    // Legacy `submit_action` path: `hex_def` here comes from a Card
+    // row, not a synthetic zone tile, so there are no row stocks to
+    // thread. Pass `None`; recipes using `hex.aspect.X` predicates
+    // fall back to the def's static `aspects`. If this path is ever
+    // revived for live use against synthetic tiles, look up
+    // `Zone::tile_at` here and forward `Some((stock0, stock1))`.
+    let up_match = match_stack_recipe(hex_def, None, root_def, &up_defs, StackDirection::Up)
         .map_err(|e| format!("recipe match (up): {e}"))?;
-    let down_match = match_stack_recipe(hex_def, root_def, &down_defs, StackDirection::Down)
+    let down_match = match_stack_recipe(hex_def, None, root_def, &down_defs, StackDirection::Down)
         .map_err(|e| format!("recipe match (down): {e}"))?;
 
     // Holds for cards in matched recipes.
@@ -494,15 +500,19 @@ pub fn propose_action(
     // If neither path resolves (no hex card, no tile under the cursor,
     // or panel-surface), `hex_def = 0` — the matcher will reject the
     // recipe if it declared `hex` and accept it otherwise.
-    let (hex_def, hex_location) = if hex != 0 {
+    // `hex_stocks` is `Some` only when the hex came from a synthetic
+    // tile path (no Card row backing it). Real hex-Card rows don't
+    // carry per-row stock — recipes targeting them go through the
+    // def's static aspect values.
+    let (hex_def, hex_stocks, hex_location) = if hex != 0 {
         let def = cards::latest(ctx, hex)
             .ok_or_else(|| format!("hex card {hex} not found"))?
             .packed_definition;
-        (def, None)
+        (def, None, None)
     } else {
         match derive_synthetic_hex(ctx, surface, macro_zone, micro_zone) {
-            Some((def, loc)) => (def, Some(loc)),
-            None => (0, None),
+            Some((def, stocks, loc)) => (def, Some(stocks), Some(loc)),
+            None => (0, None, None),
         }
     };
 
@@ -616,7 +626,7 @@ pub fn propose_action(
             .ok_or_else(|| {
                 format!("recipe {recipe_id} requires a hex card; none provided or unknown def")
             })?;
-        if !entity_satisfied(e, def) {
+        if !entity_satisfied_with_stocks(e, def, hex_stocks) {
             return Err(format!("recipe {recipe_id}: hex card does not satisfy hex entity"));
         }
     }
@@ -667,6 +677,67 @@ pub fn propose_action(
                 "recipe {recipe_id}: slot {i} (card {}) does not satisfy slot entity",
                 slots[i]
             ));
+        }
+    }
+
+    // Pre-flight stock-availability check. Each `ConsumeStock` clause
+    // names a target role + aspect + delta — for v1 the role is
+    // always `Hex`, so the consume requires a synthetic-hex path that
+    // produced a stocks tuple. A real hex-Card row doesn't carry per-
+    // row stock; rejecting here is cleaner than the alternative of
+    // silently no-op'ing the consume at completion.
+    //
+    // For each clause: look up the tile def's stock slot for the
+    // aspect, read the row's current value, and reject if it's below
+    // the delta. The matcher's `Entity::Aspect` arm already enforces
+    // that the hex predicate is satisfied for the same aspect — this
+    // check just guards the consume's specific amount against the
+    // current row value (the predicate might say `min: 1` and pass
+    // for a tile with `wood: 1`, but a `consume.hex.aspect.wood: 2`
+    // would over-draw — both fail-on-propose so the client doesn't
+    // start a long-duration action that's doomed).
+    if !recipe_def.consume.is_empty() {
+        let Some(stocks) = hex_stocks else {
+            return Err(format!(
+                "recipe {recipe_id}: declares `consume` but no synthetic hex resolved \
+                 — stock consumption requires a tile-rooted hex"
+            ));
+        };
+        let hex_def_full = decode_definition(hex_def)
+            .map_err(|err| format!("decode hex def for consume check: {err}"))?
+            .ok_or_else(|| format!("recipe {recipe_id}: hex def unknown, can't validate consume"))?;
+        for clause in &recipe_def.consume {
+            let resonantdust_content::recipe_core::ConsumeRole::Hex = clause.role;
+            // Only `Sub` ops can fail pre-flight by under-drawing.
+            // `Add` and `Set` saturate at the slot's bounds — no
+            // amount of "too much" rejects a propose.
+            if clause.op != resonantdust_content::recipe_core::StockOp::Sub {
+                continue;
+            }
+            // Sub-aspect widening for consume, mirroring the
+            // matcher's `entity_specificity_with_stocks`: a recipe
+            // consuming `wood.sub: 1` against a forest tile carrying
+            // only `pine` stock resolves to the pine slot (pine
+            // descends from wood). Multi-descendant tiles (e.g.
+            // pine + oak) sum across all descendant slots — same
+            // total the matcher predicate sees, so the eligibility
+            // check and the consume check agree on what's available.
+            let slot_indices = hex_def_full.descendant_stock_slot_indices(clause.aspect_id);
+            if slot_indices.is_empty() {
+                return Err(format!(
+                    "recipe {recipe_id}: consume targets aspect_id {} but hex def {:?} declares no matching stock slot",
+                    clause.aspect_id, hex_def_full.key
+                ));
+            }
+            let available: u8 = slot_indices.iter().map(|&idx| {
+                if idx == 0 { stocks.0 } else { stocks.1 }
+            }).sum();
+            if available < clause.delta {
+                return Err(format!(
+                    "recipe {recipe_id}: tile stock for aspect_id {} (sum across {} descendant slots) is {}, recipe requires {}",
+                    clause.aspect_id, slot_indices.len(), available, clause.delta
+                ));
+            }
         }
     }
 
@@ -1066,24 +1137,74 @@ pub fn propose_action(
 // specificity score here — `propose_action` only cares about
 // eligibility, never about ranking against other recipes.
 fn entity_satisfied(entity: &Entity, def: &CardDefinition) -> bool {
+    entity_satisfied_with_stocks(entity, def, None)
+}
+
+/// Stock-aware variant of [`entity_satisfied`]. When `stocks` is
+/// `Some((stock0, stock1))` and the def declares a `stock` slot for
+/// an `Entity::Aspect`'s aspect, the row value is checked instead of
+/// the def's static aspect value. See [docs/TILE_ASPECTS.md] for the
+/// matcher widening rationale — row stock is the per-tile truth;
+/// the static aspect entry is fallback / non-tile use.
+///
+/// All other entity arms ignore `stocks`; only `Entity::Aspect` and
+/// its boolean-combinator parents (And/Or/Not/WeightedOr) thread it
+/// through.
+fn entity_satisfied_with_stocks(
+    entity: &Entity,
+    def: &CardDefinition,
+    stocks: Option<(u8, u8)>,
+) -> bool {
     match entity {
         Entity::Card(key) => &def.key == key,
         Entity::Aspect(aspect, min) => {
-            let val = def
+            use resonantdust_content::definition_core::is_aspect_descendant;
+            // Sub-aspect widening: a predicate asking for `food`
+            // matches a card carrying `berries` because berries
+            // descends from food. The def's row stock takes priority
+            // over its static `aspects` map when ANY matching stock
+            // slot is declared (mirrors the v1 single-aspect rule).
+            // Sum the row stock values across every slot whose id IS
+            // or descends from `*aspect`; if at least one such slot
+            // exists the stock total is the answer, otherwise fall
+            // back to summing static aspect values the same way.
+            if let Some((s0, s1)) = stocks {
+                let mut had_match = false;
+                let mut stock_total: i32 = 0;
+                for (idx, slot) in def.stock.iter().enumerate() {
+                    if is_aspect_descendant(slot.aspect_id, *aspect).unwrap_or(false) {
+                        had_match = true;
+                        let row_val = if idx == 0 { s0 } else { s1 } as i32;
+                        stock_total += row_val;
+                    }
+                }
+                if had_match {
+                    return stock_total >= *min;
+                }
+            }
+            // No stock slot for this aspect on this def — sum the
+            // static aspect contributions instead.
+            let total: i32 = def
                 .aspects
                 .iter()
-                .find_map(|(a, v)| (a == aspect).then_some(*v))
-                .unwrap_or(0);
-            val >= *min
+                .filter(|(a, _)| is_aspect_descendant(*a, *aspect).unwrap_or(false))
+                .map(|(_, v)| *v)
+                .sum();
+            total >= *min
         }
         Entity::Type(type_id) => def.card_type == *type_id,
         Entity::Flag(bit) => def.flags & (1u32 << bit) != 0,
         Entity::Any => true,
-        Entity::And(children) => children.iter().all(|c| entity_satisfied(c, def)),
-        Entity::Or(children) => children.iter().any(|c| entity_satisfied(c, def)),
-        Entity::Not(child) => !entity_satisfied(child, def),
+        Entity::And(children) => children
+            .iter()
+            .all(|c| entity_satisfied_with_stocks(c, def, stocks)),
+        Entity::Or(children) => children
+            .iter()
+            .any(|c| entity_satisfied_with_stocks(c, def, stocks)),
+        Entity::Not(child) => !entity_satisfied_with_stocks(child, def, stocks),
         Entity::WeightedOr { a, b, .. } => {
-            entity_satisfied(a, def) || entity_satisfied(b, def)
+            entity_satisfied_with_stocks(a, def, stocks)
+                || entity_satisfied_with_stocks(b, def, stocks)
         }
     }
 }

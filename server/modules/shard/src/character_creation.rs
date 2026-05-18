@@ -50,6 +50,7 @@ use resonantdust_content::starter_pack_core::{starter_pack, StarterPackId};
 use crate::cards::{self, cards as _cards_table};
 use crate::packed::{pack_macro_zone, pack_micro_zone, StackedState};
 use crate::players::{self, player_profiles as _player_profiles_table};
+use crate::souls::with_portrait;
 
 /// World surface band — souls spawn here, on the world hex grid.
 /// Mirrors the constant defined in `action_completion.rs` / `actions.rs`.
@@ -175,6 +176,20 @@ pub fn create_character(
             )
         })?;
     let soul_card_id = cards::next_card_id(ctx);
+    // Deterministic 4-bit portrait pick. Mixing the soul's
+    // freshly-allocated card id with `now_ms` and `player_id` gives
+    // a fresh value per soul without needing an rng (SpacetimeDB
+    // reducers stay deterministic; consecutive souls for the same
+    // player land on different portraits because `card_id`
+    // monotonically increments). See [`cards/flags.json`] →
+    // `cards.portrait_id` for the field layout.
+    let now = now_ms(ctx);
+    let portrait_seed = (now as u32)
+        ^ (now >> 32) as u32
+        ^ player_id
+        ^ soul_card_id;
+    let portrait_id = ((portrait_seed ^ (portrait_seed >> 4)) & 0xF) as u8;
+    let soul_flags = with_portrait(cards::FLAG_OWNED_BY_PLAYER, portrait_id);
     cards::create(
         ctx,
         soul_card_id,
@@ -184,7 +199,7 @@ pub fn create_character(
         /* micro_location  */ 0,
         /* owner_id        */ player_id,
         soul_def,
-        /* flags           */ cards::FLAG_OWNED_BY_PLAYER,
+        /* flags           */ soul_flags,
     );
     crate::on_create::trigger(ctx, soul_card_id, player_id, now_ms(ctx))?;
 
