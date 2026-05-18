@@ -27,15 +27,18 @@
 //! # Side effects (success path)
 //!
 //! 1. A new soul card lands at world origin: `surface = WORLD_LAYER`,
-//!    `macro_zone = (0, 0)`, `micro_zone = OnHex(0, 0)`,
+//!    `macro_zone = (0, 0)`, `micro_zone = Free(0, 0)`,
 //!    `owner_id = caller's player_id`, `flags = FLAG_OWNED_BY_PLAYER`.
+//!    The soul is `Free` at the world coords — under the unified card
+//!    model there's no separate "on hex" state; world placement *is*
+//!    Free with `(q, r)` encoded in micro_zone.
 //! 2. For each `StarterPackItem`, `count` copies are spawned in the
 //!    soul's inventory: `surface = INVENTORY_LAYER`,
 //!    `macro_zone = owner_id = soul.card_id`, `micro_zone = 0`,
 //!    `flags = 0`.
-//! 3. Every spawn fans out through `cards::create` →
-//!    `on_create::trigger`, so OnCreate recipes wired on the soul or
-//!    its starting cards fire automatically.
+//! 3. OnCreate recipe matching is now client-driven — the client scans
+//!    root-only recipes against each newly-created card and submits a
+//!    `propose_action` if any apply.
 //!
 //! The unlock bit is **not** cleared on character creation — a pack
 //! stays usable as long as it's unlocked and the player has room
@@ -195,20 +198,20 @@ pub fn create_character(
         soul_card_id,
         /* surface         */ WORLD_LAYER,
         /* macro_zone      */ pack_macro_zone(0, 0),
-        /* micro_zone      */ pack_micro_zone(0, 0, StackedState::OnHex),
+        /* micro_zone      */ pack_micro_zone(0, 0, StackedState::Free),
         /* micro_location  */ 0,
         /* owner_id        */ player_id,
         soul_def,
         /* flags           */ soul_flags,
     );
-    crate::on_create::trigger(ctx, soul_card_id, player_id, now_ms(ctx))?;
 
     // ---- Spawn the pack contents into the soul's inventory --------
     //
     // Each item lands loose at the soul's inventory address; client
-    // layout assigns local xy from there. `on_create::trigger` runs
-    // per-card so cards carrying OnCreate recipes (e.g. `fleeting`)
-    // get their completions queued.
+    // layout assigns local xy from there. OnCreate recipe matching is
+    // now client-driven — the client scans root-only recipes against
+    // each newly-created card and submits a `propose_action` if any
+    // apply.
     for item in &pack.contents {
         for _ in 0..item.count {
             let card_id = cards::next_card_id(ctx);
@@ -223,7 +226,6 @@ pub fn create_character(
                 item.packed_definition,
                 /* flags           */ 0,
             );
-            crate::on_create::trigger(ctx, card_id, player_id, now_ms(ctx))?;
         }
     }
 

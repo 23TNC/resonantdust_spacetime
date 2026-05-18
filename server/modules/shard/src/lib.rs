@@ -7,7 +7,6 @@ pub mod gc;
 pub mod lifecycle_pending;
 pub mod mini_zone;
 pub mod movement;
-pub mod on_create;
 pub mod packed;
 pub mod players;
 pub mod recipe_eval;

@@ -83,11 +83,11 @@ pub fn add_card(
         /* flags           */ 0,
     );
 
-    // Run OnCreate recipe matching against the new card. If a recipe
-    // matches, holds get stamped on the card's row and a completion is
-    // scheduled (`action_completion::apply` at card.valid_at + duration).
-    // Acting player = the soul's owner (CLI has no caller identity).
-    crate::on_create::trigger(ctx, card_id, soul_player, now_ms(ctx))?;
+    // OnCreate recipe matching has moved client-side: when a card is
+    // spawned, the client scans root-only recipes against it and
+    // submits a `propose_action` if any apply. The server no longer
+    // auto-triggers anything on card creation.
+    let _ = soul_player;
 
     Ok(())
 }
@@ -144,9 +144,8 @@ pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
 /// - Card must exist, ultimately belong to the calling player (via
 ///   `cards::owning_player`), not be a soul itself, not be `dead`,
 ///   not be `slot_held` (claimed by an in-flight action), and not
-///   currently in a chain (`state` is `Free` or `OnHex`).
-///   Already-chained cards are rejected to avoid silently dropping
-///   their children.
+///   currently in a chain (`state` is `Free`). Already-chained cards
+///   are rejected to avoid silently dropping their children.
 ///
 /// **Stack layout written:**
 /// - First equipped card (stack empty): `state = OnRoot`,
@@ -197,8 +196,8 @@ pub fn equip_card(
     }
     // Reject cards already in a chain — equipping them would orphan
     // any descendants whose `micro_location` points back at this card.
-    // Only Free / OnHex cards are eligible; the player must first
-    // pull a chained card loose before equipping.
+    // Only `Free` cards are eligible; the player must first pull a
+    // chained card loose before equipping.
     let (_, _, current_state) = unpack_micro_zone(card.micro_zone);
     if matches!(current_state, StackedState::OnRoot | StackedState::Slot) {
         return Err(format!(

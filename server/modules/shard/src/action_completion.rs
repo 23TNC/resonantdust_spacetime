@@ -531,15 +531,14 @@ pub fn apply(
                         packed_def,
                         /* flags           */ 0,
                     );
-                    // Pass `completion_ms` (the product's own
-                    // `valid_at`) rather than `now`: the new card's
-                    // only row is future-stamped, and
-                    // `on_create::trigger`'s `cards::prior_at` call
-                    // needs the matching upper bound to see it. With
-                    // `now`, the fetch silently returns `None` and
-                    // the OnCreate recipe is never installed — see
-                    // `on_create::trigger`'s `time_secs` doc.
-                    crate::on_create::trigger(ctx, new_id, caller_player_id, completion_ms)?;
+                    // OnCreate recipe matching has moved client-side
+                    // (the client scans root-only recipes against
+                    // newly-created cards and submits
+                    // `propose_action` if any apply). The server no
+                    // longer auto-triggers anything on card creation.
+                    let _ = caller_player_id;
+                    let _ = new_id;
+                    let _ = completion_ms;
                 }
             }
             ProductPlace::Location => {

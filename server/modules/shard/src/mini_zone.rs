@@ -218,12 +218,12 @@ pub fn tile_at_anchor(
 ///    `mini_zone`-type card, currently in caller's inventory
 ///    (`surface == INVENTORY_LAYER`).
 /// 3. Validate the target hex: `target_micro_zone` decodes to a
-///    valid `OnHex` byte, no card already occupies the world hex
-///    at `(target_macro_zone, target_micro_zone)`.
+///    valid `Free` byte (world-position encoding), no card already
+///    occupies the world hex at `(target_macro_zone, target_micro_zone)`.
 /// 4. Allocate a fresh `zone_id`.
 /// 5. Rewrite the anchor card's row to land at world
 ///    `(surface=WORLD_LAYER, macro_zone=target_macro_zone,
-///      micro_zone=target_micro_zone, state=OnHex, micro_location=0)`.
+///      micro_zone=target_micro_zone, state=Free, micro_location=0)`.
 /// 6. Create the mini_zone `Zone` row at
 ///    `(surface=MINI_ZONE_LAYER, macro_zone=anchor.card_id)` with all
 ///    37 effective hex cells set to `def_id == 0` (empty). The Zone
@@ -285,9 +285,10 @@ pub fn deploy_mini_zone(
 
     // ---- target validation ----------------------------------------
     let (_t_q, _t_r, t_state) = unpack_micro_zone(target_micro_zone);
-    if t_state != StackedState::OnHex {
+    if t_state != StackedState::Free {
         return Err(format!(
-            "deploy_mini_zone: target micro_zone must carry state=OnHex; got {t_state:?}"
+            "deploy_mini_zone: target micro_zone must carry state=Free \
+             (world-position encoding); got {t_state:?}"
         ));
     }
     // Confirm a world Zone exists at the target macro_zone — placing
@@ -299,8 +300,8 @@ pub fn deploy_mini_zone(
         ));
     }
     // Reject if any card already occupies the target hex on the
-    // world layer. `state == OnHex` cards at the same micro_zone =
-    // this hex's resident.
+    // world layer. Any non-dead world-surface card at the same
+    // (macro_zone, micro_zone) counts as a resident.
     let occupied = ctx
         .db
         .cards()
@@ -332,7 +333,7 @@ pub fn deploy_mini_zone(
     // ---- write the anchor onto the world hex ----------------------
     //
     // The anchor leaves inventory and lands at the world position.
-    // State becomes OnHex, micro_location=0 (no parent card).
+    // State becomes Free (world placement), micro_location=0.
     // `owner_id` is intentionally untouched — physical location
     // (surface / macro_zone / micro_zone) and ownership are
     // orthogonal: a card can sit on a world hex and still be
@@ -394,7 +395,7 @@ pub fn deploy_mini_zone(
 ///    world layer.
 /// 3. For every alive card on the mini_zone (`surface=63,
 ///    macro_zone=anchor.card_id`): rewrite to land at the anchor's
-///    previous world hex, `state=OnHex, micro_location=0`. (v1
+///    previous world hex, `state=Free, micro_location=0`. (v1
 ///    spill — multiple cards pile up on the same world hex.
 ///    Refinement deferred.)
 /// 4. Delete the Zone row at `(surface=63, macro_zone=anchor.card_id)`.

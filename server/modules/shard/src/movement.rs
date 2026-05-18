@@ -64,7 +64,7 @@ fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u16> {
     let macro_zone = pack_macro_zone(macro_q as i16, macro_r as i16);
 
     if surface == crate::packed::WORLD_LAYER {
-        let micro_zone = pack_micro_zone(local_q, local_r, crate::packed::StackedState::OnHex);
+        let micro_zone = pack_micro_zone(local_q, local_r, crate::packed::StackedState::Free);
         if let Some(anchor) = crate::mini_zone::anchor_covering_hex(ctx, macro_zone, micro_zone) {
             // Mini_zone covers this hex. Read its tile byte at the
             // corresponding `(q, r)` within the mini_zone's grid.
@@ -186,9 +186,10 @@ const MAX_VALIDATION_STEPS: usize = 256;
 
 /// One step in a client-submitted path. Mirrors the
 /// `(surface, macro_zone, micro_zone)` triplet the soul row already
-/// carries — same packing, same `micro_zone` `state == OnHex`
-/// requirement. `micro_location` isn't on the wire (world-hex
-/// placements always use `0`).
+/// carries — same packing, same `micro_zone` `state == Free`
+/// requirement (world-positioned cards are Free in the unified card
+/// model). `micro_location` isn't on the wire (world placements
+/// always use `0`).
 ///
 /// Per-step `surface` is carried so the wire format stays
 /// forward-compatible with cross-surface pathing (portals, etc.).
@@ -212,7 +213,7 @@ pub struct TilePoint {
 /// Validation per step:
 ///   - `surface` matches the soul's current surface (cross-surface
 ///     transitions not supported).
-///   - `micro_zone`'s state bits == `OnHex`.
+///   - `micro_zone`'s state bits == `Free` (world placement).
 ///   - Axially adjacent to the predecessor (the soul's current tile
 ///     for step 0; the previous step otherwise).
 ///   - The tile is traversable — `tile_def_at` returns a def_id and
@@ -297,9 +298,9 @@ pub fn move_soul(
             ));
         }
         let (lq, lr, state) = unpack_micro_zone(point.micro_zone);
-        if state != StackedState::OnHex {
+        if state != StackedState::Free {
             return Err(format!(
-                "movement: step {idx} micro_zone state must be OnHex (got {state:?})"
+                "movement: step {idx} micro_zone state must be Free (got {state:?})"
             ));
         }
         let (mq, mr) = unpack_macro_zone(point.macro_zone);
