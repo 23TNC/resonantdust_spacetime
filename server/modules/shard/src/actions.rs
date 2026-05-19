@@ -1,1239 +1,862 @@
+//! `propose_action` reducer — verifier for the tape-form recipe model.
+//!
+//! Wire format (per-iterator bindings — no inventory walks):
+//!
+//! ```text
+//! propose_action(
+//!   recipe_id: u16,
+//!   surface: u8, macro_zone: u32, micro_zone: u8,  // root's intended location
+//!   root: u32,
+//!   bindings: Vec<Vec<u32>>,    // bindings[iter_id][offset] = card_id
+//! )
+//! ```
+//!
+//! The client pre-resolves every `slot.<branch>.<index>` reference and
+//! sends the resulting card_ids per iterator. Top-level iterators
+//! (`parent == []`) carry the player's action stack — those cards get
+//! chain-stitched into branch `iterator.branch` at completion.
+//! Nested iterators (`parent != []`) carry cards that already live in
+//! some other chain (equipment, queued actions, …) — those are
+//! predicate-verified but not chain-stitched.
+//!
+//! Branch 0 is the tile branch by convention. If a recipe references
+//! branch 0 and `bindings[iter_for_branch_0][0] == 0` (the no-card
+//! sentinel), the server synthesizes from zone tile data at
+//! `(surface, macro_zone, micro_zone)`.
+//!
+//! Stages (any failure rolls the whole reducer back):
+//!
+//! 1. **Recipe-vs-stack** (fail-fast, in-memory): walk `recipe.input`,
+//!    resolve each `Seg::Slot { iterator_id, offset }` via
+//!    `bindings[iter_id][offset]`, evaluate predicate. Transition
+//!    checks (`.owner` / `.parent` consistency, branch-direction
+//!    constraint on nested iterators) ride alongside — all O(1)
+//!    per segment, no scans.
+//! 2. **Stack-vs-world** (DB-heavy): every card_id in bindings
+//!    exists, no duplicates, no `slot_hold` from another action,
+//!    owners chain back to caller, magnetic-flag discipline holds.
+//! 3. **Chain-stitch**: write per-card position bytes for cards in
+//!    top-level iterators' bindings, organized by `iterator.branch`.
+//!    Nested-iterator bindings are left alone (they're in their own
+//!    chains already).
+//! 4. **Locks + schedule**: `slot_hold` on cards inside iterator
+//!    windows (those consumed at completion); `position_hold` on
+//!    every chain card to preserve structure; stamp the action row;
+//!    schedule [`action_completion::apply`].
+
 use std::collections::BTreeSet;
 
-use resonantdust_content::definition_core::{decode_definition, CardDefinition};
-use resonantdust_content::recipe_core::{
-    /* match_stack_recipe, */ recipe, Duration, Entity, RecipeType, StackDirection,
+use resonantdust_content::definition_core::{
+    aspect_id, decode_definition, is_aspect_descendant, lifecycle_recipe_for_def, AspectId,
 };
+use resonantdust_content::recipe_core::{recipe, Recipe, Seg};
+use resonantdust_content::recipe_statement::StatementValue;
 use spacetimedb::{reducer, ReducerContext};
 
-use crate::action_completion;
+use crate::action_completion::{self, HexLocation};
 use crate::cards;
 use crate::packed::{
-    self, pack_slot_micro_zone, pack_stack_micro_zone, unpack_micro_zone, valid_at_time,
-    StackedState,
+    micro_zone_direction, pack_micro_zone, pack_slot_micro_zone, pack_stack_micro_zone,
+    unpack_micro_zone, StackedState,
 };
 use crate::players;
-use crate::recipe_eval::{aspect_pool, entity_satisfied_pool};
 // Module + the generated `zones()` accessor trait — needed for the
-// synthetic-hex lookup. Same `(self, … as _)` pattern as
-// `magnetic.rs` / `world_gen.rs`.
+// synthetic-tile lookup. Same `(self, … as _)` pattern as elsewhere.
 use crate::zones::zones as _zones_table;
-// use crate::stacks::CardStack;  // commented along with submit_action below
 
-// `cards/flags.json` bit positions. Append-only — pinned by the data crate.
-// Typed as u32 to match `Card.flags`.
+// `cards/flags.json` bit positions. Append-only — pinned by the data
+// crate. `#[allow(dead_code)]` until Stage 4 (locks/schedule) lands.
+#[allow(dead_code)]
+const FLAG_DEAD: u32 = 1 << 7;
+#[allow(dead_code)]
 const FLAG_SLOT_HOLD: u32 = 1 << 5;
-/// Caller-set marker: "movement (and other position-prop) must not
-/// touch this row's spatial fields." Stamped on chain-stitch / hex-pin
-/// writes here so a queued move_soul can't yank a card mid-recipe.
+#[allow(dead_code)]
 const FLAG_POSITION_PRESERVE: u32 = 1 << 14;
-// Surfaces ≥ this are world-layer; below is inventory-ish. Mirrored from
-// `action_completion::WORLD_LAYER` so both modules agree on the boundary
-// that distinguishes "rect sits on a hex tile in the world" from
-// "rect is loose on an inventory surface".
-const WORLD_LAYER: u8 = 64;
+#[allow(dead_code)]
+const FLAG_FORCE_POSITION: u32 = 1 << 11;
+#[allow(dead_code)]
+const FLAG_LIFECYCLE_PENDING: u32 = 1 << 12;
+
 /// Surfaces ≥ this carry hex-tile data inside their backing `Zone` row.
-/// Surfaces below this (player inventory panels, future personal
-/// surfaces) have no hex tiles, so a `propose_action` that omits a
-/// `hex` card on a low surface simply means "this action has no hex".
-/// `32..64` is reserved for future pocket-dimension-style surfaces
-/// that *do* carry tile data; world surfaces start at [`WORLD_LAYER`].
 const SYNTHETIC_HEX_MIN_SURFACE: u8 = 32;
 
-/// Resolve a synthetic hex for an action whose client passed `hex = 0`.
-/// Returns the full `packed_definition` (so the recipe matcher sees
-/// the same entity shape a real tile-Card would have) plus a
-/// [`HexLocation`] (so [`action_completion::apply`] can write back
-/// to the same tile for consumption / location outputs).
-///
-/// Reads the Zone at `(surface, macro_zone)`, extracts the tile byte
-/// at the `(q, r)` decoded from `micro_zone`, and combines it with
-/// the zone's `packed_definition` (which encodes the tile catalog's
-/// type + category) to produce the full `packed_definition`.
-///
-/// Returns `None` when:
-/// - `surface < SYNTHETIC_HEX_MIN_SURFACE` (panel surface — no zone
-///   tile data here, no hex semantics).
-/// - The `micro_zone` byte's state field isn't `OnHex` (client must
-///   address a hex tile via that state to opt into this path).
-/// - No Zone row exists at `(surface, macro_zone)` (unmapped area).
-/// - The tile byte is `0` (no tile here — empty / cleared).
-///
-/// On `None`, the caller falls back to `hex_def = 0` and `hex_location
-/// = None`. The matcher rejects the recipe if it declared `hex`;
-/// otherwise the action proceeds as a chain-only proposal.
+/// Tile card_type — see `movement.rs::TILE_CARD_TYPE`.
+const TILE_CARD_TYPE: u8 = 7;
+
+/// Resolve a synthetic tile when a recipe references branch 0 and
+/// the client sent `0` (no-card sentinel) for that binding. Reads
+/// the Zone at `(surface, macro_zone)`, extracts the tile byte at
+/// `(q, r)` from `micro_zone`, returns the tile's `packed_definition`,
+/// per-row stocks (for stock-aware predicate eval), and a
+/// [`HexLocation`] the tape walker uses for tile-side modify ops.
 fn derive_synthetic_hex(
     ctx: &ReducerContext,
     surface: u8,
     macro_zone: u32,
     micro_zone: u8,
-) -> Option<(u16, (u8, u8), action_completion::HexLocation)> {
+) -> Option<(u16, (u8, u8), HexLocation)> {
     if surface < SYNTHETIC_HEX_MIN_SURFACE {
         return None;
     }
-    let (q, r, state) = unpack_micro_zone(micro_zone);
-    if state != StackedState::OnHex {
-        return None;
-    }
-    // Mini_zones overlay world chunks. If any deployed mini_zone's
-    // radius-3 footprint covers this hex, the mini_zone tile is the
-    // answer — empty or not. We don't fall through to the world tile
-    // because the mini_zone occludes whatever's underneath it. See
-    // `mini_zone::anchor_covering_hex` / `tile_at_anchor` for the
-    // resolution logic and known v1 limitations.
-    if surface == crate::packed::WORLD_LAYER {
-        if let Some(anchor) = crate::mini_zone::anchor_covering_hex(ctx, macro_zone, micro_zone) {
-            return crate::mini_zone::tile_at_anchor(ctx, &anchor, macro_zone, micro_zone);
-        }
-    }
+    let (q, r, _state) = unpack_micro_zone(micro_zone);
     let zone = ctx
         .db
         .zones()
         .macro_zone()
         .filter(macro_zone)
         .filter(|z| z.surface == surface)
-        .max_by_key(|z| valid_at_time(z.valid_at))?;
-    let (tile_def_id, stock0, stock1) = zone.tile_at(r, q).unwrap_or((0, 0, 0));
-    if tile_def_id == 0 {
+        .max_by_key(|z| crate::packed::valid_at_time(z.valid_at))?;
+    let (def_id, stock0, stock1) = zone.tile_at(r, q)?;
+    if def_id == 0 {
         return None;
     }
-    // `packed_definition` layout: `[card_type:u4 | def_id:u12]`. The
-    // zone's `packed_definition` is `[type:u4 | 0:u4]` packed into a
-    // u8 — its high nibble holds the type, so a `<< 8` lands the
-    // type bits at u16 positions 12..=15. `tile_def_id` is u12 and
-    // ORs cleanly into the low 12 bits.
-    let packed_def = ((zone.packed_definition as u16) << 8) | tile_def_id;
-    let location = action_completion::HexLocation {
-        zone_id: zone.zone_id,
-        macro_zone: zone.macro_zone,
-        col: q,
-        row: r,
-        owner_id: zone.owner_id,
-    };
-    Some((packed_def, (stock0, stock1), location))
+    let packed_def = crate::packed::pack_definition(TILE_CARD_TYPE, def_id);
+    Some((
+        packed_def,
+        (stock0, stock1),
+        HexLocation {
+            zone_id: zone.zone_id,
+            macro_zone,
+            col: q,
+            row: r,
+            owner_id: zone.owner_id,
+        },
+    ))
 }
-/// Mask for the `progress_style` 3-bit field at bits 8..=10. With-holds
-/// rows clear this so any value inherited from a prior completion row
-/// doesn't make this non-event row render a progress bar on the client.
-const PROGRESS_STYLE_MASK: u32 = 0b111 << 8;
-/// `force_position` (bit 11). Server is asserting this row's
-/// `micro_zone` / `micro_location` verbatim — the client mirror should
-/// overwrite local state and renumber conflicting entries. Replaces the
-/// older `micro_zone.local_q = 1` disagree-with-anything trick (which
-/// shared a field with real q-coordinate data). Set on with-holds rows
-/// where the server has stitched a chain layout; explicitly cleared
-/// otherwise so an inherited bit doesn't keep firing on later rows.
-const FLAG_FORCE_POSITION: u32 = 1 << 11;
 
-// ----- submit_action and its helpers — commented out 2026-05-09 -----
-//
-// Not currently needed. The active reducer is `propose_action` below
-// (client-proposed recipe verification + flag/chain-stitch). Restore by
-// removing the surrounding `/* */`, re-enabling the imports tagged
-// `commented along with submit_action below`, and (per the earlier
-// note) updating the per-card writeback to use `pack_stack_micro_zone`
-// for stacked positions instead of `pack_micro_zone`.
-/*
-/// Submit one or more card stacks to the action system.
+// ----- propose_action reducer ------------------------------------------
+
+/// Verify a client-proposed recipe + bindings, and (eventually)
+/// stitch the chain, apply locks, schedule completion. See module
+/// docs for the four-stage flow.
 ///
-/// For each stack, the server:
-/// 1. Validates structural well-formedness (cards exist, no duplicates).
-/// 2. Runs `Stack(Up)` and `Stack(Down)` recipe matching independently
-///    against the chain. Either, both, or neither may match.
-/// 3. For every matched recipe: sets `slot_hold` on every card filling a
-///    slot, and `position_hold` on every slot **except the first** (the
-///    actor — see below).
-/// 4. Sets `position_hold` on the actor of any matched direction iff
-///    `root != 0` or `hex != 0` (locks the actor to its current stack).
-/// 5. Sets `position_hold` on `stack.root` iff `hex != 0` (locks the
-///    root to the hex card) and overwrites `root.micro_location = hex`.
-/// 6. Rewrites every card's `micro_location` (and `micro_zone` state
-///    bits) to reflect the chain — bottom card is `Free` at the stack's
-///    `micro_location`, every card above sits `OnCardTop` the one below.
-/// 7. If the resolved `surface < 64` and the new `stacked_state != 0`,
-///    sets `FLAG_FORCE_POSITION` on the row so the client's mirror
-///    accepts the server's `micro_zone` / `micro_location` verbatim
-///    (overwriting any local state and renumbering conflicting
-///    entries). Replaces the older "set `micro_zone.local_q = 1`"
-///    disagree-with-anything trick.
-///
-/// `position_hold` and `slot_hold` are **not** touched on cards outside
-/// matched recipes. Cards already carrying those flags from a previous
-/// action keep them; the release path is the recipe-completion logic
-/// (not yet implemented).
-///
-/// All writes go through `cards::update_with`, so each card's
-/// `valid_at` is stamped to "now" and a one-shot delete schedule is
-/// enqueued. Recipe execution proper — reagent consumption, product
-/// generation, hold release — is intentionally deferred and will be
-/// scheduled with future `valid_at`s once the recipe-runner lands.
-///
-/// **Sentinel-value caveats.** Per the agreed reducer signature, `0`
-/// means "not provided" for `root`, `hex`, `surface`, and `macro_zone`.
-/// `card_id` 0 is reserved so that's safe for the first two; `surface=0`
-/// (world layer 0) and `macro_zone=0` (origin tile) are legitimate
-/// values that this signature can't express as overrides — pass non-zero
-/// or use the original `cards::set_*` helpers if you need to write a
-/// genuine zero. `micro_zone` carries no override semantics here; it's
-/// taken as-is and re-packed per chain position.
+/// **Status:** Stage 1 verifier landed; Stages 2-4 stubbed.
 #[reducer]
-pub fn submit_action(
+#[allow(clippy::too_many_arguments)]
+pub fn propose_action(
     ctx: &ReducerContext,
-    stacks: Vec<CardStack>,
-    root: u32,
-    hex: u32,
+    recipe_id: u16,
     surface: u8,
     macro_zone: u32,
     micro_zone: u8,
-) -> Result<(), String> {
-    for (i, stack) in stacks.iter().enumerate() {
-        validate_stack(ctx, stack).map_err(|e| format!("stacks[{i}]: {e}"))?;
-    }
-
-    for (i, stack) in stacks.iter().enumerate() {
-        process_stack(ctx, stack, root, hex, surface, macro_zone, micro_zone)
-            .map_err(|e| format!("stacks[{i}]: {e}"))?;
-    }
-
-    Ok(())
-}
-
-// Cards exist + no duplicates across root + stack_up + stack_down.
-fn validate_stack(ctx: &ReducerContext, stack: &CardStack) -> Result<(), String> {
-    let mut chain = Vec::with_capacity(1 + stack.stack_up.len() + stack.stack_down.len());
-    chain.push(stack.root);
-    chain.extend(stack.stack_up.iter().copied());
-    chain.extend(stack.stack_down.iter().copied());
-
-    let mut seen = BTreeSet::new();
-    for &id in &chain {
-        if !seen.insert(id) {
-            return Err(format!("card {id} appears more than once"));
-        }
-        if cards::latest(ctx, id).is_none() {
-            return Err(format!("card {id} does not exist"));
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn process_stack(
-    ctx: &ReducerContext,
-    stack: &CardStack,
-    arg_root: u32,
-    arg_hex: u32,
-    arg_surface: u8,
-    arg_macro_zone: u32,
-    arg_micro_zone: u8,
-) -> Result<(), String> {
-    // Resolve packed_definitions for the recipe matcher.
-    let hex_def = if arg_hex != 0 {
-        cards::latest(ctx, arg_hex)
-            .ok_or_else(|| format!("hex card {arg_hex} not found"))?
-            .packed_definition
-    } else {
-        0
-    };
-    let root_card = cards::latest(ctx, stack.root)
-        .ok_or_else(|| format!("root card {} not found", stack.root))?;
-    let root_def = root_card.packed_definition;
-
-    let up_defs = pack_chain_defs(ctx, &stack.stack_up);
-    let down_defs = pack_chain_defs(ctx, &stack.stack_down);
-
-    // Legacy `submit_action` path: `hex_def` here comes from a Card
-    // row, not a synthetic zone tile, so there are no row stocks to
-    // thread. Pass `None`; recipes using `hex.aspect.X` predicates
-    // fall back to the def's static `aspects`. If this path is ever
-    // revived for live use against synthetic tiles, look up
-    // `Zone::tile_at` here and forward `Some((stock0, stock1))`.
-    let up_match = match_stack_recipe(hex_def, None, root_def, &up_defs, StackDirection::Up)
-        .map_err(|e| format!("recipe match (up): {e}"))?;
-    let down_match = match_stack_recipe(hex_def, None, root_def, &down_defs, StackDirection::Down)
-        .map_err(|e| format!("recipe match (down): {e}"))?;
-
-    // Holds for cards in matched recipes.
-    let mut slot_holds: BTreeSet<u32> = BTreeSet::new();
-    let mut position_holds: BTreeSet<u32> = BTreeSet::new();
-
-    apply_match_holds(up_match, &stack.stack_up, &mut slot_holds, &mut position_holds)?;
-    apply_match_holds(down_match, &stack.stack_down, &mut slot_holds, &mut position_holds)?;
-
-    // Actor pinning: if the action carries either a root or a hex context,
-    // the actor of any matched direction is locked to its current stack.
-    let any_match = up_match != 0 || down_match != 0;
-    if any_match && (arg_root != 0 || arg_hex != 0) {
-        if up_match != 0 {
-            if let Some(&actor) = stack.stack_up.first() {
-                position_holds.insert(actor);
-            }
-        }
-        if down_match != 0 {
-            if let Some(&actor) = stack.stack_down.first() {
-                position_holds.insert(actor);
-            }
-        }
-    }
-
-    // Root pinned to hex.
-    let root_pinned_to_hex = arg_hex != 0;
-    if root_pinned_to_hex {
-        position_holds.insert(stack.root);
-    }
-
-    // Resolve the new (surface, macro_zone) for the root. 0 = absent =>
-    // keep what the root currently has. micro_zone has no override
-    // sentinel; we always re-pack it per chain position below.
-    let new_surface = if arg_surface != 0 { arg_surface } else { root_card.surface };
-    let new_macro_zone = if arg_macro_zone != 0 { arg_macro_zone } else { root_card.macro_zone };
-    let (q_arg, r_arg, _) = unpack_micro_zone(arg_micro_zone);
-
-    // Bottom-to-top chain: stack_down reversed → root → stack_up.
-    let mut chain: Vec<u32> = Vec::with_capacity(
-        1 + stack.stack_up.len() + stack.stack_down.len(),
-    );
-    chain.extend(stack.stack_down.iter().rev().copied());
-    chain.push(stack.root);
-    chain.extend(stack.stack_up.iter().copied());
-
-    // Apply per-card writes. Each goes through cards::update_with so
-    // valid_at = now; retention is handled by the periodic
-    // `crate::gc` sweep.
-    for (i, &card_id) in chain.iter().enumerate() {
-        let (mut state, mut micro_location) = if i == 0 {
-            (StackedState::Free, stack.micro_location)
-        } else {
-            (StackedState::OnRoot, chain[i - 1])
-        };
-
-        // Root pinned to hex overrides whatever chain position
-        // suggested — the card is physically on the hex, not on
-        // chain[i-1] (or free at a spatial position). State flips to
-        // OnHex (= 3, same value as the client's `STACKED_ON_HEX`
-        // in `pixijs/src/game/cards/cardData.ts`), and `micro_location`
-        // becomes the hex card's id. Doing this *before* the q=1 force
-        // rule means hex-pinned roots also pick up the resync trick.
-        // Fixes the prior inconsistency where a root with no
-        // `stack_down` ended up with `state=Free` but a
-        // card-id-typed `micro_location`.
-        if card_id == stack.root && root_pinned_to_hex {
-            state = StackedState::OnHex;
-            micro_location = arg_hex;
-        }
-
-        // surface<64 + non-Free => force q=1 so the next sync from the
-        // client picks up the server's intent even if the client thinks
-        // the card was somewhere else.
-        let local_q = if new_surface < 64 && state != StackedState::Free {
-            1
-        } else {
-            q_arg
-        };
-        let new_micro_zone = pack_micro_zone(local_q, r_arg, state);
-
-        let set_pos = position_holds.contains(&card_id);
-        let set_slot = slot_holds.contains(&card_id);
-
-        cards::update_with(ctx, card_id, |c| {
-            c.surface = new_surface;
-            c.macro_zone = new_macro_zone;
-            c.micro_zone = new_micro_zone;
-            c.micro_location = micro_location;
-            if set_pos {
-                c.flags |= FLAG_POSITION_HOLD;
-            }
-            if set_slot {
-                c.flags |= FLAG_SLOT_HOLD;
-            }
-            // With-holds rows aren't progress events — clear any
-            // inherited progress_style so the client doesn't render
-            // this row as one.
-            c.flags &= !PROGRESS_STYLE_MASK;
-        });
-    }
-
-    Ok(())
-}
-
-// Read packed_definitions for a chain of card_ids. Validation has already
-// confirmed every id exists, so a `None` here would only arise from a race
-// the SpacetimeDB reducer-serialization model rules out — we substitute 0
-// in that case rather than propagate, since match_stack_recipe treats 0
-// as "no card here" and will simply fail to match.
-fn pack_chain_defs(ctx: &ReducerContext, ids: &[u32]) -> Vec<u16> {
-    ids.iter()
-        .map(|&id| cards::latest(ctx, id).map(|c| c.packed_definition).unwrap_or(0))
-        .collect()
-}
-*/
-// ----- end of commented-out submit_action region -----
-
-/// Verify a client-proposed recipe, stitch its slot cards into a chain,
-/// and assign its hold flags.
-///
-/// Unlike [`submit_action`] (which searches for the best-matching recipe),
-/// this reducer takes a specific `recipe_id` and verifies that the
-/// supplied cards satisfy its entities. The server then writes the chain
-/// under the (root_id, position) layout (see `packed.rs` header) so
-/// every slot card's `micro_location` points at the chain root and its
-/// row carries `FLAG_FORCE_POSITION` — the client mirror's
-/// preserve rule respects the force bit and snaps the client view to
-/// the server's chain.
-///
-/// **Sentinel-zero semantics:** both `hex` and `root` use `0` to mean
-/// "not provided". A `0` inside `slots` is always a client bug and is
-/// rejected. The recipe itself decides whether `hex` / `root` are
-/// required — if `recipe.hex.is_some()` and the caller passed `hex == 0`,
-/// the request is rejected (and same for `root`).
-///
-/// **Validation steps (any failure rolls the whole reducer back):**
-///
-/// 1. No card id appears twice across `hex` / `root` / `slots`. Every
-///    non-zero referenced card must exist.
-/// 2. If `root != 0`, root's current row must match the proposed
-///    `(surface, macro_zone, micro_zone, micro_location)` exactly —
-///    catches client-server sync drift. If `root == 0`, the location
-///    args are accepted but not enforced; there's no anchor card to
-///    check them against.
-/// 3. No card already carries `slot_hold` from another in-flight
-///    action. Per `cards/flags.json`, a `slot_hold`-marked card is
-///    "committed to the in-flight recipe and must not be re-claimed
-///    by another match" — we enforce that contract here so concurrent
-///    proposals against the same cards serialize as "first wins".
-///    Checked on `root` and every `slots[i]`.
-/// 4. `recipe_id` must be a registered `Stack(_)` recipe.
-/// 5. Recipe eligibility: `recipe.hex` (if present) requires `hex != 0`
-///    and the hex card's def must satisfy it; same for `recipe.root`.
-///    Every `recipe.slots[i]` must be satisfied by `slots[i]`.
-///    `slots.len()` must equal `recipe.slots.len()` exactly — extras
-///    or shortfalls reject.
-///
-/// **Chain layout written to slot cards:**
-///
-/// - The "chain root" is `root` when `root != 0`, otherwise `slots[0]`
-///   (the actor) — a free-floating action makes the actor the loose
-///   root of its own one-direction chain.
-/// - Every slot that isn't the chain root gets:
-///   - `micro_location = chain_root_id`
-///   - `micro_zone = pack_stack_micro_zone(position, force_flag = false,
-///     stacked_state)`, where position is the card's 1-indexed place in
-///     the chain (actor = 1 when `root != 0`, slots[1] = 1 when
-///     `root == 0`) and stacked_state is OnCardTop for `Stack(Up)` /
-///     OnCardBottom for `Stack(Down)`.
-/// - The chain root itself is not repositioned (its existing row is
-///   left as the location-of-truth for the chain).
-///
-/// **Flag assignment** (mirrors `submit_action`):
-///
-/// - `slot_hold` set on every slot card.
-/// - `position_hold` set on `slots[1..]` (the actor at `slots[0]` is
-///   excluded from this rule).
-/// - `position_hold` set on the actor iff `root != 0 || hex != 0` —
-///   without either, the action is free-floating and the actor doesn't
-///   need a positional pin.
-/// - `position_hold` set on `root` iff `root != 0 && hex != 0`.
-///
-/// Flags are OR'd in, never cleared. Release happens at recipe
-/// completion. All writes go through `cards::update_with` so each
-/// stamps a fresh `valid_at` and enqueues the delete sweep.
-#[reducer]
-pub fn propose_action(
-    ctx: &ReducerContext,
-    hex: u32,
     root: u32,
-    slots: Vec<u32>,
-    surface: u8,
-    macro_zone: u32,
-    micro_zone: u8,        // World-rooted only: tile's local (q, r) with
-                           // state=OnHex, used when root == 0 && hex == 0
-                           // && surface >= WORLD_LAYER. Ignored otherwise
-                           // (rooted / hex-anchored anchors derive their
-                           // micro_zone from the anchor card).
-    micro_location: u32,   // legacy / unused; kept on the wire for binding
-                           // stability.
-    recipe_id: u16,
-    root_dist: u8,         // actor's distance from root in the new layout.
-                           // Used only when `root != 0`; the actor's
-                           // `OnRoot` row gets `position = root_dist`.
-                           // For a fresh chain with no held cards,
-                           // typically `1`; for sub-roots past held
-                           // blocks this is the full distance from the
-                           // chain root.
+    bindings: Vec<Vec<u32>>,
 ) -> Result<(), String> {
-    // `micro_zone` is consumed only by the world-rooted anchor case
-    // below (root == 0, hex == 0, surface >= WORLD_LAYER) — it carries
-    // the virtual hex tile's local (q, r) with state=OnHex. The
-    // rooted and hex-anchored cases derive their micro_zone from the
-    // chain's anchor card instead. `micro_location` is still legacy
-    // on the wire; kept for binding stability.
-    let _ = micro_location;
-    // De-dup across hex / root / slots. Zero is the sentinel for "absent"
-    // on hex and root (skipped from the dedup set); zero inside slots is
-    // a client bug.
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    if root != 0 {
-        seen.insert(root);
-    }
-    if hex != 0 && !seen.insert(hex) {
-        return Err(format!("hex {hex} duplicates root"));
-    }
-    for &id in &slots {
-        if id == 0 {
-            return Err("slot card_id must be non-zero".to_string());
-        }
-        if !seen.insert(id) {
-            return Err(format!("card {id} appears more than once"));
-        }
-    }
+    let caller_player_id = players::resolve_caller(ctx)?;
 
-    // Resolve hex def. Two paths:
-    //
-    // 1. **Real hex card** (`hex != 0`): standard lookup against the
-    //    `cards` table. Same shape this codebase has always had.
-    // 2. **Synthetic hex from a zone tile** (`hex == 0`, surface carries
-    //    tile data): derive the `packed_definition` from the Zone at
-    //    `macro_zone` and the tile byte at the `(q, r)` decoded from
-    //    `micro_zone`. Gives the matcher the same entity-shaped data
-    //    a real Card would, without materializing a card row.
-    //
-    // If neither path resolves (no hex card, no tile under the cursor,
-    // or panel-surface), `hex_def = 0` — the matcher will reject the
-    // recipe if it declared `hex` and accept it otherwise.
-    // `hex_stocks` is `Some` only when the hex came from a synthetic
-    // tile path (no Card row backing it). Real hex-Card rows don't
-    // carry per-row stock — recipes targeting them go through the
-    // def's static aspect values.
-    let (hex_def, hex_stocks, hex_location) = if hex != 0 {
-        let def = cards::latest(ctx, hex)
-            .ok_or_else(|| format!("hex card {hex} not found"))?
-            .packed_definition;
-        (def, None, None)
-    } else {
-        match derive_synthetic_hex(ctx, surface, macro_zone, micro_zone) {
-            Some((def, stocks, loc)) => (def, Some(stocks), Some(loc)),
-            None => (0, None, None),
-        }
-    };
-
-    // Resolve root def + slot_hold guard only when a root was provided.
-    // Without a root we have no anchor card to validate against.
-    //
-    // The full location-quartet check (surface, macro_zone, micro_zone,
-    // micro_location) that lived here previously is gone: under the
-    // new layout the client will rewrite root's `micro_zone` and
-    // `micro_location` (e.g. when re-anchoring root to a hex via this
-    // very reducer), so checking those fields against the client's
-    // pre-write claim catches false-positive drift. We still validate
-    // (surface, macro_zone) since those drive which subscriptions see
-    // the row — a mismatch there would mean the client and server
-    // disagree about which zone the recipe is happening in.
-    let root_def = if root != 0 {
-        let root_card = cards::latest(ctx, root)
-            .ok_or_else(|| format!("root card {root} not found"))?;
-        if root_card.flags & FLAG_SLOT_HOLD != 0 {
-            return Err(format!(
-                "root card {root} is already claimed by another in-flight action"
-            ));
-        }
-        if root_card.surface != surface || root_card.macro_zone != macro_zone {
-            return Err(format!(
-                "root card {root} not in proposed zone \
-                 (server: surface={}, macro_zone={}; proposed: surface={surface}, macro_zone={macro_zone})",
-                root_card.surface,
-                root_card.macro_zone,
-            ));
-        }
-        root_card.packed_definition
-    } else {
-        0
-    };
-
-    let mut slot_defs: Vec<u16> = Vec::with_capacity(slots.len());
-    for &id in &slots {
-        let card = cards::latest(ctx, id)
-            .ok_or_else(|| format!("slot card {id} not found"))?;
-        if card.flags & FLAG_SLOT_HOLD != 0 {
-            return Err(format!(
-                "slot card {id} is already claimed by another in-flight action"
-            ));
-        }
-        slot_defs.push(card.packed_definition);
-    }
-
-    // Verify the proposed recipe.
-    let recipe_def = recipe(recipe_id)
+    let recipe_ref = recipe(recipe_id)
         .map_err(|e| format!("recipe lookup: {e}"))?
         .ok_or_else(|| format!("recipe {recipe_id} not registered"))?;
-    let is_magnetic = matches!(recipe_def.recipe_type, RecipeType::Magnetic(_));
-    if !matches!(recipe_def.recipe_type, RecipeType::Stack(_)) && !is_magnetic {
-        return Err(format!(
-            "recipe {recipe_id} is not a stack or magnetic recipe ({:?})",
-            recipe_def.recipe_type
-        ));
-    }
-    // Magnetic-recipe validation. For a magnetic recipe to be a
-    // legitimate resolution attempt, three things must hold:
-    //   1. The root card carries `FLAG_LIFECYCLE_PENDING` (it's an
-    //      active lifecycle anchor — required for any magnetic-recipe
-    //      submission).
-    //   2. The recipe's packed id matches `root.def.lifecycle_recipe_key`'s
-    //      resolved packed id. Stops clients from invoking some other
-    //      lifecycle recipe against this card.
-    //   3. (Implicitly handled below by existing slot validation.)
-    if is_magnetic {
-        if root == 0 {
-            return Err(format!(
-                "magnetic recipe {recipe_id} requires a root card; none provided",
-            ));
-        }
-        let root_card = cards::latest(ctx, root)
-            .ok_or_else(|| format!("root card {root} not found"))?;
-        const FLAG_LIFECYCLE_PENDING: u32 = 1 << 12;
-        if root_card.flags & FLAG_LIFECYCLE_PENDING == 0 {
-            return Err(format!(
-                "magnetic recipe {recipe_id}: root card {root} is not lifecycle-pending"
-            ));
-        }
-        let root_def_full = decode_definition(root_card.packed_definition)
-            .map_err(|err| format!("decode root def: {err}"))?
-            .ok_or_else(|| format!("root card {root} has unknown definition"))?;
-        match resonantdust_content::definition_core::lifecycle_recipe_for_def(root_def_full)
-            .map_err(|e| format!("lifecycle recipe lookup on root def: {e}"))?
-        {
-            None => {
-                return Err(format!(
-                    "magnetic recipe {recipe_id}: root card {root}'s def declares no lifecycle_recipe",
-                ));
-            }
-            Some(expected_id) if expected_id != recipe_id => {
-                return Err(format!(
-                    "magnetic recipe {recipe_id}: doesn't match root card {root}'s def \
-                     (expected recipe {expected_id})",
-                ));
-            }
-            Some(_) => {}
-        }
-    }
 
-    // Eligibility: every entity in the recipe must be satisfied by the
-    // corresponding card. Mirrors the eligibility half of
-    // `match_stack_recipe`, minus the specificity scoring (we don't
-    // care about ranking when the client has named the recipe).
-    if let Some(e) = &recipe_def.hex {
-        let def = decode_definition(hex_def)
-            .map_err(|err| format!("decode hex def: {err}"))?
-            .ok_or_else(|| {
-                format!("recipe {recipe_id} requires a hex card; none provided or unknown def")
-            })?;
-        if !entity_satisfied_with_stocks(e, def, hex_stocks) {
-            return Err(format!("recipe {recipe_id}: hex card does not satisfy hex entity"));
-        }
-    }
-    if let Some(e) = &recipe_def.root {
-        if root == 0 {
-            return Err(format!("recipe {recipe_id} requires a root card; none provided"));
-        }
-        let def = decode_definition(root_def)
-            .map_err(|err| format!("decode root def: {err}"))?
-            .ok_or_else(|| format!("root card {root} has unknown definition"))?;
-        if !entity_satisfied(e, def) {
-            return Err(format!("recipe {recipe_id}: root card does not satisfy root entity"));
-        }
-    }
-    if slots.len() != recipe_def.slots.len() {
+    if bindings.len() != recipe_ref.iterators.len() {
         return Err(format!(
-            "recipe {recipe_id} expects {} slot(s), got {}",
-            recipe_def.slots.len(),
-            slots.len()
+            "bindings length {} doesn't match recipe iterator count {}",
+            bindings.len(),
+            recipe_ref.iterators.len(),
         ));
     }
 
-    // Chain-depth bound: when this action pins the actor to root (i.e.
-    // `root != 0`), `slot[0]` gets a state-2 (`OnRoot`) row whose
-    // `position` field is `root_dist`. `pack_stack_micro_zone` masks
-    // `position & 0x1f`, so any depth past 31 silently truncates and
-    // corrupts chain layout. Mirrors the client's `DragManager` and
-    // `ActionManager.tryMatch` rejection at the same threshold —
-    // having both gates means a misbehaving client can't sneak a
-    // chain-corrupting action past the server. Rootless actions
-    // (`root == 0`) don't write state-2 here, so they don't hit this.
-    if root != 0 {
-        let pin_depth = root_dist as usize + slots.len();
-        if pin_depth > 31 {
-            return Err(format!(
-                "recipe {recipe_id} would pin past chain index 31: \
-                 root_dist={root_dist} + slots.len={} = {pin_depth}",
-                slots.len()
-            ));
-        }
-    }
-    for (i, slot_entity) in recipe_def.slots.iter().enumerate() {
-        let def = decode_definition(slot_defs[i])
-            .map_err(|err| format!("decode slot {i} def: {err}"))?
-            .ok_or_else(|| format!("slot {i} card {} has unknown definition", slots[i]))?;
-        if !entity_satisfied(slot_entity, def) {
-            return Err(format!(
-                "recipe {recipe_id}: slot {i} (card {}) does not satisfy slot entity",
-                slots[i]
-            ));
-        }
-    }
-
-    // Pre-flight stock-availability check. Each `ConsumeStock` clause
-    // names a target role + aspect + delta — for v1 the role is
-    // always `Hex`, so the consume requires a synthetic-hex path that
-    // produced a stocks tuple. A real hex-Card row doesn't carry per-
-    // row stock; rejecting here is cleaner than the alternative of
-    // silently no-op'ing the consume at completion.
-    //
-    // For each clause: look up the tile def's stock slot for the
-    // aspect, read the row's current value, and reject if it's below
-    // the delta. The matcher's `Entity::Aspect` arm already enforces
-    // that the hex predicate is satisfied for the same aspect — this
-    // check just guards the consume's specific amount against the
-    // current row value (the predicate might say `min: 1` and pass
-    // for a tile with `wood: 1`, but a `consume.hex.aspect.wood: 2`
-    // would over-draw — both fail-on-propose so the client doesn't
-    // start a long-duration action that's doomed).
-    if !recipe_def.consume.is_empty() {
-        let Some(stocks) = hex_stocks else {
-            return Err(format!(
-                "recipe {recipe_id}: declares `consume` but no synthetic hex resolved \
-                 — stock consumption requires a tile-rooted hex"
-            ));
-        };
-        let hex_def_full = decode_definition(hex_def)
-            .map_err(|err| format!("decode hex def for consume check: {err}"))?
-            .ok_or_else(|| format!("recipe {recipe_id}: hex def unknown, can't validate consume"))?;
-        for clause in &recipe_def.consume {
-            let resonantdust_content::recipe_core::ConsumeRole::Hex = clause.role;
-            // Only `Sub` ops can fail pre-flight by under-drawing.
-            // `Add` and `Set` saturate at the slot's bounds — no
-            // amount of "too much" rejects a propose.
-            if clause.op != resonantdust_content::recipe_core::StockOp::Sub {
-                continue;
-            }
-            // Sub-aspect widening for consume, mirroring the
-            // matcher's `entity_specificity_with_stocks`: a recipe
-            // consuming `wood.sub: 1` against a forest tile carrying
-            // only `pine` stock resolves to the pine slot (pine
-            // descends from wood). Multi-descendant tiles (e.g.
-            // pine + oak) sum across all descendant slots — same
-            // total the matcher predicate sees, so the eligibility
-            // check and the consume check agree on what's available.
-            let slot_indices = hex_def_full.descendant_stock_slot_indices(clause.aspect_id);
-            if slot_indices.is_empty() {
-                return Err(format!(
-                    "recipe {recipe_id}: consume targets aspect_id {} but hex def {:?} declares no matching stock slot",
-                    clause.aspect_id, hex_def_full.key
-                ));
-            }
-            let available: u8 = slot_indices.iter().map(|&idx| {
-                if idx == 0 { stocks.0 } else { stocks.1 }
-            }).sum();
-            if available < clause.delta {
-                return Err(format!(
-                    "recipe {recipe_id}: tile stock for aspect_id {} (sum across {} descendant slots) is {}, recipe requires {}",
-                    clause.aspect_id, slot_indices.len(), available, clause.delta
-                ));
-            }
-        }
-    }
-
-    // Resolve direction once from the recipe — Stack/Magnetic(Up) →
-    // STACK_DIR_UP, Stack/Magnetic(Down) → STACK_DIR_DOWN. Used by
-    // both the slot chain (state-1) and the actor-on-root pin
-    // (state-2) so they share a direction. The recipe_type guard
-    // above already established this is `Stack(_)` or `Magnetic(_)`,
-    // so the unreachable arm only fires if that guard is later
-    // relaxed without updating this.
-    let direction = match recipe_def.recipe_type {
-        RecipeType::Stack(StackDirection::Up) | RecipeType::Magnetic(StackDirection::Up) => {
-            crate::packed::STACK_DIR_UP
-        }
-        RecipeType::Stack(StackDirection::Down) | RecipeType::Magnetic(StackDirection::Down) => {
-            crate::packed::STACK_DIR_DOWN
-        }
-        _ => unreachable!("recipe_type guard above ensures Stack(_) or Magnetic(_)"),
-    };
-
-    // Apply per-card writes per the lock-phase contract:
-    //
-    //   if Slots.length:
-    //     slot_hold(Slot[0])
-    //     for i in 1..N:
-    //       Slot[i] → state=Slot, microLocation=Slot[i-1],
-    //                 direction, macro_zone, surface,
-    //                 slot_hold + position_hold + force_position.
-    //
-    //     Slot[0]'s spatial anchor depends on the chain shape (see
-    //     `actor_anchor` above):
-    //       - root != 0:
-    //           Slot[0] → state=OnRoot, microLocation=root,
-    //                     position=root_dist, direction,
-    //                     macro_zone, surface,
-    //                     position_hold + force_position.
-    //       - root == 0 && hex != 0:
-    //           Slot[0] → state=OnHex, microZone=hex's (q,r),
-    //                     microLocation=hex card_id, macro_zone, surface
-    //                     (all taken from hex card's row),
-    //                     position_hold + force_position.
-    //       - root == 0 && hex == 0 && surface >= WORLD_LAYER:
-    //           Slot[0] → state=OnHex, microZone=caller's (carries q,r),
-    //                     microLocation=0, macro_zone, surface
-    //                     (all taken from caller args),
-    //                     position_hold + force_position.
-    //       - otherwise: no spatial change (rootless inventory action).
-    //
-    //   if root:
-    //     slot_hold(root)
-    //     if hex:
-    //       root → state=OnHex, microZone=hex's (q,r),
-    //              microLocation=hex card_id, macro_zone, surface,
-    //              position_hold + force_position.
-    //
-    // `slot_hold` / `position_hold` flags are OR'd in. `force_position`
-    // is set on every row that gets spatial fields rewritten so the
-    // client's mirror takes the server's bytes verbatim. With-holds
-    // rows clear `progress_style` so they don't render as completion
-    // events on the client.
-    //
-    // Recipe-side `set_start` flags are applied per role at the same
-    // time as the built-in holds: `set_start.slot` ORed onto every
-    // slot card, `set_start.root` onto root (if present),
-    // `set_start.hex` onto hex (if present). `set_start.slot` applies
-    // uniformly across all slots in the matched recipe — per-index
-    // overrides aren't a current need. Held flags clear at completion
-    // via `action_completion::apply`'s `release_mask` (every `*_hold`
-    // bit); permanent variants are the `*_locked` flags, which the
-    // release_mask doesn't touch.
-    // `set_start` is `FlagOps` per role — set/clear bitmasks built
-    // from the JSON `"flag": true|false` entries. Each consumer site
-    // below applies them *after* the server defaults so the author's
-    // explicit `false` can release auto-held bits (e.g.,
-    // `set_start.root.slot_hold = false` to drop the auto slot_hold
-    // chain-stitching would otherwise leave on a slot).
-    let set_start_root = recipe_def.set_start.root;
-    let set_start_slot = recipe_def.set_start.slot;
-    let set_start_hex = recipe_def.set_start.hex;
-    let with_holds_flags_clear = !(PROGRESS_STYLE_MASK | FLAG_FORCE_POSITION);
-    // Reducer-call timestamp, captured once. Used by both the chain-
-    // stitch position-hold forward-propagation below and the
-    // `completion_ms` calculation further down. `cards::now_ms` is
-    // ctx-timestamp-based so multiple calls within the same reducer
-    // return the same value; precomputing just makes the dataflow
-    // explicit.
-    let start_ms = crate::cards::now_ms(ctx);
-
-    // Precompute slots[0]'s spatial anchor. Four cases:
-    //   1. `root != 0`                        → state-2 OnRoot pin onto
-    //                                            root at `root_dist`.
-    //   2. `root == 0 && hex != 0`            → state-3 OnHex onto the hex
-    //                                            card; (surface, macro_zone,
-    //                                            q, r) come from hex's row.
-    //   3. `root == 0 && hex == 0
-    //       && surface >= WORLD_LAYER`        → state-3 OnHex onto a
-    //                                            virtual world tile (no
-    //                                            hex card row); the
-    //                                            caller's (surface,
-    //                                            macro_zone, micro_zone)
-    //                                            encode the tile.
-    //   4. otherwise                          → no spatial change; slots[0]
-    //                                            keeps its current loose
-    //                                            position (rootless
-    //                                            inventory action).
-    //
-    // The server is authoritative on slot spatial state: the client's
-    // local overlay for world drops is local-only, so without this
-    // write the server would leave slots[0]'s stale (pre-drop) spatial
-    // bytes intact and push them back, collapsing the chain on the
-    // client mirror.
-    let actor_anchor: Option<(u8, u32, u8, u32)> = if slots.is_empty() {
-        None
-    } else if root != 0 {
-        Some((
-            surface,
-            macro_zone,
-            pack_stack_micro_zone(root_dist, direction, StackedState::OnRoot),
-            root,
-        ))
-    } else if hex != 0 {
-        let hex_card = cards::latest(ctx, hex)
-            .ok_or_else(|| format!("hex card {hex} not found"))?;
-        if hex_card.surface != surface || hex_card.macro_zone != macro_zone {
-            return Err(format!(
-                "hex card {hex} not in proposed zone \
-                 (server: surface={}, macro_zone={}; proposed: surface={surface}, macro_zone={macro_zone})",
-                hex_card.surface, hex_card.macro_zone,
-            ));
-        }
-        let (q, r, _) = unpack_micro_zone(hex_card.micro_zone);
-        Some((
-            hex_card.surface,
-            hex_card.macro_zone,
-            crate::packed::pack_micro_zone(q, r, StackedState::OnHex),
-            hex,
-        ))
-    } else if surface >= WORLD_LAYER {
-        // World-rooted: trust the caller's tile coords. The state bits
-        // in `micro_zone` must say OnHex — anything else is a client
-        // bug we don't want to silently paper over.
-        let (_, _, state) = unpack_micro_zone(micro_zone);
-        if state != StackedState::OnHex {
-            return Err(format!(
-                "world-rooted action requires micro_zone state=OnHex; got {state:?}"
-            ));
-        }
-        Some((surface, macro_zone, micro_zone, 0))
-    } else {
-        None
-    };
-
-    if !slots.is_empty() {
-        // slots[0] (actor): always gets slot_hold. Spatial fields when
-        // `actor_anchor` is `Some` (the three anchored cases above) —
-        // also bumps position_hold_count + force_position so the
-        // client mirror accepts the server's bytes verbatim.
-        let actor_takes_position_hold = actor_anchor.is_some();
-        cards::update_with(ctx, slots[0], |c| {
-            c.flags &= with_holds_flags_clear;
-            c.flags |= FLAG_SLOT_HOLD;
-            if let Some((s, mz_macro, mz_micro, ml)) = actor_anchor {
-                c.surface = s;
-                c.macro_zone = mz_macro;
-                c.micro_zone = mz_micro;
-                c.micro_location = ml;
-                // `position_preserve` only when we actually pinned a
-                // position. Rootless inventory actions (actor_anchor =
-                // None) leave the card where the player put it, so a
-                // later move_soul is free to re-home it.
-                c.flags = cards::increment_position_hold_count(c.flags)
-                    | FLAG_FORCE_POSITION
-                    | FLAG_POSITION_PRESERVE;
-            }
-            // set_start.slot runs last so the author can override the
-            // auto-held bits set above (slot_hold, position_hold).
-            c.flags = set_start_slot.apply(c.flags);
-        });
-        if actor_takes_position_hold {
-            // Forward-prop the count delta we just applied to any
-            // future rows of this card (release rows queued by other
-            // in-flight actions on the same card, etc.).
-            cards::propagate_position_hold_forward(ctx, slots[0], start_ms, true);
-        }
-
-        // slots[1..]: state-1 (Slot) parent-pointer chain anchored on
-        // slots[0]. Each slot's microLocation is its immediate
-        // predecessor. Direction is stored explicitly. Always
-        // `position_preserve` — these slots' positions are entirely
-        // derived from the chain and movement must not reposition them.
-        for i in 1..slots.len() {
-            let parent_id = slots[i - 1];
-            cards::update_with(ctx, slots[i], |c| {
-                c.flags &= with_holds_flags_clear;
-                c.flags = cards::increment_position_hold_count(c.flags)
-                    | FLAG_SLOT_HOLD
-                    | FLAG_FORCE_POSITION
-                    | FLAG_POSITION_PRESERVE;
-                c.flags = set_start_slot.apply(c.flags);
-                c.micro_location = parent_id;
-                c.micro_zone = pack_slot_micro_zone(direction);
-                c.macro_zone = macro_zone;
-                c.surface = surface;
-            });
-            cards::propagate_position_hold_forward(ctx, slots[i], start_ms, true);
-        }
-    }
-
-    // Root: in stack recipes, root is the chain anchor — not the actor
-    // (actor is slots[0]; see action_completion::apply's actor_id
-    // resolution). Per the recipe-author contract, slot_hold goes on
-    // the actor + slot fillers, not on root in stack recipes.
-    // `set_start.root` bits and the hex-anchor spatial pin are still
-    // applied here; the difference vs. earlier revisions is just that
-    // we no longer OR in slot_hold.
-    //
-    // Spatial fields only when hex is provided (state-3 re-anchor
-    // onto hex tile). When root is present without hex, root keeps
-    // its existing position — the chain hangs off it where the player
-    // put it.
-    if root != 0 {
-        // For the hex-anchor case, read the hex card's row to grab
-        // its (localQ, localR) — those are the in-zone coords we
-        // stamp on root's micro_zone so the client knows which hex
-        // tile root sits on.
-        let hex_qr: Option<(u8, u8)> = if hex != 0 {
-            cards::latest(ctx, hex).map(|hex_card| {
-                let (q, r, _) = unpack_micro_zone(hex_card.micro_zone);
-                (q, r)
-            })
-        } else {
-            None
-        };
-        let root_takes_position_hold = hex_qr.is_some();
-        cards::update_with(ctx, root, |c| {
-            c.flags &= with_holds_flags_clear;
-            if let Some((q, r)) = hex_qr {
-                c.micro_zone = crate::packed::pack_micro_zone(q, r, StackedState::OnHex);
-                c.micro_location = hex;
-                c.macro_zone = macro_zone;
-                c.surface = surface;
-                // Pinned onto the hex tile — `position_preserve` so
-                // movement can't yank the root off the hex mid-action.
-                c.flags = cards::increment_position_hold_count(c.flags)
-                    | FLAG_FORCE_POSITION
-                    | FLAG_POSITION_PRESERVE;
-            }
-            c.flags = set_start_root.apply(c.flags);
-        });
-        if root_takes_position_hold {
-            cards::propagate_position_hold_forward(ctx, root, start_ms, true);
-        }
-    }
-
-    // Hex: not otherwise touched by the lock-phase, but if the recipe's
-    // `set_start.hex` carries any non-zero set/clear masks we apply
-    // them to the hex card's row. Skipping the write when both
-    // `hex == 0` and the ops are all-zero avoids a no-op version row.
-    if hex != 0 && (set_start_hex.set_mask != 0 || set_start_hex.clear_mask != 0) {
-        cards::update_with(ctx, hex, |c| {
-            c.flags = set_start_hex.apply(c.flags);
-        });
-    }
-
-    // Apply the completion outcomes synchronously, with all writes
-    // stamped at start_secs + duration. The valid_at pattern handles
-    // the "this becomes current later" behaviour automatically — the
-    // client's ValidAtTable.promote(now) surfaces each future-stamped
-    // row once wall-clock catches up. No scheduler involved.
-    let duration_secs = match &recipe_def.duration {
-        Some(Duration::Fixed(s)) => *s,
-        Some(Duration::Conditional { cases, fallback }) => {
-            // Pool: root (when present) + every slot's def. Hex tier
-            // aspects are excluded by convention — duration is a
-            // chain-side property, not an anchor property. Defs are
-            // re-decoded here rather than threaded down from the
-            // earlier eligibility loop; the registry lookups are
-            // O(log n) and the chain is short.
-            let mut chain_defs: Vec<&CardDefinition> = Vec::new();
-            if root != 0 {
-                if let Some(d) = decode_definition(root_def)
-                    .map_err(|err| format!("recipe {recipe_id}: decode root def for pool: {err}"))?
-                {
-                    chain_defs.push(d);
-                }
-            }
-            for (i, &packed) in slot_defs.iter().enumerate() {
-                if let Some(d) = decode_definition(packed).map_err(|err| {
-                    format!("recipe {recipe_id}: decode slot {i} def for pool: {err}")
-                })? {
-                    chain_defs.push(d);
-                }
-            }
-            let pool = aspect_pool(chain_defs);
-            // Cases evaluate in declaration order; first match wins.
-            // Falls back to the trailing default when no case fires.
-            let mut hit: Option<u32> = None;
-            for (secs, entity) in cases {
-                if entity_satisfied_pool(entity, &pool).map_err(|err| {
-                    format!("recipe {recipe_id}: conditional duration entity: {err}")
-                })? {
-                    hit = Some(*secs);
-                    break;
-                }
-            }
-            hit.unwrap_or(*fallback)
-        }
-        None => return Err(format!("recipe {recipe_id}: missing duration")),
-    };
-    // `start_ms` was precomputed at the top of the lock-phase. Recipe
-    // `duration` is authored in whole seconds (JSON int); convert to
-    // ms for the time-budget arithmetic everywhere downstream.
-    let completion_ms = start_ms.saturating_add((duration_secs as u64) * 1_000);
-
-    // Capture the caller's player_id for ProductOwner::Action
-    // resolution. Falling back to 0 if the caller has no session keeps
-    // unauthenticated callers from breaking the reducer; products land
-    // with owner_id=0 in that pathological case.
-    let caller_player_id = players::resolve_caller(ctx).unwrap_or(0);
-
-    // Resolve `has` / `reagents.has` predicates against the soul
-    // stacks containing the root and actor cards. Empty
-    // `HasMatches` when the recipe declares no has-predicates.
-    //
-    // Soul resolution mirrors `action_completion::apply`'s actor
-    // pick: actor is `slots[0]` if slots exist, else root, else hex.
-    // The souls containing those cards are what `has.root` /
-    // `has.actor` checks against. `owning_soul` walks `owner_id`
-    // up to the first `FLAG_OWNED_BY_PLAYER` row; world-owned roles
-    // return `None` (no soul context → empty stack → has-predicates
-    // can't bind, recipe is filtered out).
-    let root_soul_card_id = if root != 0 {
-        cards::owning_soul(ctx, root).unwrap_or(0)
-    } else {
-        0
-    };
-    let actor_id_for_has = if !slots.is_empty() {
-        slots[0]
-    } else if root != 0 {
-        root
-    } else {
-        hex
-    };
-    let actor_soul_card_id = if actor_id_for_has != 0 {
-        cards::owning_soul(ctx, actor_id_for_has).unwrap_or(0)
-    } else {
-        0
-    };
-    let has_matches = crate::recipe_eval::resolve_has(
+    // If the recipe references branch 0 and the client sent 0
+    // (sentinel) for that binding, resolve a synthetic tile from
+    // zone data. Only valid when bindings is exactly [0].
+    let synthetic_hex = resolve_synthetic_if_needed(
         ctx,
-        &recipe_def.id,
-        &recipe_def.has,
-        &recipe_def.reagents.has,
-        &recipe_def.has_below,
-        &recipe_def.reagents.has_below,
-        root_soul_card_id,
-        actor_soul_card_id,
-        start_ms,
+        recipe_ref,
+        &bindings,
+        surface,
+        macro_zone,
+        micro_zone,
     )?;
 
-    // Magnetic block check: if the caller has expired magnetic
-    // actions past the grace window, reject unless this call is
-    // attempting to resolve one. The carve-out is permissive — any
-    // of (hex, root, slots) overlapping the caller's blocked
-    // card_ids counts as a resolution attempt. If the recipe
-    // doesn't actually transform the magnetic card, the row stays
-    // and the next non-resolving call gets blocked again.
-    let involved: Vec<u32> = std::iter::once(hex)
-        .chain(std::iter::once(root))
-        .chain(slots.iter().copied())
-        .filter(|&id| id != 0)
-        .collect();
-    crate::lifecycle_pending::block_check(
+    // Stage 1 — Recipe-vs-stack verification.
+    verify_input(ctx, recipe_ref, root, &bindings, synthetic_hex.as_ref())?;
+
+    // Stage 2 — Stack-vs-world cross-check.
+    validate_bindings(ctx, recipe_ref, recipe_id, &bindings, caller_player_id)?;
+
+    // Stage 3 — Chain-stitch (write per-card position bytes for root
+    // and every top-level iterator binding).
+    let now_ms = cards::now_ms(ctx);
+    chain_stitch(
         ctx,
-        caller_player_id,
-        crate::cards::now_ms(ctx),
-        &involved,
+        recipe_ref,
+        root,
+        surface,
+        macro_zone,
+        micro_zone,
+        &bindings,
     )?;
 
+    // Stage 4 — Locks (propose-time claims).
+    apply_locks(recipe_ref, &bindings, root, now_ms, ctx);
+
+    // Run the tape walker — emits completion-time future-stamped
+    // writes (destroy / create / lock release) at
+    // `now_ms + walker.duration * 1000`. The walker computes
+    // `walker.duration` from `sys.duration.set` statements in the
+    // output tape.
     action_completion::apply(
         ctx,
-        recipe_def,
-        hex,
+        recipe_ref,
+        &bindings,
         root,
-        &slots,
-        completion_ms,
+        synthetic_hex.map(|(_, _, loc)| loc),
+        now_ms,
         caller_player_id,
-        hex_location,
-        has_matches,
     )?;
 
     Ok(())
 }
 
-// Boolean version of recipe_core's private `entity_specificity`. Returns
-// true iff the entity is satisfied by `def`. We don't need the
-// specificity score here — `propose_action` only cares about
-// eligibility, never about ranking against other recipes.
-fn entity_satisfied(entity: &Entity, def: &CardDefinition) -> bool {
-    entity_satisfied_with_stocks(entity, def, None)
+/// If the recipe references branch 0 at top-level and the client
+/// sent the no-card sentinel (`bindings[iter][0] == 0`), resolve a
+/// synthetic tile from zone data. Returns `Ok(None)` when no
+/// synthesis is needed (either branch 0 isn't referenced or the
+/// client provided a real card_id).
+fn resolve_synthetic_if_needed(
+    ctx: &ReducerContext,
+    recipe: &Recipe,
+    bindings: &[Vec<u32>],
+    surface: u8,
+    macro_zone: u32,
+    micro_zone: u8,
+) -> Result<Option<(u16, (u8, u8), HexLocation)>, String> {
+    for (iter_id, it) in recipe.iterators.iter().enumerate() {
+        if it.parent.is_empty() && it.branch == 0 {
+            let binding = bindings.get(iter_id).ok_or_else(|| {
+                format!("bindings missing entry for iterator {iter_id}")
+            })?;
+            // Only the first slot of branch 0 supports synthetic
+            // tiles. If the recipe uses slot.0.1+, those must be
+            // real cards.
+            if !binding.is_empty() && binding[0] == 0 {
+                let synth = derive_synthetic_hex(ctx, surface, macro_zone, micro_zone)
+                    .ok_or_else(|| {
+                        format!(
+                            "recipe references branch 0 with synthetic sentinel \
+                             (0) but no tile resolves at (surface={surface}, \
+                             macro_zone={macro_zone}, micro_zone={micro_zone})"
+                        )
+                    })?;
+                return Ok(Some(synth));
+            }
+        }
+    }
+    Ok(None)
 }
 
-/// Stock-aware variant of [`entity_satisfied`]. When `stocks` is
-/// `Some((stock0, stock1))` and the def declares a `stock` slot for
-/// an `Entity::Aspect`'s aspect, the row value is checked instead of
-/// the def's static aspect value. See [docs/TILE_ASPECTS.md] for the
-/// matcher widening rationale — row stock is the per-tile truth;
-/// the static aspect entry is fallback / non-tile use.
+// ----- Stage 1: recipe-vs-stack verifier ------------------------------
+
+/// Walk every input statement and evaluate its predicate. Errors
+/// are prefixed with the statement index for findability.
+fn verify_input(
+    ctx: &ReducerContext,
+    recipe: &Recipe,
+    root: u32,
+    bindings: &[Vec<u32>],
+    synthetic_hex: Option<&(u16, (u8, u8), HexLocation)>,
+) -> Result<(), String> {
+    for (i, stmt) in recipe.input.iter().enumerate() {
+        verify_stmt(ctx, recipe, stmt, root, bindings, synthetic_hex)
+            .map_err(|e| format!("input[{i}]: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Evaluate one input predicate. Path-first grammar — the last
+/// segment is the predicate op:
 ///
-/// All other entity arms ignore `stocks`; only `Entity::Aspect` and
-/// its boolean-combinator parents (And/Or/Not/WeightedOr) thread it
-/// through.
-fn entity_satisfied_with_stocks(
-    entity: &Entity,
-    def: &CardDefinition,
-    stocks: Option<(u8, u8)>,
-) -> bool {
-    match entity {
-        Entity::Card(key) => &def.key == key,
-        Entity::Aspect(aspect, min) => {
-            use resonantdust_content::definition_core::is_aspect_descendant;
-            // Sub-aspect widening: a predicate asking for `food`
-            // matches a card carrying `berries` because berries
-            // descends from food. The def's row stock takes priority
-            // over its static `aspects` map when ANY matching stock
-            // slot is declared (mirrors the v1 single-aspect rule).
-            // Sum the row stock values across every slot whose id IS
-            // or descends from `*aspect`; if at least one such slot
-            // exists the stock total is the answer, otherwise fall
-            // back to summing static aspect values the same way.
-            if let Some((s0, s1)) = stocks {
-                let mut had_match = false;
-                let mut stock_total: i32 = 0;
-                for (idx, slot) in def.stock.iter().enumerate() {
-                    if is_aspect_descendant(slot.aspect_id, *aspect).unwrap_or(false) {
-                        had_match = true;
-                        let row_val = if idx == 0 { s0 } else { s1 } as i32;
-                        stock_total += row_val;
-                    }
-                }
-                if had_match {
-                    return stock_total >= *min;
+/// - `<path>.def_id: <key>` — card def's key equals `<key>`.
+/// - `<path>.aspect.<name>.min: <N>` — card's aspect value (or
+///   matching stock total) is ≥ `<N>`.
+fn verify_stmt(
+    ctx: &ReducerContext,
+    recipe: &Recipe,
+    stmt: &resonantdust_content::recipe_core::Stmt,
+    root: u32,
+    bindings: &[Vec<u32>],
+    synthetic_hex: Option<&(u16, (u8, u8), HexLocation)>,
+) -> Result<(), String> {
+    let segs = stmt.segments.as_slice();
+    let op = segs
+        .last()
+        .and_then(|s| match s {
+            Seg::Word(w) => Some(w.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| "empty path or non-word terminal segment".to_string())?;
+
+    match op {
+        "def_id" => {
+            let key = match &stmt.value {
+                Some(StatementValue::Str(s)) => s.as_str(),
+                _ => return Err("def_id: requires a string value".to_string()),
+            };
+            let target = &segs[..segs.len() - 1];
+            let (packed_def, _stocks) = resolve_target(
+                ctx,
+                recipe,
+                target,
+                root,
+                bindings,
+                synthetic_hex,
+            )?;
+            let def = decode_definition(packed_def)
+                .map_err(|e| format!("decode card def: {e}"))?
+                .ok_or_else(|| format!("def_id check: packed {packed_def:#06x} has no def"))?;
+            if def.key != key {
+                return Err(format!("def_id: expected {key:?}, got {:?}", def.key));
+            }
+            Ok(())
+        }
+        "min" => {
+            // Shape: <path>.aspect.<name>.min: <N>
+            if segs.len() < 4 {
+                return Err(format!(
+                    "min predicate expects `<path>.aspect.<name>.min`, got {segs:?}"
+                ));
+            }
+            match &segs[segs.len() - 3] {
+                Seg::Word(w) if w == "aspect" => {}
+                other => {
+                    return Err(format!(
+                        "min predicate expects `aspect` before name; got {other:?}"
+                    ))
                 }
             }
-            // No stock slot for this aspect on this def — sum the
-            // static aspect contributions instead.
-            let total: i32 = def
-                .aspects
-                .iter()
-                .filter(|(a, _)| is_aspect_descendant(*a, *aspect).unwrap_or(false))
-                .map(|(_, v)| *v)
-                .sum();
-            total >= *min
+            let aspect_name = match &segs[segs.len() - 2] {
+                Seg::Word(w) => w.as_str(),
+                other => {
+                    return Err(format!(
+                        "min predicate expects an aspect name; got {other:?}"
+                    ))
+                }
+            };
+            let min_value = match &stmt.value {
+                Some(StatementValue::Int(n)) => *n as i32,
+                _ => return Err("min: requires an integer value".to_string()),
+            };
+            let target = &segs[..segs.len() - 3];
+            let aspect_id = aspect_id(aspect_name)
+                .map_err(|e| format!("aspect lookup: {e}"))?
+                .ok_or_else(|| format!("unknown aspect {aspect_name:?}"))?;
+            let (packed_def, stocks) = resolve_target(
+                ctx,
+                recipe,
+                target,
+                root,
+                bindings,
+                synthetic_hex,
+            )?;
+            let total = aspect_total(packed_def, aspect_id, stocks)?;
+            if total < min_value {
+                return Err(format!(
+                    "aspect {aspect_name:?}.min: required >= {min_value}, got {total}"
+                ));
+            }
+            Ok(())
         }
-        Entity::Type(type_id) => def.card_type == *type_id,
-        Entity::Flag(bit) => def.flags & (1u32 << bit) != 0,
-        Entity::Any => true,
-        Entity::And(children) => children
-            .iter()
-            .all(|c| entity_satisfied_with_stocks(c, def, stocks)),
-        Entity::Or(children) => children
-            .iter()
-            .any(|c| entity_satisfied_with_stocks(c, def, stocks)),
-        Entity::Not(child) => !entity_satisfied_with_stocks(child, def, stocks),
-        Entity::WeightedOr { a, b, .. } => {
-            entity_satisfied_with_stocks(a, def, stocks)
-                || entity_satisfied_with_stocks(b, def, stocks)
-        }
+        "destroy" | "create" | "set" | "add" | "sub" | "random" => Err(format!(
+            "{op:?} is an output op; not valid in input statements"
+        )),
+        "gt" | "ge" | "lt" | "le" | "eq" | "ne" => Err(format!(
+            "{op:?} comparison ops are output-side gates; \
+             input predicates use `min` or `def_id`"
+        )),
+        other => Err(format!("unsupported predicate op {other:?}")),
     }
 }
 
-// ----- apply_match_holds — commented out alongside submit_action -----
-/*
-// For a matched recipe id, mark the cards filling its slots:
-// - all slot fillers get slot_hold;
-// - everyone except slot[0] (the actor) gets position_hold from this rule.
-//   The actor's own pin is governed separately by the root/hex args.
-fn apply_match_holds(
-    match_id: u16,
-    chain: &[u32],
-    slot_holds: &mut BTreeSet<u32>,
-    position_holds: &mut BTreeSet<u32>,
-) -> Result<(), String> {
-    if match_id == 0 {
-        return Ok(());
+/// Sum aspect values visible to the predicate matcher. Walks the
+/// def's stock slots and static aspects, summing every entry whose
+/// aspect IS or descends from the target. Per-row stocks (when
+/// provided) take precedence when a matching stock slot exists.
+fn aspect_total(
+    packed_def: u16,
+    aspect: AspectId,
+    stocks: Option<(u8, u8)>,
+) -> Result<i32, String> {
+    let def = decode_definition(packed_def)
+        .map_err(|e| format!("decode def: {e}"))?
+        .ok_or_else(|| format!("packed {packed_def:#06x} has no def"))?;
+    if let Some((s0, s1)) = stocks {
+        let mut had_match = false;
+        let mut stock_total: i32 = 0;
+        for (idx, slot) in def.stock.iter().enumerate() {
+            if is_aspect_descendant(slot.aspect_id, aspect).unwrap_or(false) {
+                had_match = true;
+                let row_val = if idx == 0 { s0 } else { s1 } as i32;
+                stock_total += row_val;
+            }
+        }
+        if had_match {
+            return Ok(stock_total);
+        }
     }
-    let recipe_def = recipe(match_id)
-        .map_err(|e| format!("recipe lookup: {e}"))?
-        .ok_or_else(|| format!("recipe {match_id} not registered"))?;
-    let n = recipe_def.slots.len().min(chain.len());
-    for (i, &card_id) in chain.iter().take(n).enumerate() {
-        slot_holds.insert(card_id);
-        if i > 0 {
-            position_holds.insert(card_id);
+    let total: i32 = def
+        .aspects
+        .iter()
+        .filter(|(a, _)| is_aspect_descendant(*a, aspect).unwrap_or(false))
+        .map(|(_, v)| *v)
+        .sum();
+    Ok(total)
+}
+
+/// Resolve a segment path to the target's `(packed_definition,
+/// stocks)`. Walks anchor + slot refs + `.owner` / `.parent` chain
+/// steps, enforcing transition constraints as it goes:
+///
+/// - **After `.owner`:** the next card's `card_id` must equal the
+///   previous card's `owner_id` (the `.owner` step said "go to the
+///   card whose id is `prev.owner_id`"; verify the binding agrees).
+/// - **After `.parent`:** the next card's `card_id` must equal the
+///   previous card's `micro_location` (chain parent pointer).
+/// - **Branch constraint on nested iterators:** the resolved card's
+///   `micro_zone` direction must match the iterator's `branch`.
+///
+/// These are all O(1) per segment — no inventory walks, no chain
+/// scans. The client pre-resolved every binding; the server just
+/// confirms the relationships claimed by the path actually hold.
+fn resolve_target(
+    ctx: &ReducerContext,
+    recipe: &Recipe,
+    path: &[Seg],
+    root: u32,
+    bindings: &[Vec<u32>],
+    synthetic_hex: Option<&(u16, (u8, u8), HexLocation)>,
+) -> Result<(u16, Option<(u8, u8)>), String> {
+    // Resolve the first segment to a card_id. Either `root` or a
+    // top-level `Slot` reference.
+    let mut card_id = match path.first() {
+        Some(Seg::Word(w)) if w == "root" => {
+            if root == 0 {
+                return Err("root anchor: root is 0".to_string());
+            }
+            root
+        }
+        Some(Seg::Slot {
+            iterator_id,
+            offset,
+        }) => {
+            let it = recipe
+                .iterators
+                .get(*iterator_id as usize)
+                .ok_or_else(|| format!("iterator_id {iterator_id} out of range"))?;
+            let binding_row = bindings
+                .get(*iterator_id as usize)
+                .ok_or_else(|| format!("bindings missing entry for iterator {iterator_id}"))?;
+            let resolved = binding_row.get(*offset as usize).copied().ok_or_else(|| {
+                format!(
+                    "iterator {iterator_id} offset {offset} out of range (binding len {})",
+                    binding_row.len()
+                )
+            })?;
+            // Synthetic-tile case: branch 0, top-level, sentinel 0.
+            // Only valid as a leaf (path.len() == 1) — synthetic
+            // tiles have no chain to walk.
+            if resolved == 0 && it.parent.is_empty() && it.branch == 0 && *offset == 0 {
+                if let Some(&(packed, stocks, _)) = synthetic_hex {
+                    if path.len() == 1 {
+                        return Ok((packed, Some(stocks)));
+                    }
+                    return Err(
+                        "synthetic tile doesn't support owner/parent chain navigation"
+                            .to_string(),
+                    );
+                }
+            }
+            if resolved == 0 {
+                return Err(format!(
+                    "iterator {iterator_id} offset {offset}: binding is 0 (no-card sentinel)"
+                ));
+            }
+            resolved
+        }
+        Some(other) => {
+            return Err(format!("unsupported top-level anchor segment {other:?}"))
+        }
+        None => return Err("empty path".to_string()),
+    };
+
+    // Walk subsequent segments. Track what's expected of the next
+    // card after each `.owner` / `.parent` transition.
+    enum Expect {
+        Anything,
+        OwnerOf(u32),  // next card.card_id must equal this value
+        ParentOf(u32), // next card.card_id must equal this value
+    }
+    let mut expect = Expect::Anything;
+    let mut i = 1;
+    while i < path.len() {
+        match &path[i] {
+            Seg::Word(w) if w == "owner" => {
+                let card = cards::latest(ctx, card_id)
+                    .ok_or_else(|| format!("card {card_id} not found"))?;
+                if card.owner_id == 0 {
+                    return Err(format!(
+                        "owner step: card {card_id} has no owner"
+                    ));
+                }
+                expect = Expect::OwnerOf(card.owner_id);
+                card_id = card.owner_id;
+                i += 1;
+            }
+            Seg::Word(w) if w == "parent" => {
+                let card = cards::latest(ctx, card_id)
+                    .ok_or_else(|| format!("card {card_id} not found"))?;
+                if card.micro_location == 0 {
+                    return Err(format!(
+                        "parent step: card {card_id} has no parent"
+                    ));
+                }
+                expect = Expect::ParentOf(card.micro_location);
+                card_id = card.micro_location;
+                i += 1;
+            }
+            Seg::Slot {
+                iterator_id,
+                offset,
+            } => {
+                let it = recipe
+                    .iterators
+                    .get(*iterator_id as usize)
+                    .ok_or_else(|| format!("iterator_id {iterator_id} out of range"))?;
+                let binding_row = bindings.get(*iterator_id as usize).ok_or_else(|| {
+                    format!("bindings missing entry for iterator {iterator_id}")
+                })?;
+                let resolved = binding_row.get(*offset as usize).copied().ok_or_else(|| {
+                    format!(
+                        "iterator {iterator_id} offset {offset} out of range \
+                         (binding len {})",
+                        binding_row.len()
+                    )
+                })?;
+                if resolved == 0 {
+                    return Err(format!(
+                        "iterator {iterator_id} offset {offset}: binding is 0"
+                    ));
+                }
+                // A Slot reference following `.owner` / `.parent`
+                // means "look up this iterator's binding, which is a
+                // card in the chain rooted at the owner/parent we
+                // just walked to." The resolved card is in that
+                // chain, not the owner/parent itself — so
+                // `resolved == card_id` is the wrong check (it
+                // confused "iterator parent target" with "iterator
+                // binding"). The structural correctness is verified
+                // by the branch-direction check below plus the
+                // ownership / FLAG_SLOT_HOLD checks in
+                // `validate_bindings`; the Expect mechanism was just
+                // wrong-headed here.
+                //
+                // The one case we still want to reject is a
+                // Slot-after-Slot with no `.owner` / `.parent`
+                // between — that's a parser-level malformed path.
+                if matches!(expect, Expect::Anything) && i > 1 {
+                    if let Seg::Slot { .. } = &path[i - 1] {
+                        return Err(format!(
+                            "unexpected slot reference (iter {iterator_id}, \
+                             offset {offset}) without prior owner/parent step"
+                        ));
+                    }
+                }
+                // For nested iterators (parent != []), the bound card
+                // must actually be in the right branch. Read its
+                // micro_zone direction and check against
+                // `iterator.branch`. (Top-level iterators get their
+                // branch direction stamped by chain-stitch at Stage 3
+                // — no check needed here since the server is the one
+                // writing it.)
+                if !it.parent.is_empty() {
+                    let card = cards::latest(ctx, resolved)
+                        .ok_or_else(|| format!("card {resolved} not found"))?;
+                    let actual_dir = micro_zone_direction(card.micro_zone);
+                    if actual_dir != it.branch {
+                        return Err(format!(
+                            "branch mismatch: iterator {iterator_id} expects \
+                             branch {}, but card {resolved}'s actual direction \
+                             is {}",
+                            it.branch, actual_dir
+                        ));
+                    }
+                }
+                card_id = resolved;
+                expect = Expect::Anything;
+                i += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unsupported path segment {other:?} in chain navigation"
+                ))
+            }
+        }
+    }
+
+    let card = cards::latest(ctx, card_id)
+        .ok_or_else(|| format!("resolve target: card {card_id} not found"))?;
+    Ok((card.packed_definition, None))
+}
+
+// ----- Stage 2: stack-vs-world validation -----------------------------
+
+/// Cross-check every card_id in `bindings` against the cards table.
+///
+/// For each non-sentinel card:
+/// - The row must exist and not be dead.
+/// - `slot_hold` must be clear — claimed cards can't be re-claimed
+///   by a concurrent action.
+/// - Ownership must lead back to the caller (or to the world
+///   anonymous player for shared-world cards).
+/// - Magnetic discipline: if a bound card carries the magnetic
+///   flag, the `recipe_id` must equal the card def's declared
+///   `magnetic.recipe`. This is what prevents a client from
+///   resolving a magnetic card with the wrong recipe.
+///
+/// Duplicate detection covers the whole bindings 2-D array; the
+/// same card can't appear at two different (iter, offset) slots.
+/// Card_id 0 is the synthetic-tile sentinel and is skipped.
+fn validate_bindings(
+    ctx: &ReducerContext,
+    recipe: &Recipe,
+    recipe_id: u16,
+    bindings: &[Vec<u32>],
+    caller_player_id: u32,
+) -> Result<(), String> {
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    for (iter_id, binding_row) in bindings.iter().enumerate() {
+        let iter_locks = recipe
+            .iterators
+            .get(iter_id)
+            .map(|it| it.slot_hold)
+            .unwrap_or(true);
+        for &card_id in binding_row.iter() {
+            if card_id == 0 {
+                continue;
+            }
+            if !seen.insert(card_id) {
+                return Err(format!(
+                    "card {card_id} appears more than once in bindings"
+                ));
+            }
+            let card = cards::latest(ctx, card_id)
+                .ok_or_else(|| format!("card {card_id} not found"))?;
+            if card.flags & FLAG_DEAD != 0 {
+                return Err(format!("card {card_id} is dead"));
+            }
+            // Borrow iterators (lookup-only, no `slot_hold` claim)
+            // skip the in-flight check so concurrent recipes can
+            // simultaneously borrow the same tool — e.g. two
+            // cut_tree actions running in parallel both referencing
+            // the soul's axe. Non-borrow (locked) iterators still
+            // reject if their bindings are already slot_held by
+            // another action.
+            if iter_locks && card.flags & FLAG_SLOT_HOLD != 0 {
+                return Err(format!(
+                    "card {card_id} is already claimed by another in-flight action"
+                ));
+            }
+            // Ownership: walk up to the responsible player. Either
+            // the caller or the world-anonymous bucket is fine.
+            let owner_player =
+                cards::owning_player(ctx, card_id).unwrap_or(cards::WORLD_PLAYER_ID);
+            if owner_player != caller_player_id
+                && owner_player != cards::WORLD_PLAYER_ID
+            {
+                return Err(format!(
+                    "card {card_id} is owned by player {owner_player}, not caller {caller_player_id}"
+                ));
+            }
+            // Magnetic discipline.
+            if card.flags & FLAG_LIFECYCLE_PENDING != 0 {
+                let def = decode_definition(card.packed_definition)
+                    .map_err(|e| format!("decode def for magnetic check: {e}"))?
+                    .ok_or_else(|| format!("card {card_id} has unknown def"))?;
+                let expected = lifecycle_recipe_for_def(def)
+                    .map_err(|e| format!("magnetic recipe lookup: {e}"))?
+                    .ok_or_else(|| {
+                        format!(
+                            "card {card_id} carries magnetic flag but def declares no magnetic recipe"
+                        )
+                    })?;
+                if expected != recipe_id {
+                    return Err(format!(
+                        "card {card_id} is magnetic-locked to recipe {expected}, got {recipe_id}"
+                    ));
+                }
+            }
         }
     }
     Ok(())
 }
-*/
+
+// ----- Stage 3: chain-stitch -----------------------------------------
+
+/// Write per-card position bytes so the chain is a server-side
+/// fact, visible to all subscribers. Root lands `Free` at the
+/// proposed `(surface, macro_zone, micro_zone)`; each top-level
+/// iterator's bindings stitch into branch `iterator.branch` as a
+/// parent-pointer chain off root.
+///
+/// Card layout per branch:
+/// - `bindings[iter][0]` — `state=OnRoot, direction=branch,
+///   position=1, micro_location=root`.
+/// - `bindings[iter][i>0]` — `state=Slot, direction=branch,
+///   micro_location=bindings[iter][i-1]` (parent pointer chain).
+///
+/// Nested iterators (parent != []) are left alone — their cards
+/// already live in other chains (equipment, etc.). Synthetic-tile
+/// sentinels (card_id == 0) are skipped.
+fn chain_stitch(
+    ctx: &ReducerContext,
+    recipe: &Recipe,
+    root: u32,
+    surface: u8,
+    macro_zone: u32,
+    micro_zone: u8,
+    bindings: &[Vec<u32>],
+) -> Result<(), String> {
+    if root != 0 {
+        let (q, r, _) = unpack_micro_zone(micro_zone);
+        let root_micro_zone = pack_micro_zone(q, r, StackedState::Free);
+        cards::update_with(ctx, root, |c| {
+            c.surface = surface;
+            c.macro_zone = macro_zone;
+            c.micro_zone = root_micro_zone;
+            // Free state uses micro_location for [x, y] pixel coords;
+            // for action-rooted cards we don't carry sub-tile coords,
+            // so 0 it.
+            c.micro_location = 0;
+            c.flags |= FLAG_FORCE_POSITION;
+        });
+    }
+
+    for (iter_id, it) in recipe.iterators.iter().enumerate() {
+        if !it.parent.is_empty() {
+            continue;
+        }
+        let binding_row = &bindings[iter_id];
+        for (offset, &card_id) in binding_row.iter().enumerate() {
+            if card_id == 0 {
+                continue;
+            }
+            // Root may appear in bindings when the client promoted it
+            // to `slot.<branch>.0` for a recipe with `anchors.root ==
+            // false` (e.g. `corpus + corpus` matching against a stack
+            // of two corpus where the bottom is the loose root).
+            // Root's position was already written above; subsequent
+            // bindings entries (offset >= 1) will chain off it via
+            // `binding_row[offset - 1] == root`, so the visual chain
+            // is still correct.
+            if card_id == root {
+                continue;
+            }
+            let direction = it.branch;
+            let (new_micro_zone, parent_id) = if offset == 0 {
+                (
+                    pack_stack_micro_zone(1, direction, StackedState::OnRoot),
+                    root,
+                )
+            } else {
+                (
+                    pack_slot_micro_zone(direction),
+                    binding_row[offset - 1],
+                )
+            };
+            cards::update_with(ctx, card_id, |c| {
+                c.surface = surface;
+                c.macro_zone = macro_zone;
+                c.micro_zone = new_micro_zone;
+                c.micro_location = parent_id;
+                c.flags |= FLAG_FORCE_POSITION;
+            });
+        }
+    }
+    Ok(())
+}
+
+// ----- Stage 4: locks ------------------------------------------------
+
+/// Apply `slot_hold` to every bound card (claims it for this action)
+/// and `position_hold` (ref-counted) to top-level chain cards
+/// (preserves chain integrity against movement / other actions).
+///
+/// Nested-iterator bindings get only `slot_hold` — they already
+/// live in their own chains, and that chain's structure isn't this
+/// action's responsibility to preserve.
+///
+/// **Note:** Phase 8 (`action_completion::apply`) will release these
+/// locks at completion time. Until Phase 8 lands, locks applied
+/// here persist indefinitely; expect to wipe state between dev
+/// iterations.
+fn apply_locks(
+    recipe: &Recipe,
+    bindings: &[Vec<u32>],
+    root: u32,
+    now_ms: u64,
+    ctx: &ReducerContext,
+) {
+    // Hold policy is fully explicit per the parser's prefix tokens
+    // (`borrow.` / `share.` / `claim.` / `use.`):
+    //   - `slot_hold`     → FLAG_SLOT_HOLD (exclusive claim + blocks user pickup)
+    //   - `position_hold` → ref-counted movement lock
+    //
+    // The parser aggregates per-statement prefixes to per-iterator
+    // and per-root tuples via last-write-wins. No more cross-anchor
+    // inference here — the recipe author writes what they want.
+
+    // Root: explicit anchor tokens, plus client root-promotion (root
+    // may appear in an iterator's bindings when a `slot.X.0` recipe
+    // matched against a stack whose bottom is the loose root).
+    let mut claim_root = recipe.anchors.root && recipe.root_slot_hold;
+    let mut pin_root = recipe.anchors.root && recipe.root_position_hold;
+    for (i, it) in recipe.iterators.iter().enumerate() {
+        let row = match bindings.get(i) {
+            Some(r) => r,
+            None => continue,
+        };
+        if row.iter().any(|&id| id == root) {
+            if it.slot_hold {
+                claim_root = true;
+            }
+            if it.position_hold {
+                pin_root = true;
+            }
+        }
+    }
+    if root != 0 {
+        if claim_root {
+            cards::update_with(ctx, root, |c| {
+                c.flags |= FLAG_SLOT_HOLD;
+            });
+        }
+        if pin_root {
+            cards::acquire_position_hold(ctx, root, now_ms);
+        }
+    }
+
+    for (iter_id, it) in recipe.iterators.iter().enumerate() {
+        if !it.slot_hold && !it.position_hold {
+            continue;
+        }
+        for &card_id in &bindings[iter_id] {
+            if card_id == 0 {
+                continue;
+            }
+            // Root's locks were applied above (with promotion-aware
+            // union across iterators); skip here to avoid double-
+            // acquire (would leak the position_hold refcount).
+            if card_id == root {
+                continue;
+            }
+            if it.position_hold {
+                cards::acquire_position_hold(ctx, card_id, now_ms);
+            }
+            if it.slot_hold {
+                cards::update_with(ctx, card_id, |c| {
+                    c.flags |= FLAG_SLOT_HOLD;
+                });
+            }
+        }
+    }
+}
+

@@ -218,8 +218,26 @@ fn dead_row_reapable(
     let age_ms = now_ms.saturating_sub(dead_at_ms);
 
     // Hard cap — never retain past 30 days, regardless of owner.
+    // Safety net for the in-flight-death retention below: if a
+    // recipe somehow gets stuck holding `slot_hold` on a dead row
+    // forever (server bug, lost completion write, etc), the row
+    // still gets reaped eventually.
     if age_ms > MAX_DEAD_RETENTION_MS {
         return true;
+    }
+
+    // In-flight death: the row has FLAG_DEAD but also carries
+    // slot_hold (forward-propagated onto this dead row by a later
+    // chain_stitch — a concurrent recipe claimed the card before
+    // its scheduled death fired). Retain so the client's animation-
+    // deferral path keeps seeing the dead+held state. The holding
+    // recipe's `action_completion` will write a future row at its
+    // own completion time that clears slot_hold; that newer row
+    // supersedes this one as "latest" and the non-latest sweep
+    // reaps this row on the next cadence.
+    const FLAG_SLOT_HOLD: u32 = 1 << 5;
+    if card.flags & FLAG_SLOT_HOLD != 0 {
+        return false;
     }
 
     // Resolve owner. The dead row's own `owner_id` chain may be

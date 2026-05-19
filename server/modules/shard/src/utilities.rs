@@ -284,11 +284,29 @@ pub fn unequip_card(
         return Err(format!("unequip_card: can't unequip soul card {card_id}"));
     }
 
-    // Only currently-chained cards can be unequipped.
+    // Idempotency: if the card is already Free, the unequip target
+    // state is already achieved. The client's drop path computes
+    // `sourceWasEquipped` from the LOCAL row, which can drift from
+    // the server when `mirrorCard.preservePosition` keeps a stale
+    // equipped state across a server-side Free push (FORCE_POSITION
+    // is clear on equip/release writes, so position-preserve fires).
+    // Returning Ok keeps the user's drag UX smooth — the row is just
+    // re-positioned at (target_x, target_y) so the visual matches
+    // wherever they dropped it.
     let (_, _, state) = unpack_micro_zone(card.micro_zone);
+    if matches!(state, StackedState::Free) {
+        cards::update_with(ctx, card_id, |c| {
+            c.surface = INVENTORY_LAYER;
+            c.macro_zone = soul_card_id;
+            c.micro_zone = pack_micro_zone(0, 0, StackedState::Free);
+            c.micro_location = pack_micro_location_xy(target_x, target_y);
+            c.owner_id = soul_card_id;
+        });
+        return Ok(());
+    }
     if !matches!(state, StackedState::OnRoot | StackedState::Slot) {
         return Err(format!(
-            "unequip_card: card {card_id} is not chained (state {state:?})"
+            "unequip_card: card {card_id} is in unexpected state {state:?}"
         ));
     }
     // Direction filter: this reducer is for the UP (equipment) chain.
@@ -303,15 +321,33 @@ pub fn unequip_card(
             "unequip_card: card {card_id} is claimed by an in-flight action"
         ));
     }
+    // `position_hold` (ref-counted at bits 17..=19) is the broader
+    // movement-block: any in-flight recipe whose path resolves to
+    // this card sets it, even when `slot_hold` is off (e.g. a
+    // `borrow.` nested-iterator predicate like `cut_tree`'s axe).
+    // Unequipping a position-held card would shift it out of the
+    // chain the recipe's path expects.
+    if cards::position_hold_count(card.flags) > 0 {
+        return Err(format!(
+            "unequip_card: card {card_id} is position-held by an in-flight action"
+        ));
+    }
 
     // Collect descendants (sub-chain above `card_id`). Any descendant
-    // carrying FLAG_SLOT_HOLD blocks the unequip — detaching it would
-    // orphan it mid-recipe.
+    // carrying FLAG_SLOT_HOLD or position_hold blocks the unequip —
+    // detaching it would orphan it mid-recipe (slot_hold) or shift
+    // it out of an in-flight recipe's path (position_hold).
     let descendants = chain_descendants(ctx, soul_card_id, card_id);
     for d in &descendants {
         if d.flags & FLAG_SLOT_HOLD != 0 {
             return Err(format!(
                 "unequip_card: descendant card {} is claimed by an in-flight action",
+                d.card_id
+            ));
+        }
+        if cards::position_hold_count(d.flags) > 0 {
+            return Err(format!(
+                "unequip_card: descendant card {} is position-held by an in-flight action",
                 d.card_id
             ));
         }

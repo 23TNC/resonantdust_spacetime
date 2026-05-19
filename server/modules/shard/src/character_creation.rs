@@ -45,15 +45,17 @@
 //! under the soul cap. That's what supports "delete a character and
 //! roll another from the same pack."
 
-use spacetimedb::{reducer, ReducerContext};
+use spacetimedb::{reducer, ReducerContext, Table};
 
 use resonantdust_content::definition_core::find_packed_by_key;
-use resonantdust_content::starter_pack_core::{starter_pack, StarterPackId};
+use resonantdust_content::starter_pack_core::{
+    starter_blueprints_for_soul, starter_pack, StarterPackId,
+};
 
 use crate::cards::{self, cards as _cards_table};
 use crate::packed::{pack_macro_zone, pack_micro_zone, StackedState};
 use crate::players::{self, player_profiles as _player_profiles_table};
-use crate::souls::with_portrait;
+use crate::souls::{soul_privates as _soul_privates_table, with_portrait, SoulPrivate};
 
 /// World surface band — souls spawn here, on the world hex grid.
 /// Mirrors the constant defined in `action_completion.rs` / `actions.rs`.
@@ -204,6 +206,38 @@ pub fn create_character(
         soul_def,
         /* flags           */ soul_flags,
     );
+
+    // Seed the per-soul private state row. The soul's starter
+    // blueprints (from the `"blueprints": [...]` array under its
+    // entry in `content/starter_packs/data/*.json`) get packed into
+    // the `blueprints_0` bit field — bit position = `blueprint_id -
+    // 1` (so id 1 → bit 0), matching the 1-indexed id mapping in
+    // `content/blueprints/id.json`. Ids 1..=64 fit in `blueprints_0`;
+    // anything beyond that is silently dropped today, but the bit
+    // field is sized to grow (`blueprints_1`, …) when the catalog
+    // crosses 64. The owning client subscribes to its own soul's row
+    // via `WHERE card_id = <soul card_id>`.
+    let starter_blueprints = starter_blueprints_for_soul(&pack.soul)
+        .map_err(|e| format!("create_character: starter blueprints: {e}"))?;
+    let mut blueprints_0: u64 = 0;
+    for bp_id in starter_blueprints {
+        // `BLUEPRINT_NONE` (0) is a sentinel and can't appear here —
+        // `starter_blueprints_for_soul` filters via `find_blueprint`
+        // which returns `Some(Blueprint { id: 1.. })` for real keys.
+        // Guard anyway so a future content shape change can't
+        // underflow `bit_pos`.
+        if bp_id == 0 {
+            continue;
+        }
+        let bit_pos = (bp_id as u32) - 1;
+        if bit_pos < 64 {
+            blueprints_0 |= 1u64 << bit_pos;
+        }
+    }
+    ctx.db.soul_privates().insert(SoulPrivate {
+        card_id: soul_card_id,
+        blueprints_0,
+    });
 
     // ---- Spawn the pack contents into the soul's inventory --------
     //

@@ -82,6 +82,44 @@ pub struct Soul {
     pub injured: u32,
 }
 
+/// Per-soul private state — the stuff the owning soul needs but
+/// other players don't (discovered blueprints, etc.). Kept off the
+/// public `Soul` row so other clients mirroring souls visible in
+/// their loaded zone don't pull in this soul's personal progression.
+///
+/// **Subscription pattern.** Public table, but each client only
+/// subscribes to their own active soul's row via
+/// `WHERE card_id = <local soul's card_id>`. Same convention as
+/// [`crate::players::PlayerProfile`] — server can't enforce "no
+/// peeking at others" today, so this is fine for low-sensitivity
+/// progression bits but not for anything truly sensitive.
+///
+/// **Flat row, not history.** Unlike `Soul` / `Card`, this table has
+/// one row per `card_id` and is updated in place. Progression state
+/// isn't time-stamped — there are no "what blueprints did the soul
+/// have discovered at time T" reads downstream — so the `valid_at`
+/// history machinery would be deadweight.
+///
+/// **Initial row.** Created in
+/// `character_creation::create_character` right after the soul card
+/// itself, alongside the starter-pack inventory spawn. Default
+/// `blueprints_0 = 0` — discovery is gameplay-driven, nothing is
+/// granted on character creation.
+#[table(accessor = soul_privates, public)]
+#[derive(Debug, Clone)]
+pub struct SoulPrivate {
+    #[primary_key]
+    pub card_id: u32,
+    /// Bit field of discovered blueprints, ids 1..=64. Bit position
+    /// is `blueprint_id - 1`, matching the 1-indexed id mapping in
+    /// `content/blueprints/id.json` (so blueprint id 1 = bit 0).
+    /// `blueprints_0` covers the first 64 ids; further fields
+    /// (`blueprints_1`, …) will be appended as the catalog grows
+    /// past 64 entries. Default `0` — discovery is gameplay-driven,
+    /// nothing is granted on signup. Flipping a bit on is one-way.
+    pub blueprints_0: u64,
+}
+
 // ---- u32 quad packing -----------------------------------------------
 
 /// Pack four `u8`s into a `u32` in the same order they're laid out in
