@@ -1,13 +1,18 @@
 // lib.rs
 pub mod action_completion;
 pub mod actions;
+pub mod blueprints;
 pub mod cards;
 pub mod character_creation;
+pub mod flags;
 pub mod gc;
 pub mod lifecycle_pending;
 pub mod mini_zone;
 pub mod movement;
 pub mod packed;
+pub mod pending_actions;
+pub mod place;
+pub mod player_dimension;
 pub mod players;
 pub mod recipe_eval;
 pub mod sequence;

@@ -1,72 +1,20 @@
 use resonantdust_content::definition_core::decode_definition;
 use spacetimedb::{table, ReducerContext, Table};
 
+use crate::flags::{bk_flags, state_flags};
 use crate::lifecycle_pending::lifecycle_pending;
-use crate::packed::{pack_valid_at, valid_at_time};
+use crate::packed::{
+    micro_zone_direction, pack_definition, pack_micro_zone, pack_stack_micro_zone,
+    pack_valid_at, unpack_definition, unpack_micro_zone, unpack_zone_definition, valid_at_time,
+    StackedState, STACK_DIR_HEX,
+};
 use crate::sequence;
-
-// Flag bit positions from `cards/flags.json`. Kept local for the
-// dirty / preserve marker machinery that lives in this file; other
-// modules duplicate the bits they need (see `action_completion.rs` /
-// `actions.rs` for the holds and progress fields).
-//
-// `FLAG_POSITION_DIRTY` / `FLAG_DATA_DIRTY` are auto-set by `write_at`
-// on every insert via a diff against `prev_latest` — callers should
-// never set them manually.
-//
-// `FLAG_POSITION_PRESERVE` / `FLAG_DATA_PRESERVE` are caller-set
-// intent flags: "don't override this row's position/data via forward
-// propagation." The forward-prop helpers respect them as stop /
-// skip conditions.
-const FLAG_POSITION_DIRTY: u32 = 1 << 13;
-const FLAG_POSITION_PRESERVE: u32 = 1 << 14;
-const FLAG_DATA_DIRTY: u32 = 1 << 15;
-const FLAG_DATA_PRESERVE: u32 = 1 << 16;
-
-/// `position_hold_count` (bits 17..=19). 3-bit reference count of how
-/// many distinct holders currently claim a position hold on this card
-/// — chain stitches, magnetic pulls, has-predicate matches, etc.
-/// Readers asking "is this card position-held?" check `count > 0`;
-/// there's no separate `position_hold` flag bit anymore (bit 0 is a
-/// tombstone in flags.json), the count IS the source of truth.
-/// Saturates at `0b111 = 7`; in realistic play the count tops out
-/// around 2-3 so the cap is comfortable slack and saturation only
-/// ever errs on the "hold lingers a bit longer" side, never the
-/// inverse.
-const POSITION_HOLD_COUNT_SHIFT: u32 = 17;
-pub const POSITION_HOLD_COUNT_MASK: u32 = 0b111 << POSITION_HOLD_COUNT_SHIFT;
-const POSITION_HOLD_COUNT_MAX: u32 = 0b111;
-
-/// `is_owned_by_player` (bit 20). Disambiguates `Card.owner_id`:
-/// SET → `owner_id` is a `player_id` (only valid on soul cards);
-/// CLEAR → `owner_id` is a `card_id` (the immediate container; `0`
-/// = world). Resolved by [`owning_player`] which walks `owner_id`
-/// until it hits a row carrying this bit and returns that row's
-/// `owner_id` as the player.
-pub const FLAG_OWNED_BY_PLAYER: u32 = 1 << 20;
-
-/// `dead` (bit 7). Set by action_completion when a card is consumed
-/// as a recipe reagent. Used here for the magnetic-cleanup hook —
-/// when `FLAG_DEAD` flips 0 → 1 on a write, any lifecycle_pending
-/// row for the card is removed and the owner's PlayerProfile
-/// summary is re-synced. See [`crate::lifecycle_pending`].
-/// Also consumed by the GC sweep ([`crate::gc`]) to identify dead
-/// rows eligible for retention-bounded reaping.
-pub const FLAG_DEAD: u32 = 1 << 7;
-
-/// `lifecycle_pending` (bit 12; JSON name `magnetic` for stable-id
-/// discipline until Phase 6 of the lifecycle rewrite). Set on the
-/// install row of a card whose def declares a `lifecycle:` block,
-/// via definition-flag inheritance. Detected here on first-row
-/// writes to decide whether to insert a `lifecycle_pending` detail
-/// row.
-const FLAG_LIFECYCLE_PENDING: u32 = 1 << 12;
 
 /// Reserved sentinel player_id meaning "the world" (no real player
 /// owns this). Server players `0..=1023` are reserved for pseudo-
 /// owners; world-owned cards have `owner_id == 0` AND
-/// `FLAG_OWNED_BY_PLAYER` clear. [`owning_player`] returns this
-/// when the walk terminates at `owner_id == 0`.
+/// `flags_state.is_owned_by_player` clear. [`owning_player`] returns
+/// this when the walk terminates at `owner_id == 0`.
 pub const WORLD_PLAYER_ID: u32 = 0;
 
 /// Max steps [`owning_player`] / [`would_cycle`] will follow before
@@ -75,63 +23,205 @@ pub const WORLD_PLAYER_ID: u32 = 0;
 /// → soul → player) so 32 is comfortable slack.
 const OWNER_WALK_DEPTH_CAP: u32 = 32;
 
-/// Read the `position_hold_count` field out of a flags u32.
-pub fn position_hold_count(flags: u32) -> u32 {
-    (flags >> POSITION_HOLD_COUNT_SHIFT) & POSITION_HOLD_COUNT_MAX
-}
-
-/// Replace the `position_hold_count` field on a flags u32 with `count`.
-fn write_position_hold_count(flags: u32, count: u32) -> u32 {
-    (flags & !POSITION_HOLD_COUNT_MASK)
-        | ((count & POSITION_HOLD_COUNT_MAX) << POSITION_HOLD_COUNT_SHIFT)
-}
-
-/// Pure flag transform: bump `position_hold_count` by 1 (saturating
-/// at 7). Used by callers that already have an open `update_with(_at)`
-/// closure (e.g., `propose_action`'s chain-stitch writes that combine
-/// position-hold + slot-hold + force-position in one row). Those
-/// callers must follow up with `propagate_position_hold_forward(ctx,
-/// card_id, time_ms, +1)` so future rows pick up the same delta;
-/// otherwise prefer the high-level `acquire_position_hold` helper.
-pub fn increment_position_hold_count(flags: u32) -> u32 {
-    let next = position_hold_count(flags)
-        .saturating_add(1)
-        .min(POSITION_HOLD_COUNT_MAX);
-    write_position_hold_count(flags, next)
-}
-
-/// Pure flag transform: subtract 1 from `position_hold_count`
-/// (saturating at 0). Mirror of [`increment_position_hold_count`] for
-/// release paths; same "open closure" caveats and same need to follow
-/// up with `propagate_position_hold_forward(..., -1)`.
-pub fn decrement_position_hold_count(flags: u32) -> u32 {
-    let next = position_hold_count(flags).saturating_sub(1);
-    write_position_hold_count(flags, next)
-}
-
-/// Bookkeeping bits — server-managed `position_dirty` / `data_dirty`
-/// plus the caller-set preserve markers, plus the
-/// `position_hold_count` field. Excluded from the data-diff (so
-/// toggling them doesn't itself count as a data change) and from
-/// `propagate_flag_diff_forward`'s set/clear masks (so they don't
-/// propagate themselves around).
+/// Define the pure-transform quartet (`<name>`, `write_<name>`,
+/// `increment_<name>`, `decrement_<name>`) for a `cards_bk` refcount
+/// field. Each generated function operates on the `flags_bk` u32:
 ///
-/// Including `POSITION_HOLD_COUNT_MASK` here is what makes the count's
-/// own dedicated forward-prop (`propagate_position_hold_forward`)
-/// safe: the bit-by-bit propagator can't fight the count-aware
-/// propagator over the same bits, because the bit-by-bit one ignores
-/// the field entirely.
-const BOOKKEEPING_FLAGS_MASK: u32 = FLAG_POSITION_DIRTY
-    | FLAG_POSITION_PRESERVE
-    | FLAG_DATA_DIRTY
-    | FLAG_DATA_PRESERVE
-    | POSITION_HOLD_COUNT_MASK;
+/// - `<name>(flags_bk)` — read the field's current value.
+/// - `write_<name>(flags_bk, count)` — replace the field's value
+///   (count is masked to the field width).
+/// - `increment_<name>(flags_bk)` — saturating-add one to the field,
+///   capped at the field's max value.
+/// - `decrement_<name>(flags_bk)` — saturating-sub one from the field,
+///   floor at zero.
+///
+/// Field shape (mask / shift / max) is pulled from `bk_flags()`
+/// keyed on `$mask` / `$shift` / `$max` (member names on `BkFlags`).
+/// The acquire / release / propagate-forward triplet that touches
+/// the cards table is generated separately via `decl_count_ctx!`.
+macro_rules! decl_count_pure {
+    (
+        $field_name:ident,
+        $mask_field:ident,
+        $shift_field:ident,
+        $max_field:ident,
+        $read:ident,
+        $write:ident,
+        $increment:ident,
+        $decrement:ident $(,)?
+    ) => {
+        #[doc = concat!("Read the `", stringify!($field_name), "` field out of a `flags_bk` u32.")]
+        pub fn $read(flags_bk: u32) -> u32 {
+            let b = bk_flags();
+            (flags_bk & b.$mask_field) >> b.$shift_field
+        }
 
-/// Bit-mask of flags carried by `packed_definition`'s `CardDefinition.flags`,
-/// or 0 when the definition isn't registered. Called from `create` /
-/// `create_at` so any card spawned with a definition inherits its
-/// flag set without per-call-site bookkeeping.
-fn definition_flag_mask(packed: u16) -> u32 {
+        #[doc = concat!("Replace the `", stringify!($field_name), "` field on a `flags_bk` u32 with `count` (clamped to the field width).")]
+        fn $write(flags_bk: u32, count: u32) -> u32 {
+            let b = bk_flags();
+            (flags_bk & !b.$mask_field)
+                | ((count & b.$max_field) << b.$shift_field)
+        }
+
+        #[doc = concat!("Pure flag transform: bump `", stringify!($field_name), "` by 1 (saturating at the field's max). Used by callers with an open `update_with(_at)` closure on `flags_bk`; pair with the corresponding `propagate_*_forward` to extend the delta into future rows, or prefer the higher-level acquire helper.")]
+        pub fn $increment(flags_bk: u32) -> u32 {
+            let max = bk_flags().$max_field;
+            let next = $read(flags_bk).saturating_add(1).min(max);
+            $write(flags_bk, next)
+        }
+
+        #[doc = concat!("Pure flag transform: subtract 1 from `", stringify!($field_name), "` (saturating at 0). Mirror of `", stringify!($increment), "`.")]
+        pub fn $decrement(flags_bk: u32) -> u32 {
+            let next = $read(flags_bk).saturating_sub(1);
+            $write(flags_bk, next)
+        }
+    };
+}
+
+/// Define the acquire / release / propagate-forward triplet for a
+/// `cards_bk` refcount field. Wraps the pure transforms from
+/// `decl_count_pure!` with the cards-table mutation and forward-prop
+/// walk. Each generated `acquire_<name>` increments the count at
+/// `time_ms` and walks every future-stamped row, applying +1 with
+/// delta arithmetic; `release_<name>` mirrors with -1.
+///
+/// The forward-prop helper bypasses `write_at` (direct
+/// `delete` / `insert`) so we don't recursively fire hooks or
+/// re-enqueue schedule-deletes for rows that were already scheduled
+/// at their original write. `valid_at` PKs are preserved across the
+/// delete/insert pair so any existing `schedule_delete_cards` row
+/// keyed on it still targets the correct (replacement) row.
+macro_rules! decl_count_ctx {
+    (
+        $increment:ident,
+        $decrement:ident,
+        $acquire:ident,
+        $release:ident,
+        $propagate:ident $(,)?
+    ) => {
+        #[doc = concat!("Acquire one reference on a card at `time_ms`. Bumps the count on the row current at that time AND walks every future-stamped row, incrementing there too — so a future-stamped release row written by an earlier action (with count baked in) correctly reflects 'but someone else is still holding' once this acquire lands.")]
+        pub fn $acquire(ctx: &ReducerContext, card_id: u32, time_ms: u64) {
+            update_with_at(ctx, card_id, time_ms, |c| {
+                c.flags_bk = $increment(c.flags_bk);
+            });
+            $propagate(ctx, card_id, time_ms, true);
+        }
+
+        #[doc = concat!("Release one reference on a card at `time_ms`. Decrements the count at `time_ms` and on every future-stamped row of the same card.")]
+        pub fn $release(ctx: &ReducerContext, card_id: u32, time_ms: u64) {
+            update_with_at(ctx, card_id, time_ms, |c| {
+                c.flags_bk = $decrement(c.flags_bk);
+            });
+            $propagate(ctx, card_id, time_ms, false);
+        }
+
+        #[doc = concat!("Apply ±1 to the field on every row of this card with `valid_at_time > time_ms`. Bypasses `write_at` (direct `delete` / `insert`) so we don't re-fire hooks. `valid_at` PKs are preserved across delete/insert pairs.")]
+        pub fn $propagate(
+            ctx: &ReducerContext,
+            card_id: u32,
+            time_ms: u64,
+            increment: bool,
+        ) {
+            let future: Vec<u64> = ctx
+                .db
+                .cards()
+                .card_id()
+                .filter(card_id)
+                .filter(|c| valid_at_time(c.valid_at) > time_ms)
+                .map(|c| c.valid_at)
+                .collect();
+            for v in future {
+                let Some(row) = ctx.db.cards().valid_at().find(v) else {
+                    continue;
+                };
+                let new_bk = if increment {
+                    $increment(row.flags_bk)
+                } else {
+                    $decrement(row.flags_bk)
+                };
+                ctx.db.cards().valid_at().delete(v);
+                let mut updated = row;
+                updated.flags_bk = new_bk;
+                ctx.db.cards().insert(updated);
+            }
+        }
+    };
+}
+
+decl_count_pure!(
+    position_hold_count,
+    position_hold_count_mask,
+    position_hold_count_shift,
+    position_hold_count_max,
+    position_hold_count,
+    write_position_hold_count,
+    increment_position_hold_count,
+    decrement_position_hold_count,
+);
+
+decl_count_pure!(
+    slot_share_count,
+    slot_share_count_mask,
+    slot_share_count_shift,
+    slot_share_count_max,
+    slot_share_count,
+    write_slot_share_count,
+    increment_slot_share_count,
+    decrement_slot_share_count,
+);
+
+decl_count_pure!(
+    drop_hold_count,
+    drop_hold_count_mask,
+    drop_hold_count_shift,
+    drop_hold_count_max,
+    drop_hold_count,
+    write_drop_hold_count,
+    increment_drop_hold_count,
+    decrement_drop_hold_count,
+);
+
+decl_count_pure!(
+    slot_hold_count,
+    slot_hold_count_mask,
+    slot_hold_count_shift,
+    slot_hold_count_max,
+    slot_hold_count,
+    write_slot_hold_count,
+    increment_slot_hold_count,
+    decrement_slot_hold_count,
+);
+
+decl_count_pure!(
+    touch_count,
+    touch_count_mask,
+    touch_count_shift,
+    touch_count_max,
+    touch_count,
+    write_touch_count,
+    increment_touch_count,
+    decrement_touch_count,
+);
+
+decl_count_pure!(
+    server_count,
+    server_count_mask,
+    server_count_shift,
+    server_count_max,
+    server_count,
+    write_server_count,
+    increment_server_count,
+    decrement_server_count,
+);
+
+/// State-flag bit mask carried by `packed_definition`'s
+/// `CardDefinition.flags` (def-driven inheritance — today this
+/// surfaces only the `magnetic` lifecycle-pending bit), or 0 when the
+/// definition isn't registered. Called from [`create`] / [`create_at`]
+/// so any card spawned with a definition inherits its state-flag set
+/// without per-call-site bookkeeping. Def-driven `flags_bk` doesn't
+/// exist yet — no bookkeeping flag has an authoring-time meaning.
+fn definition_state_flag_mask(packed: u16) -> u32 {
     decode_definition(packed)
         .ok()
         .flatten()
@@ -148,15 +238,34 @@ pub struct Card {
     #[index(btree)]
     pub macro_zone: u32,
     pub micro_zone: u8,
+    /// Index motivator: state-3 (`StackedState::Deferred`) cards
+    /// carry their host's `card_id` in `micro_location`. When the
+    /// host's `(surface, macro_zone)` changes, every state-3 row
+    /// pointing at it must follow — `state_3_followers(host_id)`
+    /// scans this index, dedupes by card_id, filters to current
+    /// state-3 rows. Also covers the more general case (state-1
+    /// Slot points at parent here too) but the only consumer today
+    /// is the state-3 cascade in [`write_at`].
+    #[index(btree)]
     pub micro_location: u32,
     #[index(btree)]
     pub owner_id: u32,
     pub packed_definition: u16,
-    /// Bit-flag column. Currently u32 — wider than the populated bit
-    /// range (bits 0..=7 today, defined in `content/cards/flags.json`).
-    /// Will shrink to the smallest type that fits the final flag count
-    /// once the registry stabilises.
-    pub flags: u32,
+    /// State flags — what is true about the card. Propagated forward
+    /// by [`propagate_flag_diff_forward`] from [`write_at`] on every
+    /// insert. Bit layout lives in `content/cards/flags.json`'s
+    /// `cards_state` namespace and is surfaced server-side via
+    /// [`crate::flags::state_flags`] (cached at first access).
+    pub flags_state: u32,
+    /// Bookkeeping flags — server-managed dirty / preserve markers
+    /// plus refcount fields (`position_hold_count`, `slot_share_count`).
+    /// Never bit-diff propagated; refcount fields have dedicated
+    /// delta-arithmetic propagators
+    /// ([`propagate_position_hold_forward`] /
+    /// [`propagate_slot_share_forward`]) that handle overlapping
+    /// holders correctly. Bit layout lives in `cards_bk` and is
+    /// surfaced server-side via [`crate::flags::bk_flags`].
+    pub flags_bk: u32,
 }
 
 /// Wall-clock now in unix milliseconds (u64). The codebase's time
@@ -181,6 +290,112 @@ pub fn now_ms(ctx: &ReducerContext) -> u64 {
 /// tables.
 pub fn latest(ctx: &ReducerContext, card_id: u32) -> Option<Card> {
     prior_at(ctx, card_id, now_ms(ctx))
+}
+
+/// Client-server time-drift tolerance.
+///
+/// Single-source-of-truth for the time-discipline contract between
+/// client and server:
+///
+///  - **Client buffer:** the client runs its `serverNowMs()` estimate
+///    `TIME_DRIFT_BUFFER_MS` behind the captured server timestamp, so
+///    `client_time_ms` submitted with every reducer is ≈ server_time -
+///    TIME_DRIFT_BUFFER_MS in steady state.
+///  - **Server back-grace:** the server accepts `client_time_ms` up to
+///    `TIME_DRIFT_BUFFER_MS + MAX_RTT_MS` behind its own clock. The
+///    buffer term absorbs the client's normal lag; the RTT term
+///    absorbs the round-trip network latency the submission travels
+///    through (since `ctx.timestamp` includes the inbound `δ_out`
+///    that the client couldn't yet have observed). Anything further
+///    back is rejected as `time_drift:client_behind`.
+///  - **Server forward-grace:** the server accepts `client_time_ms` up
+///    to `TIME_DRIFT_BUFFER_MS` ahead of its own clock. Beyond that the
+///    server rejects as `time_drift:client_ahead`. Inside the window
+///    the server uses `min(client, server)` for game logic, so any
+///    forward overshoot just degrades to using server-time directly.
+///
+/// 2000ms covers ~3% server-clock drag (observed in WSL2 / Docker
+/// throttling) over recipes up to ~67 seconds. If longer-duration
+/// content surfaces or the drift baseline worsens, this constant is
+/// the single knob.
+pub const TIME_DRIFT_BUFFER_MS: u64 = 2_000;
+
+/// Maximum round-trip network latency the time-discipline contract
+/// tolerates. Used by [`effective_now_ms`] as additional back-grace
+/// on top of `TIME_DRIFT_BUFFER_MS`.
+///
+/// Why this exists: in steady state, a client submission travels to
+/// the server with `δ_out` of latency, so `ctx.timestamp` reads
+/// `client_time_ms + TIME_DRIFT_BUFFER_MS + RTT`. Without this term,
+/// any client whose round-trip exceeds the buffer magnitude (e.g.,
+/// remote servers, slow Wi-Fi, mobile) would trip the back-grace
+/// check even when its clock is perfectly aligned with the server's.
+///
+/// 3000ms covers high-latency dev setups (remote SpacetimeDB across a
+/// public link) and intermittent jitter on otherwise-OK connections.
+/// The cheat budget under this constant is `MAX_RTT_MS`: a malicious
+/// client can back-date submissions by up to that amount per call to
+/// shave duration waits. Bounded by chained dependencies as elsewhere.
+pub const MAX_RTT_MS: u64 = 3_000;
+
+/// Static backward-grace window in `effective_now_ms`. The server
+/// accepts `client_time_ms` up to this many ms behind its own clock,
+/// rejecting anything older as `time_drift:client_behind_by`.
+///
+/// Sized at 2× the client's maximum self-imposed `clientDelay` (= 5s
+/// on the client), so the server has comfortable headroom even when
+/// the client is operating at its max-clamp. No per-player budget is
+/// stored or communicated — the client adapts within `[1500, 5000]`
+/// independently, and as long as that ceiling holds the server never
+/// rejects a legitimate submission for being too far behind. Keep
+/// `CLIENT_DELAY_MAX_MS` on the client ≤ `N/2` to maintain the 2×
+/// safety margin.
+pub const BACKWARD_GRACE_MS: u64 = 10_000;
+
+/// Resolve the time to use for game-logic calculations in a reducer.
+///
+/// Policy:
+///  - Reject if `client_time_ms` is more than `BACKWARD_GRACE_MS`
+///    behind the server's `ctx.timestamp`. Static cap; the client
+///    adapts its own `clientDelay` independently within `[1500, 5000]`
+///    and the server just needs enough margin to cover the client's
+///    max self-imposed delay (sized at 2×).
+///  - Reject if `client_time_ms` is more than `TIME_DRIFT_BUFFER_MS`
+///    ahead of the server's `ctx.timestamp`. (Cheat / desync: client
+///    claims the future to pull rows whose `valid_at` hasn't elapsed.
+///    Forward grace stays small — it's anti-cheat, not lag absorption.)
+///  - Otherwise return `min(client_time_ms, server_time_ms)`.
+///
+/// **Why `min`:** when the client is correctly behind the server (the
+/// normal case under steady-state buffer), `min` picks the client's
+/// value, so server stamps new rows at `client_time + duration*1000`.
+/// The client's `serverNowMs()` then hits those `valid_at`s on
+/// schedule. When the client is anomalously ahead (within the forward
+/// grace), `min` picks server, falling back to current-strict behavior.
+///
+/// Errors use the `time_drift:` prefix so the client's `ActionManager`
+/// can parse the rejection and schedule a retry once the gap closes.
+/// Format: `time_drift:client_behind_by=<N>` or
+/// `time_drift:client_ahead_by=<N>` where N is the millisecond gap.
+pub fn effective_now_ms(ctx: &ReducerContext, client_time_ms: u64) -> Result<u64, String> {
+    let server = now_ms(ctx);
+    // Client too far in the past → reject. `saturating_sub` keeps the
+    // math safe if `client_time_ms` is somehow huge (overflow guard).
+    let behind = server.saturating_sub(client_time_ms);
+    if behind > BACKWARD_GRACE_MS {
+        return Err(format!(
+            "time_drift:client_behind_by={behind} (server={server}, client={client_time_ms})"
+        ));
+    }
+    // Client too far in the future → reject. Forward grace is static
+    // (anti-cheat, not lag absorption).
+    let ahead = client_time_ms.saturating_sub(server);
+    if ahead > TIME_DRIFT_BUFFER_MS {
+        return Err(format!(
+            "time_drift:client_ahead_by={ahead} (server={server}, client={client_time_ms})"
+        ));
+    }
+    Ok(client_time_ms.min(server))
 }
 
 /// Row that's current at `time_ms` — max `valid_at_time` among
@@ -275,36 +490,36 @@ fn write_at(ctx: &ReducerContext, mut card: Card, time_ms: u64) -> Card {
     // See `packed::pack_valid_at` and `sequence.rs`.
     card.valid_at = pack_valid_at(time_ms, sequence::next_sequence(ctx));
 
-    // Auto-set `position_dirty` / `data_dirty` by diffing the row
-    // we're about to insert against the prior row. Strips any
-    // caller-set value for those bits (they're server-managed) but
-    // preserves the caller-set `position_preserve` / `data_preserve`
-    // intent flags. With no prior row (fresh card_id), treat
-    // everything as dirty so the very first row carries the markers
-    // any future forward-prop will key off.
-    card.flags &= !(FLAG_POSITION_DIRTY | FLAG_DATA_DIRTY);
+    // Auto-set `position_dirty` / `data_dirty` (both in `flags_bk`)
+    // by diffing the row we're about to insert against the prior row.
+    // Strips any caller-set value for those bits (they're
+    // server-managed) but preserves the caller-set `position_preserve`
+    // / `data_preserve` intent flags. With no prior row (fresh
+    // card_id), treat everything as dirty so the very first row
+    // carries the markers any future forward-prop will key off.
+    let bk = bk_flags();
+    card.flags_bk &= !(bk.position_dirty | bk.data_dirty);
     let (auto_pos, auto_data) = match prev_latest.as_ref() {
         Some(prev) => {
             let pos_changed = card.surface != prev.surface
                 || card.macro_zone != prev.macro_zone
                 || card.micro_zone != prev.micro_zone
                 || card.micro_location != prev.micro_location;
-            // Data diff excludes bookkeeping bits — toggling
-            // position_dirty / data_dirty / *_preserve isn't itself
-            // a state change.
+            // Data diff: `flags_state` is the data field directly —
+            // bookkeeping bits live in `flags_bk` (this field's
+            // own job) so they can't pollute the diff.
             let data_changed = card.owner_id != prev.owner_id
                 || card.packed_definition != prev.packed_definition
-                || (card.flags & !BOOKKEEPING_FLAGS_MASK)
-                    != (prev.flags & !BOOKKEEPING_FLAGS_MASK);
+                || card.flags_state != prev.flags_state;
             (pos_changed, data_changed)
         }
         None => (true, true),
     };
     if auto_pos {
-        card.flags |= FLAG_POSITION_DIRTY;
+        card.flags_bk |= bk.position_dirty;
     }
     if auto_data {
-        card.flags |= FLAG_DATA_DIRTY;
+        card.flags_bk |= bk.data_dirty;
     }
 
     if ctx.db.cards().valid_at().find(card.valid_at).is_some() {
@@ -316,10 +531,109 @@ fn write_at(ctx: &ReducerContext, mut card: Card, time_ms: u64) -> Card {
     // rules over the whole cards table.
     crate::souls::on_card_write(ctx, prev_latest.as_ref(), &inserted, time_ms);
     if let Some(prev) = prev_latest.as_ref() {
-        propagate_flag_diff_forward(ctx, &inserted, prev.flags, time_ms);
+        propagate_flag_diff_forward(ctx, &inserted, prev.flags_state, time_ms);
     }
+    cascade_to_state_3_followers(ctx, prev_latest.as_ref(), &inserted, time_ms);
     on_card_write_lifecycle(ctx, prev_latest.as_ref(), &inserted, time_ms);
     inserted
+}
+
+/// Every card currently in `StackedState::Deferred` whose
+/// `micro_location == host_id`. Walks the `micro_location` btree
+/// index, dedupes by `card_id`, looks up each card's latest row via
+/// [`prior_at`], filters down to those whose latest state is
+/// Deferred. The dedup-then-latest pattern mirrors
+/// [`walk_branch_top`] in `place.rs`: the index returns every
+/// historical row pointing at the host (including stale ones), but
+/// we only care about the current shape per card.
+///
+/// O(matches) on the index, bounded in practice by the per-host
+/// deferred follower count (typically 0-2 for normal recipe play).
+fn state_3_followers(ctx: &ReducerContext, host_id: u32, time_ms: u64) -> Vec<Card> {
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    let mut out: Vec<Card> = Vec::new();
+    for row in ctx.db.cards().micro_location().filter(host_id) {
+        if !seen.insert(row.card_id) {
+            continue;
+        }
+        let Some(latest) = prior_at(ctx, row.card_id, time_ms) else {
+            continue;
+        };
+        if latest.micro_location != host_id {
+            continue; // host pointer was stale; the latest row points elsewhere now.
+        }
+        let (_, _, state) = unpack_micro_zone(latest.micro_zone);
+        if !matches!(state, StackedState::Deferred) {
+            continue;
+        }
+        out.push(latest);
+    }
+    out
+}
+
+/// Cascade host-side `(surface, macro_zone)` / dead-flag changes
+/// down to every state-3 follower. Runs from [`write_at`] after the
+/// new row is inserted and the flag-diff propagator has finished,
+/// so the follower writes see the host's settled state.
+///
+/// Three trigger cases:
+///
+/// 1. **Host moved between `(surface, macro_zone)` pairs.** Rewrite
+///    every follower's surface + macro_zone to match. Without this,
+///    a follower placed in zone A would stay in A while the host
+///    travels to zone B — players subscribed to B alone can't see
+///    the follower; players subscribed to A see a follower pointing
+///    at a host they don't have. The cascade keeps the deferred
+///    chain visible together.
+///
+/// 2. **Host became dead.** Clear each follower's `micro_location`
+///    to 0 — the host's gone, the resolution anchor is invalid.
+///    Client cascade then falls through to the fallback (q, r) tier
+///    on the next mirror pass. Done at dead-flag-set time (not at
+///    actual delete) so the resolution happens before the GC sweep
+///    races the renderer.
+///
+/// 3. **No-op case.** Host's position and dead-flag both unchanged
+///    from the prior row → followers untouched (the most common
+///    path; a flags-only or stock-only update on a stable host).
+fn cascade_to_state_3_followers(
+    ctx: &ReducerContext,
+    prev: Option<&Card>,
+    new: &Card,
+    time_ms: u64,
+) {
+    let s = crate::flags::state_flags();
+    let position_changed = match prev {
+        Some(p) => p.surface != new.surface || p.macro_zone != new.macro_zone,
+        None => false, // first row for this card — no followers can be anchored yet.
+    };
+    let became_dead = match prev {
+        Some(p) => (p.flags_state & s.dead) == 0 && (new.flags_state & s.dead) != 0,
+        None => (new.flags_state & s.dead) != 0,
+    };
+    if !position_changed && !became_dead {
+        return;
+    }
+    let followers = state_3_followers(ctx, new.card_id, time_ms);
+    if followers.is_empty() {
+        return;
+    }
+    for follower in followers {
+        if became_dead {
+            // Host's gone — clear the anchor so the client cascade
+            // falls through to the fallback (q, r) tier.
+            update_with_at(ctx, follower.card_id, time_ms, |c| {
+                c.micro_location = 0;
+            });
+        } else if position_changed {
+            // Host moved zones — pull the follower along.
+            update_with_at(ctx, follower.card_id, time_ms, |c| {
+                c.surface = new.surface;
+                c.macro_zone = new.macro_zone;
+            });
+        }
+    }
 }
 
 /// Lifecycle-pending bookkeeping hook fired from `write_at` after the
@@ -349,13 +663,16 @@ fn on_card_write_lifecycle(
     new_row: &Card,
     _time_ms: u64,
 ) {
-    let prev_dead = prev.map_or(false, |p| p.flags & FLAG_DEAD != 0);
-    let new_dead = new_row.flags & FLAG_DEAD != 0;
+    let s = state_flags();
+    let prev_dead = prev.map_or(false, |p| p.flags_state & s.dead != 0);
+    let new_dead = new_row.flags_state & s.dead != 0;
     let became_dead = !prev_dead && new_dead;
 
-    // Install: first-ever row carrying the lifecycle flag.
+    // Install: first-ever row carrying the lifecycle flag (the
+    // `magnetic` bit in `flags_state`, set via def-flag inheritance
+    // by `definition_state_flag_mask`).
     let is_first_row = prev.is_none();
-    let is_lifecycle = new_row.flags & FLAG_LIFECYCLE_PENDING != 0;
+    let is_lifecycle = new_row.flags_state & s.magnetic != 0;
     if is_first_row && is_lifecycle && !new_dead {
         // Pull `lifecycle_duration_ms` off the def. Decode failures
         // are silently skipped here (content-authoring errors should
@@ -435,15 +752,14 @@ fn on_card_write_lifecycle(
 fn propagate_flag_diff_forward(
     ctx: &ReducerContext,
     new_card: &Card,
-    prev_flags: u32,
+    prev_flags_state: u32,
     time_ms: u64,
 ) {
-    // Exclude only the bookkeeping bits from the diff — those are
-    // server-managed per-row and shouldn't propagate themselves.
-    let prev_user = prev_flags & !BOOKKEEPING_FLAGS_MASK;
-    let new_user = new_card.flags & !BOOKKEEPING_FLAGS_MASK;
-    let set_bits = new_user & !prev_user;
-    let clear_bits = prev_user & !new_user;
+    // Operates solely on `flags_state`. Bookkeeping bits live in
+    // `flags_bk` (their own column) so they can't pollute the diff —
+    // no exclusion mask needed.
+    let set_bits = new_card.flags_state & !prev_flags_state;
+    let clear_bits = prev_flags_state & !new_card.flags_state;
     if set_bits == 0 && clear_bits == 0 {
         return;
     }
@@ -460,6 +776,7 @@ fn propagate_flag_diff_forward(
 
     let mut active_set = set_bits;
     let mut active_clear = clear_bits;
+    let data_preserve = bk_flags().data_preserve;
 
     for v in future {
         if active_set == 0 && active_clear == 0 {
@@ -468,16 +785,16 @@ fn propagate_flag_diff_forward(
         let Some(row) = ctx.db.cards().valid_at().find(v) else {
             continue;
         };
-        let row_flags = row.flags;
+        let row_state = row.flags_state;
 
-        // `data_preserve` rows opt out of forward-prop entirely — the
-        // caller deliberately stamped a state at this point in time
-        // and the per-bit stop-on-change rule can't distinguish
-        // "deliberate-same-as-prior" from "inherited," so we honor the
-        // explicit intent. Skip this row, but keep walking — a
-        // preserve marker means "don't touch THIS row," not "stop
-        // propagation entirely."
-        if row_flags & FLAG_DATA_PRESERVE != 0 {
+        // `data_preserve` (in flags_bk) rows opt out of forward-prop
+        // entirely — the caller deliberately stamped a state at this
+        // point in time and the per-bit stop-on-change rule can't
+        // distinguish "deliberate-same-as-prior" from "inherited," so
+        // we honor the explicit intent. Skip this row but keep
+        // walking — a preserve marker means "don't touch THIS row,"
+        // not "stop propagation entirely."
+        if row.flags_bk & data_preserve != 0 {
             continue;
         }
 
@@ -488,16 +805,16 @@ fn propagate_flag_diff_forward(
         //  - For clear_bits: keep bits where row has 1 (matches
         //    prev's 1, so inherited). Drop bits where row has 0
         //    (someone deliberately cleared it).
-        active_set &= !row_flags;
-        active_clear &= row_flags;
+        active_set &= !row_state;
+        active_clear &= row_state;
         if active_set == 0 && active_clear == 0 {
             break;
         }
 
-        let new_flags = (row_flags & !active_clear) | active_set;
+        let new_state = (row_state & !active_clear) | active_set;
         ctx.db.cards().valid_at().delete(v);
         let mut updated = row;
-        updated.flags = new_flags;
+        updated.flags_state = new_state;
         ctx.db.cards().insert(updated);
     }
 }
@@ -548,30 +865,31 @@ pub fn scrub_or_repath_position_forward(
         .collect();
     future.sort_unstable_by_key(|v| valid_at_time(*v));
 
+    let b = bk_flags();
     for v in future {
         let Some(row) = ctx.db.cards().valid_at().find(v) else {
             continue;
         };
-        let row_flags = row.flags;
+        let row_bk = row.flags_bk;
 
-        if row_flags & FLAG_POSITION_PRESERVE != 0 {
+        if row_bk & b.position_preserve != 0 {
             // Author-pinned position. This row and everything past
             // it is off-limits — chain stitch / magnetic pull
             // shouldn't be yanked mid-action.
             break;
         }
 
-        let pos_only = (row_flags & FLAG_POSITION_DIRTY != 0)
-            && (row_flags & FLAG_DATA_DIRTY == 0);
+        let pos_only =
+            (row_bk & b.position_dirty != 0) && (row_bk & b.data_dirty == 0);
         if pos_only {
             ctx.db.cards().valid_at().delete(v);
             continue;
         }
 
         // Mixed or data-only row — re-home its position fields to
-        // the new destination. Leave the data fields (flags / owner /
-        // packed_def) alone so a future flag-change row still applies
-        // its intended change at the correct moment.
+        // the new destination. Leave the data fields (flags_state /
+        // owner / packed_def) alone so a future flag-change row still
+        // applies its intended change at the correct moment.
         let pos_changed = row.surface != new_surface
             || row.macro_zone != new_macro_zone
             || row.micro_zone != new_micro_zone
@@ -591,7 +909,7 @@ pub fn scrub_or_repath_position_forward(
         // anchor for a tween target and stutter at the start of
         // the new path.
         if pos_changed {
-            updated.flags |= FLAG_POSITION_DIRTY;
+            updated.flags_bk |= b.position_dirty;
         }
         ctx.db.cards().insert(updated);
     }
@@ -599,11 +917,13 @@ pub fn scrub_or_repath_position_forward(
 
 // Insert a brand-new card. valid_at is computed; pass 0 will be overwritten.
 //
-// The card's `flags` column is `flags | definition_flag_mask(packed_definition)`
-// — every card spawned with a definition inherits that definition's flag
-// set (e.g. an event card with `["drop_locked", "surface_locked"]` lands
-// already drop-locked / surface-locked). Callers that need to ADD dynamic
-// bits at spawn time still pass them via `flags`; they get OR'd in.
+// `flags_state` is OR'd with `definition_state_flag_mask(packed_definition)`
+// so every card spawned with a definition inherits its def-driven state
+// flags (today: the `magnetic` bit for lifecycle-pending defs). `flags_bk`
+// is taken from the caller verbatim — no def-driven bookkeeping flags
+// exist. Callers spawning a soul pass `state_flags().is_owned_by_player`
+// plus the portrait field via `with_portrait`; most other callsites
+// pass `(0, 0)` and let the def-flag inheritance do the work.
 #[allow(clippy::too_many_arguments)]
 pub fn create(
     ctx: &ReducerContext,
@@ -614,7 +934,8 @@ pub fn create(
     micro_location: u32,
     owner_id: u32,
     packed_definition: u16,
-    flags: u32,
+    flags_state: u32,
+    flags_bk: u32,
 ) -> Card {
     write(
         ctx,
@@ -627,7 +948,8 @@ pub fn create(
             micro_location,
             owner_id,
             packed_definition,
-            flags: flags | definition_flag_mask(packed_definition),
+            flags_state: flags_state | definition_state_flag_mask(packed_definition),
+            flags_bk,
         },
     )
 }
@@ -668,83 +990,56 @@ where
     Some(write_at(ctx, c, time_ms))
 }
 
-/// Acquire one position-hold reference on a card at `time_ms`. Bumps
-/// the count on the row current at that time AND walks every
-/// future-stamped row of the same card, incrementing the count there
-/// too — so a future-stamped release row written by an earlier action
-/// (with count=0 baked in) correctly reflects "but someone else is
-/// still holding" once this acquire lands. Without the forward walk,
-/// the earlier release would prematurely transition the count to 0
-/// at its `valid_at_time` and the held bit would flicker off while a
-/// later action still needs it.
-///
-/// Symmetric with [`release_position_hold`]; SET callsites use this
-/// (or, when bundled with other mutations in one row, the pure
-/// transform [`increment_position_hold_count`] inside the closure
-/// followed by `propagate_position_hold_forward(..., +1)` here).
-pub fn acquire_position_hold(ctx: &ReducerContext, card_id: u32, time_ms: u64) {
-    update_with_at(ctx, card_id, time_ms, |c| {
-        c.flags = increment_position_hold_count(c.flags);
-    });
-    propagate_position_hold_forward(ctx, card_id, time_ms, true);
-}
+// Generated acquire / release / propagate-forward triplets for each
+// `cards_bk` refcount field. See `decl_count_ctx!` and the unified-
+// hold-counts rework doc (`docs/UNIFIED_HOLD_COUNTS.md`).
+decl_count_ctx!(
+    increment_position_hold_count,
+    decrement_position_hold_count,
+    acquire_position_hold,
+    release_position_hold,
+    propagate_position_hold_forward,
+);
 
-/// Release one position-hold reference on a card at `time_ms`. Mirror
-/// of [`acquire_position_hold`] — decrements the count at `time_ms`
-/// and on every future-stamped row of the same card.
-pub fn release_position_hold(ctx: &ReducerContext, card_id: u32, time_ms: u64) {
-    update_with_at(ctx, card_id, time_ms, |c| {
-        c.flags = decrement_position_hold_count(c.flags);
-    });
-    propagate_position_hold_forward(ctx, card_id, time_ms, false);
-}
+decl_count_ctx!(
+    increment_slot_share_count,
+    decrement_slot_share_count,
+    acquire_slot_share,
+    release_slot_share,
+    propagate_slot_share_forward,
+);
 
-/// Apply ±1 to the `position_hold_count` field on every row of this
-/// card with `valid_at_time > time_ms`. Bypasses `write_at` (direct
-/// `delete` / `insert`) so we don't recursively fire the souls hook,
-/// re-enqueue schedule-deletes, or run the bit-by-bit forward-prop
-/// (`POSITION_HOLD_COUNT_MASK` is in `BOOKKEEPING_FLAGS_MASK`, so
-/// that propagator skips this field anyway). `valid_at` PKs are
-/// preserved across delete/insert so existing `schedule_delete_cards`
-/// rows still target the correct (replacement) row.
-///
-/// Callers that already mutated the row at `time_ms` themselves
-/// (e.g., chain-stitch in `propose_action` ORs in
-/// `increment_position_hold_count` alongside other flag bits) call
-/// this to extend the same delta into the future-row chain. The pure
-/// transforms `increment_position_hold_count` /
-/// `decrement_position_hold_count` plus this helper give the same
-/// effect as `acquire_position_hold` / `release_position_hold` but
-/// fit inside a caller's existing closure.
-pub fn propagate_position_hold_forward(
-    ctx: &ReducerContext,
-    card_id: u32,
-    time_ms: u64,
-    increment: bool,
-) {
-    let future: Vec<u64> = ctx
-        .db
-        .cards()
-        .card_id()
-        .filter(card_id)
-        .filter(|c| valid_at_time(c.valid_at) > time_ms)
-        .map(|c| c.valid_at)
-        .collect();
-    for v in future {
-        let Some(row) = ctx.db.cards().valid_at().find(v) else {
-            continue;
-        };
-        let new_flags = if increment {
-            increment_position_hold_count(row.flags)
-        } else {
-            decrement_position_hold_count(row.flags)
-        };
-        ctx.db.cards().valid_at().delete(v);
-        let mut updated = row;
-        updated.flags = new_flags;
-        ctx.db.cards().insert(updated);
-    }
-}
+decl_count_ctx!(
+    increment_drop_hold_count,
+    decrement_drop_hold_count,
+    acquire_drop_hold,
+    release_drop_hold,
+    propagate_drop_hold_forward,
+);
+
+decl_count_ctx!(
+    increment_slot_hold_count,
+    decrement_slot_hold_count,
+    acquire_slot_hold,
+    release_slot_hold,
+    propagate_slot_hold_forward,
+);
+
+decl_count_ctx!(
+    increment_touch_count,
+    decrement_touch_count,
+    acquire_touch,
+    release_touch,
+    propagate_touch_forward,
+);
+
+decl_count_ctx!(
+    increment_server_count,
+    decrement_server_count,
+    acquire_server,
+    release_server,
+    propagate_server_forward,
+);
 
 // Like `create`, but stamps the new row at a specific `time_ms` rather
 // than `now`. Used by the action-completion path to materialize products
@@ -761,7 +1056,8 @@ pub fn create_at(
     micro_location: u32,
     owner_id: u32,
     packed_definition: u16,
-    flags: u32,
+    flags_state: u32,
+    flags_bk: u32,
 ) -> Card {
     write_at(
         ctx,
@@ -774,7 +1070,8 @@ pub fn create_at(
             micro_location,
             owner_id,
             packed_definition,
-            flags: flags | definition_flag_mask(packed_definition),
+            flags_state: flags_state | definition_state_flag_mask(packed_definition),
+            flags_bk,
         },
         time_ms,
     )
@@ -807,7 +1104,7 @@ pub fn next_card_id(ctx: &ReducerContext) -> u32 {
     if let Some(counter) = ctx.db.card_id_counter().id().find(0) {
         let allocated = counter.next;
         // Delete-and-reinsert is the established pattern in this
-        // codebase (see `cards::write_at`, `players::write`); avoids
+        // codebase (see `cards::write_at`, `players::write_at`); avoids
         // depending on whether `.update` is exposed on this binding
         // version.
         ctx.db.card_id_counter().id().delete(0);
@@ -835,6 +1132,415 @@ pub fn next_card_id(ctx: &ReducerContext) -> u32 {
         });
         allocated
     }
+}
+
+// ---- tile-card promotion ----------------------------------------------
+//
+// A zone tile is lazily promoted to a real `Card` row the first time
+// the unified-hold-count machinery (or any card-shaped read site) needs
+// to operate on it. Promotion is idempotent — concurrent accepts on
+// the same hex resolve to the same card via [`find_tile_card_at`]
+// before falling through to creation. Demotion (the reverse — folding
+// an at-rest tile-card back into the zone's packed tile slot) lives in
+// the GC sweep. See `docs/TILE_AS_CARD.md`.
+//
+// Disambiguation: zone tiles are hex-shaped cards whose `card_type`
+// matches the Zone's `packed_definition`. Rect-shaped cards placed at
+// the same hex live at `state = Free` carrying their own type; when a
+// rect is present, the tile-card sits **beneath** it as
+// `state = OnRoot` with `direction = STACK_DIR_HEX` (the slot.0
+// branch). This inverts the legacy "hex is the anchor, rect chains
+// on via OnHex" model — under the unified card model the rect is the
+// root and the hex is its branch-0 child.
+
+/// Snapshot of what currently occupies a hex, threaded through
+/// promotion so the placement decision and the find can share one
+/// macro_zone scan.
+struct HexOccupancy {
+    /// Existing tile-card at the hex, if any. Either standalone
+    /// (state = Free) or stacked beneath a rect
+    /// (state = OnRoot, direction = STACK_DIR_HEX).
+    tile_card: Option<Card>,
+    /// Existing Free-state non-tile root at the hex, if any. When
+    /// `tile_card` is `None` and this is `Some`, a new tile-card
+    /// promotes underneath as `state = OnRoot,
+    /// direction = STACK_DIR_HEX, micro_location = rect.card_id`.
+    rect_root: Option<Card>,
+}
+
+/// Single macro_zone scan that captures every signal
+/// `find_or_create_tile_card` needs. Iterates the `macro_zone` btree,
+/// dedupes by `card_id` (history rows produce multiple entries per
+/// card_id), and resolves each card_id to its row current at
+/// `time_ms` via [`prior_at`].
+///
+/// `owner_id_filter` is the per-surface discriminator: pass
+/// `Some(player_id)` on `PLAYER_DIMENSION_LAYER` (where multiple
+/// players' Zones share `(surface, macro_zone)`) to scope iteration
+/// to that player's cards; pass `None` on every other surface
+/// (world / mini_zone / pocket / inventory) where the
+/// `(surface, macro_zone)` tuple already uniquely identifies one
+/// container.
+fn inspect_hex(
+    ctx: &ReducerContext,
+    surface: u8,
+    macro_zone: u32,
+    owner_id_filter: Option<u32>,
+    q: u8,
+    r: u8,
+    tile_card_type: u8,
+    time_ms: u64,
+) -> HexOccupancy {
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    let mut free_tile: Option<Card> = None;
+    let mut rect_root: Option<Card> = None;
+    let mut tile_children: Vec<Card> = Vec::new();
+
+    for c in ctx.db.cards().macro_zone().filter(macro_zone) {
+        if !seen.insert(c.card_id) {
+            continue;
+        }
+        let Some(latest) = prior_at(ctx, c.card_id, time_ms) else {
+            continue;
+        };
+        if latest.surface != surface {
+            continue;
+        }
+        if let Some(want) = owner_id_filter {
+            if latest.owner_id != want {
+                continue;
+            }
+        }
+        let (cq, cr, state) = unpack_micro_zone(latest.micro_zone);
+        let (card_type, _) = unpack_definition(latest.packed_definition);
+
+        match state {
+            StackedState::Free if cq == q && cr == r => {
+                if card_type == tile_card_type {
+                    free_tile = Some(latest);
+                } else {
+                    rect_root = Some(latest);
+                }
+            }
+            StackedState::OnRoot
+                if card_type == tile_card_type
+                    && micro_zone_direction(latest.micro_zone) == STACK_DIR_HEX =>
+            {
+                tile_children.push(latest);
+            }
+            _ => {}
+        }
+    }
+
+    // Resolve tile_card: a standalone Free tile-card wins outright.
+    // Otherwise look for a tile-child whose `micro_location` points
+    // back to the rect root. A child without a matching root is data
+    // drift — leave `tile_card = None` so promotion either rebinds
+    // under the current rect or creates fresh.
+    let tile_card = if free_tile.is_some() {
+        free_tile
+    } else if let Some(root) = rect_root.as_ref() {
+        tile_children
+            .into_iter()
+            .find(|c| c.micro_location == root.card_id)
+    } else {
+        None
+    };
+
+    HexOccupancy { tile_card, rect_root }
+}
+
+/// Look up an existing tile-card at `(surface, macro_zone, q, r)`
+/// whose `card_type` matches `tile_card_type`. Checks both placements
+/// (standalone Free at the hex, or OnRoot/STACK_DIR_HEX beneath a
+/// rect). `time_ms` filters future-stamped rows so concurrent accepts
+/// see a consistent snapshot.
+///
+/// `owner_id_filter` — see [`inspect_hex`]. `Some(player_id)` on
+/// `PLAYER_DIMENSION_LAYER`, `None` elsewhere.
+pub fn find_tile_card_at(
+    ctx: &ReducerContext,
+    surface: u8,
+    macro_zone: u32,
+    owner_id_filter: Option<u32>,
+    q: u8,
+    r: u8,
+    tile_card_type: u8,
+    time_ms: u64,
+) -> Option<Card> {
+    inspect_hex(ctx, surface, macro_zone, owner_id_filter, q, r, tile_card_type, time_ms).tile_card
+}
+
+/// Promote a zone tile to a real Card row, or return the existing
+/// tile-card if one is already present. Idempotent — concurrent
+/// callers targeting the same hex resolve to the same card via
+/// `inspect_hex` before reaching the create path.
+///
+/// On promotion the new card is seeded from the Zone's tile slot at
+/// `(q, r)`:
+///
+/// - `packed_definition` = `pack_definition(zone_card_type, tile_def_id)`.
+/// - `owner_id` = `Zone.owner_id` (world: 0; mini_zone / pocket: the
+///   anchor's card_id).
+/// - `flags_state` / `flags_bk` = `0`. Def-driven state flags are
+///   merged in by [`create`] / [`create_at`] via
+///   `definition_state_flag_mask`.
+/// - Placement: standalone `Free` at the hex if no rect occupies it;
+///   else `OnRoot` direction `STACK_DIR_HEX` position `1` with
+///   `micro_location = rect.card_id` (the rect becomes its parent).
+///
+/// **Stock state.** The Zone's `(stock0, stock1)` are NOT carried
+/// onto the seeded card in this phase — they remain readable from
+/// the zone slot until the write-rerouting phase introduces a
+/// per-card stock store. Read paths that need stock during the
+/// promotion window should still consult `zone.tile_stock_at(...)`.
+/// See `docs/TILE_AS_CARD.md` Phase 4.
+///
+/// Returns `Err` when no Zone is registered at `(surface,
+/// macro_zone)`, when `(q, r)` is out of range, or when the zone
+/// slot is empty (`def_id == 0`).
+///
+/// `owner_id_filter` — see [`inspect_hex`]. `Some(player_id)` on
+/// `PLAYER_DIMENSION_LAYER`, `None` elsewhere. The created card's
+/// `owner_id` comes from the resolved Zone's `owner_id`, so on
+/// surface 62 the promoted tile-card lands with `owner_id =
+/// player_id` (the player owns it), matching the dim's
+/// discriminator.
+pub fn find_or_create_tile_card(
+    ctx: &ReducerContext,
+    surface: u8,
+    macro_zone: u32,
+    owner_id_filter: Option<u32>,
+    q: u8,
+    r: u8,
+    time_ms: u64,
+) -> Result<Card, String> {
+    let zone = resolve_zone(ctx, surface, macro_zone, owner_id_filter).ok_or_else(|| {
+        format!(
+            "find_or_create_tile_card: no zone at (surface={surface}, macro_zone={macro_zone}, owner={owner_id_filter:?})"
+        )
+    })?;
+    let tile_card_type = unpack_zone_definition(zone.packed_definition);
+
+    let occupancy = inspect_hex(ctx, surface, macro_zone, owner_id_filter, q, r, tile_card_type, time_ms);
+    if let Some(existing) = occupancy.tile_card {
+        return Ok(existing);
+    }
+
+    // No existing tile-card — read the zone slot and create one.
+    // `zone.tile_at` is (row, col): r is row, q is col.
+    let (tile_def_id, stock0, stock1) = zone.tile_at(r, q).ok_or_else(|| {
+        format!("find_or_create_tile_card: hex (q={q}, r={r}) out of range")
+    })?;
+    if tile_def_id == 0 {
+        return Err(format!(
+            "find_or_create_tile_card: zone slot at (q={q}, r={r}) is empty (def_id=0)"
+        ));
+    }
+    let packed_def = pack_definition(tile_card_type, tile_def_id);
+
+    let card_id = next_card_id(ctx);
+    let (micro_zone_byte, micro_location) = match occupancy.rect_root.as_ref() {
+        Some(rect) => (
+            // Single child in the rect's slot.0 branch — position 1.
+            pack_stack_micro_zone(1, STACK_DIR_HEX, StackedState::OnRoot),
+            rect.card_id,
+        ),
+        None => (pack_micro_zone(q, r, StackedState::Free), 0),
+    };
+
+    // Seed flags_bk with stock from the zone slot. Demotion folds
+    // these back into the zone tile slot; downstream mutations go
+    // through `set_tile_stock`.
+    let initial_flags_bk = {
+        let mut bk = 0u32;
+        bk = write_tile_stock(bk, 0, stock0);
+        bk = write_tile_stock(bk, 1, stock1);
+        bk
+    };
+
+    Ok(create_at(
+        ctx,
+        card_id,
+        time_ms,
+        surface,
+        macro_zone,
+        micro_zone_byte,
+        micro_location,
+        zone.owner_id,
+        packed_def,
+        0,
+        initial_flags_bk,
+    ))
+}
+
+// ---- tile-card stock accessors ---------------------------------------
+//
+// Stock values for promoted tile-cards live in two u2 fields in
+// `flags_bk` (`tile_stock_0`, `tile_stock_1` — see
+// `content/cards/flags.json`). Meaningless on non-tile cards. Stock
+// writes are absolute (not delta) — no `propagate_*_forward` helper;
+// the existing `prior_at` semantics give downstream readers the
+// correct value at any time. See `docs/TILE_AS_CARD.md`.
+
+/// Read `tile_stock_<slot>` (0 or 1) from a `flags_bk` u32. Returns
+/// 0..=3 for in-range `slot`; returns 0 for any other `slot` (the
+/// caller violated the 0..=1 contract — treated as "no stock").
+pub fn tile_stock(flags_bk: u32, slot: usize) -> u8 {
+    let b = bk_flags();
+    let (mask, shift) = match slot {
+        0 => (b.tile_stock_0_mask, b.tile_stock_0_shift),
+        1 => (b.tile_stock_1_mask, b.tile_stock_1_shift),
+        _ => return 0,
+    };
+    ((flags_bk & mask) >> shift) as u8
+}
+
+/// Pure-transform writer for `tile_stock_<slot>`. Replaces the slot's
+/// bits in `flags_bk` with `value` (clamped to the field's u2 width).
+/// Internal — exposed publicly only via [`set_tile_stock`] which
+/// pairs the write with `update_with_at` discipline.
+fn write_tile_stock(flags_bk: u32, slot: usize, value: u8) -> u32 {
+    let b = bk_flags();
+    let (mask, shift, max) = match slot {
+        0 => (
+            b.tile_stock_0_mask,
+            b.tile_stock_0_shift,
+            b.tile_stock_0_max,
+        ),
+        1 => (
+            b.tile_stock_1_mask,
+            b.tile_stock_1_shift,
+            b.tile_stock_1_max,
+        ),
+        _ => return flags_bk,
+    };
+    (flags_bk & !mask) | (((value as u32) & max) << shift)
+}
+
+/// Set `tile_stock_<slot>` on a tile-card at `time_ms`. Wraps
+/// [`write_tile_stock`] in `update_with_at` so the write inherits
+/// `write_at`'s prior-row read + dirty/preserve diff discipline.
+pub fn set_tile_stock(
+    ctx: &ReducerContext,
+    card_id: u32,
+    time_ms: u64,
+    slot: usize,
+    value: u8,
+) -> Option<Card> {
+    update_with_at(ctx, card_id, time_ms, |c| {
+        c.flags_bk = write_tile_stock(c.flags_bk, slot, value);
+    })
+}
+
+// ---- card-priority tile views ----------------------------------------
+//
+// The unified tile read API: every place that previously called
+// `zone.tile_at(...)` / `zone.tile_def_id_at(...)` should route
+// through these helpers so a promoted tile-card's data wins over the
+// underlying zone slot. Cards' `packed_definition` carries
+// `(card_type | def_id)` so a tile-card with a mutated def
+// (Phase 4+) surfaces here without callers having to know about
+// promotion.
+//
+// **Owner discrimination.** Every read takes `owner_id_filter:
+// Option<u32>`. Pass `Some(player_id)` on `PLAYER_DIMENSION_LAYER`
+// (where the same `(surface, macro_zone)` is shared across players)
+// so the read resolves to the right player's Zone and only iterates
+// that player's cards. Pass `None` on every other surface — there's
+// one container per `(surface, macro_zone)` and the filter would
+// incorrectly reject world cards (whose `owner_id` varies by
+// owning chain, not by the Zone's `owner_id`).
+//
+// **Stock caveat.** Tile-cards don't carry stock until the Phase 4
+// write-reroute lands. Until then `tile_full_view` returns stock
+// from the Zone slot even when a tile-card is present. Callers that
+// need post-Phase-4-correct stock should keep reading through these
+// helpers — the stock source flips silently when Phase 4 lands.
+
+/// Resolve the Zone at `(surface, macro_zone)`, applying owner
+/// discrimination when `owner_id_filter == Some(_)`. Shared internal
+/// helper for the tile-read entry points so they all dispatch the
+/// `latest_for` vs `latest_for_owner` choice the same way.
+fn resolve_zone(
+    ctx: &ReducerContext,
+    surface: u8,
+    macro_zone: u32,
+    owner_id_filter: Option<u32>,
+) -> Option<crate::zones::Zone> {
+    match owner_id_filter {
+        Some(o) => crate::zones::latest_for_owner(ctx, surface, macro_zone, o),
+        None => crate::zones::latest_for(ctx, surface, macro_zone),
+    }
+}
+
+/// Card-priority view of the tile def at `(surface, macro_zone, q,
+/// r)`. Returns the promoted tile-card's def_id when one exists,
+/// else the Zone slot's def_id. Returns `None` when no Zone is
+/// registered or `(q, r)` is out of range.
+///
+/// `owner_id_filter` — see module-level comment above.
+pub fn tile_def_id_view(
+    ctx: &ReducerContext,
+    surface: u8,
+    macro_zone: u32,
+    owner_id_filter: Option<u32>,
+    q: u8,
+    r: u8,
+    time_ms: u64,
+) -> Option<u16> {
+    let zone = resolve_zone(ctx, surface, macro_zone, owner_id_filter)?;
+    let tile_card_type = unpack_zone_definition(zone.packed_definition);
+    if let Some(tile) =
+        find_tile_card_at(ctx, surface, macro_zone, owner_id_filter, q, r, tile_card_type, time_ms)
+    {
+        let (_, def_id) = unpack_definition(tile.packed_definition);
+        return Some(def_id);
+    }
+    zone.tile_def_id_at(r, q)
+}
+
+/// Card-priority view of `(packed_def, stock0, stock1)` at
+/// `(surface, macro_zone, q, r)`. `packed_def` comes from the
+/// promoted tile-card when present (so card-side def mutations
+/// surface), else from the Zone slot (constructed via
+/// `pack_definition(zone_card_type, zone_def_id)`).
+///
+/// Returns `None` when no Zone is registered, `(q, r)` is out of
+/// range, OR when there's no tile-card and the Zone slot is empty
+/// (`def_id == 0`).
+///
+/// `owner_id_filter` — see module-level comment above.
+pub fn tile_full_view(
+    ctx: &ReducerContext,
+    surface: u8,
+    macro_zone: u32,
+    owner_id_filter: Option<u32>,
+    q: u8,
+    r: u8,
+    time_ms: u64,
+) -> Option<(u16, u8, u8)> {
+    let zone = resolve_zone(ctx, surface, macro_zone, owner_id_filter)?;
+    let tile_card_type = unpack_zone_definition(zone.packed_definition);
+
+    if let Some(tile) =
+        find_tile_card_at(ctx, surface, macro_zone, owner_id_filter, q, r, tile_card_type, time_ms)
+    {
+        // Card-resident def AND stock win — Phase 4's per-card stock
+        // storage in `flags_bk.tile_stock_{0,1}` is canonical for
+        // promoted tile-cards. Demotion folds these back into the
+        // zone slot.
+        let stock0 = tile_stock(tile.flags_bk, 0);
+        let stock1 = tile_stock(tile.flags_bk, 1);
+        return Some((tile.packed_definition, stock0, stock1));
+    }
+
+    let (zone_def_id, stock0, stock1) = zone.tile_at(r, q)?;
+    if zone_def_id == 0 {
+        return None;
+    }
+    Some((pack_definition(tile_card_type, zone_def_id), stock0, stock1))
 }
 
 // ---- single-field setters ---------------------------------------------
@@ -883,7 +1589,7 @@ pub fn owning_player(ctx: &ReducerContext, card_id: u32) -> Option<u32> {
     let mut cur = card_id;
     for _ in 0..OWNER_WALK_DEPTH_CAP {
         let row = latest(ctx, cur)?;
-        if row.flags & FLAG_OWNED_BY_PLAYER != 0 {
+        if row.flags_state & state_flags().is_owned_by_player != 0 {
             return Some(row.owner_id);
         }
         if row.owner_id == 0 {
@@ -909,7 +1615,7 @@ pub fn owning_soul_at(
     let mut cur = card_id;
     for _ in 0..OWNER_WALK_DEPTH_CAP {
         let row = prior_at(ctx, cur, time_ms)?;
-        if row.flags & FLAG_OWNED_BY_PLAYER != 0 {
+        if row.flags_state & state_flags().is_owned_by_player != 0 {
             return Some(cur);
         }
         if row.owner_id == 0 {
@@ -936,7 +1642,7 @@ pub fn owning_soul(ctx: &ReducerContext, card_id: u32) -> Option<u32> {
     let mut cur = card_id;
     for _ in 0..OWNER_WALK_DEPTH_CAP {
         let row = latest(ctx, cur)?;
-        if row.flags & FLAG_OWNED_BY_PLAYER != 0 {
+        if row.flags_state & state_flags().is_owned_by_player != 0 {
             return Some(cur);
         }
         if row.owner_id == 0 {
@@ -964,7 +1670,7 @@ pub fn inventory_container_for(ctx: &ReducerContext, card_id: u32) -> u32 {
     let Some(row) = latest(ctx, card_id) else {
         return 0;
     };
-    if row.flags & FLAG_OWNED_BY_PLAYER != 0 {
+    if row.flags_state & state_flags().is_owned_by_player != 0 {
         card_id
     } else {
         row.owner_id
@@ -984,7 +1690,7 @@ pub fn inventory_container_for_at(
     let Some(row) = prior_at(ctx, card_id, time_ms) else {
         return 0;
     };
-    if row.flags & FLAG_OWNED_BY_PLAYER != 0 {
+    if row.flags_state & state_flags().is_owned_by_player != 0 {
         card_id
     } else {
         row.owner_id
@@ -1018,7 +1724,7 @@ pub fn would_cycle(ctx: &ReducerContext, card_id: u32, new_owner_card_id: u32) -
         let Some(row) = latest(ctx, cur) else {
             return false;
         };
-        if row.flags & FLAG_OWNED_BY_PLAYER != 0 {
+        if row.flags_state & state_flags().is_owned_by_player != 0 {
             return false;
         }
         if row.owner_id == 0 {
@@ -1040,6 +1746,6 @@ pub fn set_packed_definition(
     update_with(ctx, card_id, |c| c.packed_definition = packed_definition)
 }
 
-pub fn set_flags(ctx: &ReducerContext, card_id: u32, flags: u32) -> Option<Card> {
-    update_with(ctx, card_id, |c| c.flags = flags)
+pub fn set_flags_state(ctx: &ReducerContext, card_id: u32, flags_state: u32) -> Option<Card> {
+    update_with(ctx, card_id, |c| c.flags_state = flags_state)
 }

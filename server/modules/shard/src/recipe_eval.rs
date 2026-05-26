@@ -21,11 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use spacetimedb::ReducerContext;
 
 use crate::cards::{self, cards as _cards_table, Card};
+use crate::flags::state_flags;
 use crate::packed::{micro_zone_direction, unpack_micro_zone, StackedState};
-
-// `cards/flags.json` bit positions used by the stack walker.
-const FLAG_DEAD: u32 = 1 << 7;
-const FLAG_SLOT_HOLD: u32 = 1 << 5;
 
 /// Max depth of the soul-stack walk. Bounds pathological chains and
 /// keeps traversal O(1) in chain length under normal gameplay. The
@@ -70,7 +67,9 @@ pub fn soul_stack(
         let Some(latest) = cards::latest(ctx, row.card_id) else {
             continue;
         };
-        if latest.flags & (FLAG_DEAD | FLAG_SLOT_HOLD) != 0 {
+        if latest.flags_state & state_flags().dead != 0
+            || cards::slot_hold_count(latest.flags_bk) > 0
+        {
             continue;
         }
         let (_, _, state) = unpack_micro_zone(latest.micro_zone);

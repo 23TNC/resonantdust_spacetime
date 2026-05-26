@@ -37,15 +37,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use resonantdust_content::blueprint_core::{find_blueprint_any_scope, BlueprintScope};
 use resonantdust_content::definition_core::{
     aspect_id as core_aspect_id, decode_definition, find_packed_by_key, is_aspect_descendant,
 };
 use resonantdust_content::recipe_core::{Recipe, Seg, Stmt};
 use resonantdust_content::recipe_statement::{parse_statement, Segment, StatementValue};
-use spacetimedb::ReducerContext;
+use spacetimedb::{ReducerContext, Table};
 
 use crate::cards;
+use crate::flags::state_flags;
 use crate::packed::INVENTORY_LAYER;
+use crate::players::player_profiles as _player_profiles_table;
+use crate::souls::soul_privates as _soul_privates_table;
 use crate::zones;
 
 /// Address of a synthetic hex — a tile-as-hex resolved from Zone tile
@@ -63,16 +67,12 @@ pub const PROGRESS_STYLE_NONE: u32 = 0;
 pub const PROGRESS_STYLE_LTR: u32 = 1;
 pub const PROGRESS_STYLE_RTL: u32 = 2;
 
-// Flag bits we manipulate on completion-time writes.
-const FLAG_SLOT_HOLD: u32 = 1 << 5;
-const FLAG_DEAD: u32 = 1 << 7;
-const FLAG_FORCE_POSITION: u32 = 1 << 11;
-const HOLD_RELEASE_MASK: u32 = FLAG_SLOT_HOLD | FLAG_FORCE_POSITION;
-
-/// `progress_style` field — 3 bits at positions 8..=10 of
-/// `cards.flags`. Source of truth: `content/cards/flags.json`.
-const PROGRESS_STYLE_SHIFT: u32 = 8;
-const PROGRESS_STYLE_MASK: u32 = 0b111 << PROGRESS_STYLE_SHIFT;
+// Flag bit positions live in `content/cards/flags.json` and are
+// surfaced through the `state_flags()` cache. The `commit` release
+// pass clears `pos_need` / `pos_want` (the placement-assertion
+// bits set at propose-time) and the `progress_style` field, using
+// the masks the `state_flags()` cache exposes (single-bit masks
+// for the assertion bits, shift+mask for the progress field).
 
 const VAR_SLOT_COUNT: usize = 8;
 
@@ -114,6 +114,45 @@ enum Effect {
         op: StockOp,
         delta: u8,
     },
+    /// Set a blueprint's discovery bit on either `SoulPrivate.blueprints_0`
+    /// or `PlayerProfile.blueprints_0`, picked by the blueprint catalog
+    /// entry's `scope`. Target card is whatever the recipe path
+    /// resolved to before the `.blueprint.unlock` suffix; for soul-
+    /// scope it must be a soul card itself, for player-scope the
+    /// commit walks `card.owner_id` to the owning player. Idempotent —
+    /// re-firing the recipe doesn't reject when the bit's already
+    /// set, so authors can use unlock as a "first-time gate" without
+    /// blocking later runs.
+    UnlockBlueprint {
+        blueprint_key: String,
+        target_card_id: u32,
+    },
+    /// Re-pack a player's `flags.faction` bits. Produced by the
+    /// `<owner-chain>.aspect.faction.set: <int>` recipe verb after
+    /// the chain resolves to a `player_id`. The value has been
+    /// validated to fit in the 2-bit slot (0..=3) at queue time.
+    SetPlayerFaction {
+        player_id: u32,
+        faction: u8,
+    },
+    /// Create a new card as a state-3 `StackedState::Deferred` row
+    /// anchored to `host_card_id`. Client resolves at mirror time
+    /// via `CardManager.appendAtChainLeaf` (walk host's chain,
+    /// leaf-append, fall through cascade on rejection). Emitted by
+    /// `stack.N.create: <key>` recipe outputs where the intended
+    /// position depends on chain state at write-time and a captured
+    /// position would go stale between propose and commit.
+    ///
+    /// `host_card_id` resolves at the commit-time path walk; the
+    /// follower row inherits the host's then-current `(surface,
+    /// macro_zone)`. The fallback `(q, r)` baked into `micro_zone`
+    /// reads from the host's current `micro_zone` too, giving the
+    /// client cascade a sensible loose-on-tile fallback if the host
+    /// is gone by mirror time.
+    CreateDeferred {
+        def_key: String,
+        host_card_id: u32,
+    },
 }
 
 /// Stock-modify arithmetic. `Sub` and `Add` saturate at the u2
@@ -137,23 +176,120 @@ impl TapeWalker {
     }
 }
 
-/// Walk `recipe.output` and emit completion-time card writes.
-///
-/// Computes `completion_ms = start_ms + walker.duration * 1000` from
-/// the tape's `sys.duration.set` writes. All effects are emitted
-/// future-stamped at that time so the rows become visible to
-/// subscribers exactly when the action completes.
-pub fn apply(
+/// Per-card hold kinds the recipe will claim at propose-time.
+/// Computed once in [`plan`] from `(recipe, bindings, root)` and
+/// shared by `apply_locks` (acquire path) and [`commit`] (release
+/// path). Computing in one place keeps the two passes aligned —
+/// without it, a release that doesn't precisely mirror its
+/// acquire decrements someone else's refcount.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct HoldKinds {
+    /// Card gets `FLAG_SLOT_HOLD` set at apply_locks and cleared
+    /// via `HOLD_RELEASE_MASK` at commit. Sourced from any iterator
+    /// with `it.slot_hold == true` or `recipe.root_slot_hold` (when
+    /// root anchors).
+    pub slot_hold: bool,
+    /// Card gets `acquire_position_hold` at apply_locks and
+    /// `release_position_hold` at commit. Sourced from any iterator
+    /// with `it.position_hold == true` or `recipe.root_position_hold`.
+    pub position_hold: bool,
+    /// Card gets `acquire_slot_share` at apply_locks and
+    /// `release_slot_share` at commit. Sourced from any iterator
+    /// with `it.slot_hold == false` (borrow / share) or
+    /// `!recipe.root_slot_hold` (when root anchors).
+    pub slot_share: bool,
+}
+
+/// Pre-computed output of a recipe's tape walk. Produced once by
+/// [`plan`] at propose time so the caller can read the action's
+/// `duration_ms` (needed by the `pending_actions` registry to stamp
+/// `completion_ms`) without running the walk twice, and so the
+/// `holds` map is shared between `apply_locks` and [`commit`].
+pub struct ActionPlan {
+    styles: BTreeMap<u32, u8>,
+    duration: u32,
+    pending: Vec<Effect>,
+    holds: BTreeMap<u32, HoldKinds>,
+}
+
+impl ActionPlan {
+    /// Milliseconds from `start_ms` to `completion_ms` — i.e.
+    /// `walker.duration * 1000`. Used by the `pending_actions`
+    /// registry to compute the stale-row reaping cutoff.
+    pub fn duration_ms(&self) -> u64 {
+        (self.duration as u64) * 1000
+    }
+
+    /// Per-card hold kinds the recipe will claim. Read by
+    /// `apply_locks` (acquire) and `commit` (release).
+    pub fn holds(&self) -> &BTreeMap<u32, HoldKinds> {
+        &self.holds
+    }
+}
+
+/// Build the (card_id → HoldKinds) map for a `(recipe, bindings, root)`
+/// triple. Encodes the same rules `apply_locks` used to do inline:
+/// root's anchor tokens unioned with promotion paths (root appearing
+/// in an iterator's bindings inherits that iter's tokens), and each
+/// iterator's bindings get the iter's slot_hold/share + position_hold
+/// flavors. Multiple paths to the same card union via field-OR.
+fn compute_holds(
+    recipe: &Recipe,
+    bindings: &[Vec<u32>],
+    root: u32,
+) -> BTreeMap<u32, HoldKinds> {
+    let mut holds: BTreeMap<u32, HoldKinds> = BTreeMap::new();
+
+    // Root anchor (independent of iterator promotion).
+    if recipe.anchors.root && root != 0 {
+        let entry = holds.entry(root).or_default();
+        if recipe.root_slot_hold {
+            entry.slot_hold = true;
+        } else {
+            entry.slot_share = true;
+        }
+        if recipe.root_position_hold {
+            entry.position_hold = true;
+        }
+    }
+
+    // Iterator bindings + root-promotion union.
+    for (i, it) in recipe.iterators.iter().enumerate() {
+        let row = match bindings.get(i) {
+            Some(r) => r,
+            None => continue,
+        };
+        for &card_id in row {
+            if card_id == 0 {
+                continue;
+            }
+            let entry = holds.entry(card_id).or_default();
+            if it.slot_hold {
+                entry.slot_hold = true;
+            } else {
+                entry.slot_share = true;
+            }
+            if it.position_hold {
+                entry.position_hold = true;
+            }
+        }
+    }
+
+    holds
+}
+
+/// Walk `recipe.output` into an [`ActionPlan`] without emitting any
+/// effects. The walk does DB reads (resolving card_ids, tile defs,
+/// etc.) but no writes; the resulting plan can be inspected by
+/// `actions.rs` before locks are applied and then handed to [`commit`]
+/// to materialize the future-stamped completion rows.
+pub fn plan(
     ctx: &ReducerContext,
     recipe: &Recipe,
     bindings: &[Vec<u32>],
     root: u32,
-    synthetic_hex: Option<HexLocation>,
-    start_ms: u64,
-    caller_player_id: u32,
-) -> Result<(), String> {
-    let _ = caller_player_id;
-
+    synthetic_hex: Option<&HexLocation>,
+) -> Result<ActionPlan, String> {
     let mut walker = TapeWalker::new();
     for (i, stmt) in recipe.output.iter().enumerate() {
         execute_stmt(
@@ -163,16 +299,39 @@ pub fn apply(
             stmt,
             bindings,
             root,
-            synthetic_hex.as_ref(),
+            synthetic_hex,
         )
         .map_err(|e| format!("output[{i}]: {e}"))?;
     }
+    let holds = compute_holds(recipe, bindings, root);
+    Ok(ActionPlan {
+        styles: walker.styles,
+        duration: walker.duration,
+        pending: walker.pending,
+        holds,
+    })
+}
 
-    let completion_ms = start_ms + (walker.duration as u64) * 1000;
+/// Emit the completion-time card writes captured in a previously-built
+/// [`ActionPlan`]. Stamps everything at `start_ms + plan.duration *
+/// 1000` so the rows become visible to subscribers exactly when the
+/// action completes.
+pub fn commit(
+    ctx: &ReducerContext,
+    plan: ActionPlan,
+    bindings: &[Vec<u32>],
+    root: u32,
+    start_ms: u64,
+    caller_player_id: u32,
+    dedup_key: u64,
+) -> Result<(), String> {
+    let _ = caller_player_id;
+
+    let completion_ms = start_ms + (plan.duration as u64) * 1000;
 
     // Emit effects at completion_ms.
     let mut consumed: BTreeSet<u32> = BTreeSet::new();
-    for effect in &walker.pending {
+    for effect in &plan.pending {
         match effect {
             Effect::Destroy { card_id } => {
                 consumed.insert(*card_id);
@@ -199,7 +358,8 @@ pub fn apply(
                     /* micro_location */ 0,
                     *owner_id,
                     packed_def,
-                    /* flags          */ 0,
+                    /* flags_state    */ 0,
+                    /* flags_bk       */ 0,
                 );
             }
             Effect::ModifyTileStock {
@@ -210,30 +370,154 @@ pub fn apply(
                 op,
                 delta,
             } => {
-                zones::update_with_at(ctx, *zone_id, completion_ms, |z| {
-                    let current = z.tile_stock_at(*row, *col, *slot).unwrap_or(0);
-                    let next = match op {
-                        StockOp::Sub => current.saturating_sub(*delta),
-                        StockOp::Add => current.saturating_add(*delta).min(0b11),
-                        StockOp::Set => (*delta).min(0b11),
+                // Tile-as-card routing: resolve `zone_id` to its
+                // `(surface, macro_zone)`, promote (or find) the
+                // tile-card at `(col, row)`, then mutate the card's
+                // `flags_bk.tile_stock_{slot}`. Demotion folds the
+                // value back into the zone slot. See
+                // `docs/TILE_AS_CARD.md`.
+                let zone = zones::latest(ctx, *zone_id).ok_or_else(|| {
+                    format!(
+                        "ModifyTileStock: zone {} not found at completion time",
+                        zone_id
+                    )
+                })?;
+                // Owner filter only matters on `PLAYER_DIMENSION_LAYER`
+                // where multiple Zones share `(surface, macro_zone)`.
+                // The completing action's HexLocation is already
+                // owner-resolved (it was bound at propose time via
+                // `derive_synthetic_hex` with the caller's owner
+                // filter), and `zone.owner_id` carries the
+                // discriminator forward — pass it through so the
+                // tile-card lookup lands on the same player's row.
+                let owner_filter = if zone.surface == crate::packed::PLAYER_DIMENSION_LAYER {
+                    Some(zone.owner_id)
+                } else {
+                    None
+                };
+                let tile_card = cards::find_or_create_tile_card(
+                    ctx,
+                    zone.surface,
+                    zone.macro_zone,
+                    owner_filter,
+                    *col,
+                    *row,
+                    completion_ms,
+                )
+                .map_err(|e| format!("ModifyTileStock: promote tile: {e}"))?;
+                let current = cards::tile_stock(tile_card.flags_bk, *slot);
+                let next = match op {
+                    StockOp::Sub => current.saturating_sub(*delta),
+                    StockOp::Add => current.saturating_add(*delta).min(0b11),
+                    StockOp::Set => (*delta).min(0b11),
+                };
+                cards::set_tile_stock(ctx, tile_card.card_id, completion_ms, *slot, next);
+            }
+            Effect::UnlockBlueprint {
+                blueprint_key,
+                target_card_id,
+            } => {
+                apply_unlock_blueprint(ctx, blueprint_key, *target_card_id)?;
+            }
+            Effect::SetPlayerFaction { player_id, faction } => {
+                crate::players::set_faction(ctx, *player_id, completion_ms, *faction)
+                    .map_err(|e| format!("SetPlayerFaction: {e}"))?;
+            }
+            Effect::CreateDeferred {
+                def_key,
+                host_card_id,
+            } => {
+                // Read host's current row to derive the deferred
+                // follower's `(surface, macro_zone)` and fallback
+                // `(q, r)`. The follower row needs to land at the
+                // host's same `(surface, macro_zone)` so it joins
+                // the host's subscription set; the cascade in
+                // `cards::write_at` keeps it in sync if the host
+                // later moves. The fallback `(q, r)` reads from the
+                // host's `micro_zone` (legacy q/r bits) so the
+                // client cascade has a sensible loose-on-tile
+                // landing if the host is gone by mirror time.
+                //
+                // If the host has been destroyed between queue and
+                // commit, fall back to placing the new card loose
+                // at (0, 0) on the world surface — better than
+                // dropping the create silently. This matches the
+                // "host-gone at write-time" branch the user flagged.
+                let packed_def = find_packed_by_key(def_key)
+                    .map_err(|e| format!("create_deferred: find_packed_by_key({def_key:?}): {e}"))?
+                    .ok_or_else(|| {
+                        format!("create_deferred: def {def_key:?} not registered in cards/id.json")
+                    })?;
+                let new_id = cards::next_card_id(ctx);
+                let host = cards::latest(ctx, *host_card_id);
+                let (surface, macro_zone, micro_zone, micro_location, owner_id) =
+                    if let Some(h) = host {
+                        let (q, r, _) = crate::packed::unpack_micro_zone(h.micro_zone);
+                        let deferred_micro_zone = crate::packed::pack_micro_zone(
+                            q,
+                            r,
+                            crate::packed::StackedState::Deferred,
+                        );
+                        (
+                            h.surface,
+                            h.macro_zone,
+                            deferred_micro_zone,
+                            *host_card_id,
+                            h.owner_id,
+                        )
+                    } else {
+                        // Host gone at commit — degenerate fallback. Land
+                        // loose at world-(0, 0) with no host anchor;
+                        // client cascade will pick up via the fallback
+                        // (q, r) tier on mirror.
+                        (
+                            crate::packed::WORLD_LAYER,
+                            0,
+                            crate::packed::pack_micro_zone(
+                                0,
+                                0,
+                                crate::packed::StackedState::Deferred,
+                            ),
+                            0,
+                            0,
+                        )
                     };
-                    z.assign_tile_stock(*row, *col, *slot, next);
-                });
+                cards::create_at(
+                    ctx,
+                    new_id,
+                    completion_ms,
+                    surface,
+                    macro_zone,
+                    micro_zone,
+                    micro_location,
+                    owner_id,
+                    packed_def,
+                    /* flags_state */ 0,
+                    /* flags_bk    */ 0,
+                );
             }
         }
     }
 
-    // Release locks on every bound card (root + bindings). Consumed
-    // cards (in `destroy` statements) get `FLAG_DEAD` set in the same
-    // write; survivors just shed their `slot_hold` / `force_position`.
-    // `position_hold` is ref-counted — we decrement for every card we
-    // bumped on the propose side.
+    // Release locks per-kind, mirroring exactly what `apply_locks`
+    // acquired via `plan.holds()`. Precise release is required for
+    // the refcounted kinds (`position_hold_count`, `slot_share_count`):
+    // unconditional decrement on a card we didn't acquire would
+    // decrement another concurrent recipe's count and break their
+    // hold mid-flight. `slot_hold` is exclusive — a single bit clear
+    // via `HOLD_RELEASE_MASK` is idempotent on cards we didn't hold,
+    // so the gate against clobbering someone else's is V5's
+    // validate-time rejection (an exclusive claim can't land while
+    // we hold any kind of lock on the card).
     //
-    // `progress_style` is stamped per `walker.styles` — populated by
-    // `<path>.style.set` output statements. Cards not in the map get
-    // `progress_style` cleared so any previously-rendered bar
-    // disappears at completion. The map drives multi-bar recipes
-    // naturally: each style.set'd card carries its own value.
+    // Bound cards that didn't get any hold acquired (e.g. an iterator
+    // with no slot_hold AND no position_hold tokens, which is
+    // currently unreachable but reserved for future prefix tokens)
+    // still need the dead / style / HOLD_RELEASE write — they were
+    // logically participants of the action even if they didn't lock.
+    // We compute that union from root + bindings and walk all of it,
+    // consulting `plan.holds()` only to decide whether to call the
+    // refcount-release helpers.
     let mut all_bound: BTreeSet<u32> = BTreeSet::new();
     if root != 0 {
         all_bound.insert(root);
@@ -246,20 +530,50 @@ pub fn apply(
         }
     }
 
+    let s = state_flags();
     for &card_id in &all_bound {
         let is_consumed = consumed.contains(&card_id);
-        let style = walker.styles.get(&card_id).copied().unwrap_or(0);
-        let style_bits = (style as u32) << PROGRESS_STYLE_SHIFT;
+        let style = plan.styles.get(&card_id).copied().unwrap_or(0);
+        let style_bits = (style as u32) << s.progress_style_shift;
         cards::update_with_at(ctx, card_id, completion_ms, |c| {
             if is_consumed {
-                c.flags |= FLAG_DEAD;
+                c.flags_state |= s.dead;
             }
-            c.flags &= !HOLD_RELEASE_MASK;
-            c.flags &= !PROGRESS_STYLE_MASK;
-            c.flags |= style_bits & PROGRESS_STYLE_MASK;
+            // `pos_need` / `pos_want` are the placement-assertion
+            // bits — set by `propose_action` to tell the client
+            // mirror how to reconcile loaded cards against the new
+            // row, cleared here so they don't persist past the
+            // completion that wrote the position. Pre-rework this
+            // was a single `force_position` bit alongside the
+            // now-gone `slot_hold` bit (`slot_hold` is a refcount in
+            // `flags_bk` now and gets `release_slot_hold`'d below).
+            c.flags_state &= !s.pos_need;
+            c.flags_state &= !s.pos_want;
+            c.flags_state &= !s.progress_style_mask;
+            c.flags_state |= style_bits & s.progress_style_mask;
         });
-        cards::release_position_hold(ctx, card_id, completion_ms);
+        // Release every count we acquired in `apply_locks`. Each
+        // touched card always got `acquire_touch`; per-kind
+        // acquires happened only when the plan's HoldKinds said so.
+        cards::release_touch(ctx, card_id, completion_ms);
+        if let Some(kinds) = plan.holds.get(&card_id) {
+            if kinds.slot_hold {
+                cards::release_slot_hold(ctx, card_id, completion_ms);
+            }
+            if kinds.position_hold {
+                cards::release_position_hold(ctx, card_id, completion_ms);
+            }
+            if kinds.slot_share {
+                cards::release_slot_share(ctx, card_id, completion_ms);
+            }
+        }
     }
+
+    // Release the in-flight registry row. The action's effects are
+    // now persisted (future-stamped at `completion_ms`); the dedup
+    // gate's job is done. A subsequent identical propose will be
+    // allowed once the user re-issues it.
+    crate::pending_actions::release(ctx, dedup_key);
 
     Ok(())
 }
@@ -513,29 +827,80 @@ fn execute_card_op(
             Ok(())
         }
         "create" => {
-            // Path ends in `.inventory` — the destination is the
-            // resolved card's inventory bucket.
-            if path.last().and_then(|s| match s {
-                Seg::Word(w) => Some(w.as_str()),
-                _ => None,
-            }) != Some("inventory")
-            {
-                return Err(format!(
-                    "create: path must end in `.inventory.create`; got {segs:?}"
-                ));
-            }
-            let target_path = &path[..path.len() - 1];
-            let owner_card_id =
-                resolve_card_target(ctx, recipe, target_path, bindings, root)?;
             let def_key = match &stmt.value {
                 Some(StatementValue::Str(s)) => s.clone(),
                 _ => return Err("create: requires a string def_id value".to_string()),
             };
-            walker.pending.push(Effect::Create {
-                def_key,
-                surface: INVENTORY_LAYER,
-                macro_zone: owner_card_id,
-                owner_id: owner_card_id,
+            // Suffix-dispatch on the segments before `.create`:
+            //   - `<host>.inventory.create: <key>` — drop into
+            //     `<host>`'s inventory bucket as Loose.
+            //   - `<host>.stack.<N>.create: <key>` — emit a state-3
+            //     `Deferred` row anchored to `<host>` so the client
+            //     cascade resolves the actual placement at mirror
+            //     time. `N` is recorded for future "N steps up"
+            //     refinement but the cascade currently always
+            //     leaf-appends regardless of N.
+            //   - anything else — parse error.
+            let last = path.last();
+            let penultimate = path.get(path.len().wrapping_sub(2));
+            let is_inventory_suffix =
+                matches!(last, Some(Seg::Word(w)) if w == "inventory");
+            let is_stack_n_suffix = matches!(last, Some(Seg::Index(_)))
+                && matches!(penultimate, Some(Seg::Word(w)) if w == "stack");
+
+            if is_inventory_suffix {
+                let target_path = &path[..path.len() - 1];
+                let owner_card_id =
+                    resolve_card_target(ctx, recipe, target_path, bindings, root)?;
+                walker.pending.push(Effect::Create {
+                    def_key,
+                    surface: INVENTORY_LAYER,
+                    macro_zone: owner_card_id,
+                    owner_id: owner_card_id,
+                });
+                Ok(())
+            } else if is_stack_n_suffix {
+                // `<host>.stack.<N>` — host is `path[..-2]`.
+                let host_path = &path[..path.len() - 2];
+                let host_card_id =
+                    resolve_card_target(ctx, recipe, host_path, bindings, root)?;
+                walker.pending.push(Effect::CreateDeferred {
+                    def_key,
+                    host_card_id,
+                });
+                Ok(())
+            } else {
+                Err(format!(
+                    "create: path must end in `.inventory.create` or `.stack.<N>.create`; got {segs:?}"
+                ))
+            }
+        }
+        "unlock" => {
+            // Shape: `<path>.blueprint.unlock: <blueprint_key>`.
+            // Path before `.unlock` must end in `.blueprint`; the
+            // target card resolves from everything before that.
+            // Scope (Soul / Player) comes from the blueprint catalog
+            // entry — authors don't spell it out. See
+            // docs/recipe-grammar notes on the unlock op.
+            if path.last().and_then(|s| match s {
+                Seg::Word(w) => Some(w.as_str()),
+                _ => None,
+            }) != Some("blueprint")
+            {
+                return Err(format!(
+                    "unlock: path must end in `.blueprint.unlock`; got {segs:?}"
+                ));
+            }
+            let target_path = &path[..path.len() - 1];
+            let target_card_id =
+                resolve_card_target(ctx, recipe, target_path, bindings, root)?;
+            let blueprint_key = match &stmt.value {
+                Some(StatementValue::Str(s)) => s.clone(),
+                _ => return Err("unlock: requires a string blueprint key value".to_string()),
+            };
+            walker.pending.push(Effect::UnlockBlueprint {
+                blueprint_key,
+                target_card_id,
             });
             Ok(())
         }
@@ -553,6 +918,37 @@ fn execute_card_op(
             let target_id = resolve_card_target(ctx, recipe, target_path, bindings, root)?;
             let style = style_from_value(&stmt.value)?;
             walker.styles.insert(target_id, style);
+            Ok(())
+        }
+        "set" if is_aspect_faction_path(path) => {
+            // `<owner-chain>.aspect.faction.set: <int>` — re-pack the
+            // player's faction bits in `Player.flags`. The owner chain
+            // must terminate at a player_id (typically `<soul>.owner`
+            // or `<player-owned-card>.owner`). Value is the 2-bit
+            // faction slot 0..=3 — recipe authors should use the
+            // `Faction*` aliases declared in `recipes/aliases.json`
+            // (`FactionChorus` = 1, etc.) for readability.
+            let target_path = &path[..path.len() - 2];
+            let player_id =
+                resolve_player_target(ctx, recipe, target_path, bindings, root)?;
+            let n = match &stmt.value {
+                Some(StatementValue::Int(n)) => *n,
+                _ => {
+                    return Err(
+                        "aspect.faction.set: requires an integer value 0..=3 (use the Faction* aliases in recipes/aliases.json)"
+                            .to_string(),
+                    )
+                }
+            };
+            if !(0..=3).contains(&n) {
+                return Err(format!(
+                    "aspect.faction.set: value {n} out of range 0..=3"
+                ));
+            }
+            walker.pending.push(Effect::SetPlayerFaction {
+                player_id,
+                faction: n as u8,
+            });
             Ok(())
         }
         "sub" | "add" | "set" => {
@@ -643,6 +1039,95 @@ fn execute_card_op(
         }
         other => Err(format!("card op: unsupported op {other:?}")),
     }
+}
+
+/// Commit handler for `Effect::UnlockBlueprint`. Looks up the
+/// blueprint catalog entry by key, sets the matching bit in
+/// `SoulPrivate.blueprints_0` (Soul scope) or `PlayerProfile.
+/// blueprints_0` (Player scope), and tolerates an already-set bit
+/// as a no-op so authors can use unlock as a "first-time gate"
+/// without blocking recipe rematches.
+///
+/// Bucket / id-range invariant: only ids 1..=64 fit in
+/// `blueprints_0`. When the catalog grows past 64 a new
+/// `blueprints_1` column needs to land on both `SoulPrivate` and
+/// `PlayerProfile`; this helper rejects out-of-range ids loudly
+/// until that column exists so the failure mode is "can't
+/// express in storage" rather than "silently dropped."
+fn apply_unlock_blueprint(
+    ctx: &ReducerContext,
+    blueprint_key: &str,
+    target_card_id: u32,
+) -> Result<(), String> {
+    let bp = find_blueprint_any_scope(blueprint_key)
+        .map_err(|e| format!("unlock: catalog lookup: {e}"))?
+        .ok_or_else(|| {
+            format!("unlock: blueprint {blueprint_key:?} not registered in any scope")
+        })?;
+    if bp.id == 0 || bp.id > 64 {
+        return Err(format!(
+            "unlock: blueprint id {} (key={blueprint_key:?}) outside the \
+             blueprints_0 bucket (1..=64); add a `blueprints_1` column on \
+             {} before authoring this unlock",
+            bp.id,
+            match bp.scope {
+                BlueprintScope::Soul => "SoulPrivate",
+                BlueprintScope::Player => "PlayerProfile",
+            },
+        ));
+    }
+    let bit = 1u64 << (bp.id - 1);
+    match bp.scope {
+        BlueprintScope::Soul => {
+            // Target must be a soul card — `SoulPrivate` is keyed by
+            // `soul.card_id`.
+            let Some(mut row) =
+                ctx.db.soul_privates().card_id().find(target_card_id)
+            else {
+                return Err(format!(
+                    "unlock: no SoulPrivate row for target card {target_card_id} \
+                     (key={blueprint_key:?}, scope=Soul)"
+                ));
+            };
+            if row.blueprints_0 & bit != 0 {
+                return Ok(()); // already discovered — idempotent
+            }
+            row.blueprints_0 |= bit;
+            ctx.db.soul_privates().card_id().delete(target_card_id);
+            ctx.db.soul_privates().insert(row);
+        }
+        BlueprintScope::Player => {
+            // Target is typically a soul (via `slot.X.Y.owner`); walk
+            // one step through the card's `owner_id` to find the
+            // player_id. A player isn't a Card row, so we don't keep
+            // walking — we just need the id to look up
+            // `PlayerProfile`.
+            let card = cards::latest(ctx, target_card_id)
+                .ok_or_else(|| format!("unlock: target card {target_card_id} not found"))?;
+            if card.owner_id == 0 {
+                return Err(format!(
+                    "unlock: target card {target_card_id} has no owner; can't resolve \
+                     player_id for player-scope unlock (key={blueprint_key:?})"
+                ));
+            }
+            let player_id = card.owner_id;
+            let Some(mut row) =
+                ctx.db.player_profiles().player_id().find(player_id)
+            else {
+                return Err(format!(
+                    "unlock: no PlayerProfile row for player {player_id} \
+                     (key={blueprint_key:?}, scope=Player)"
+                ));
+            };
+            if row.blueprints_0 & bit != 0 {
+                return Ok(()); // already discovered — idempotent
+            }
+            row.blueprints_0 |= bit;
+            ctx.db.player_profiles().player_id().delete(player_id);
+            ctx.db.player_profiles().insert(row);
+        }
+    }
+    Ok(())
 }
 
 /// Confirm the target path resolves to the synthetic tile
@@ -773,6 +1258,50 @@ fn resolve_card_target(
         return Err("resolve: terminal card_id is 0".to_string());
     }
     Ok(card_id)
+}
+
+/// Path-shape test for the `<…>.aspect.faction.set` verb. True when
+/// the last two segments are exactly `aspect` then `faction` words.
+/// Used to discriminate the player-faction write from the
+/// general-purpose stock-modify `set` arm.
+fn is_aspect_faction_path(path: &[Seg]) -> bool {
+    if path.len() < 2 {
+        return false;
+    }
+    matches!(&path[path.len() - 2], Seg::Word(w) if w == "aspect")
+        && matches!(&path[path.len() - 1], Seg::Word(w) if w == "faction")
+}
+
+/// Walk the recipe-DSL path the same way [`resolve_card_target`]
+/// does, then assert the terminal id resolves to a `Player` row
+/// rather than a `Card` row. Used by the faction-set executor —
+/// `<owner-chain>.aspect.faction.set` only makes sense when the
+/// chain terminates at a player.
+///
+/// In practice the chain is `<some-card>.owner`, where `<some-card>`
+/// is a soul (or another player-owned card carrying
+/// `FLAG_OWNED_BY_PLAYER`) and `.owner` reads the row's
+/// `owner_id`, which is the player_id under the post-flag-20
+/// card-owner model. `resolve_card_target` returns the integer
+/// verbatim — we just probe `players()` to confirm it's a player
+/// rather than a coincidentally-numbered card id.
+fn resolve_player_target(
+    ctx: &ReducerContext,
+    recipe: &Recipe,
+    path: &[Seg],
+    bindings: &[Vec<u32>],
+    root: u32,
+) -> Result<u32, String> {
+    let id = resolve_card_target(ctx, recipe, path, bindings, root)?;
+    if crate::players::latest(ctx, id).is_some() {
+        Ok(id)
+    } else {
+        Err(format!(
+            "resolve_player: id {id} (terminus of path {path:?}) is not a player_id \
+             — check that the chain ends on `.owner` of a card carrying \
+             FLAG_OWNED_BY_PLAYER"
+        ))
+    }
 }
 
 /// Walk raw `Segment`s left-to-right and collapse every
@@ -912,10 +1441,15 @@ fn read_path_value(
     // target aspect id. Mirrors the server-side predicate matcher's
     // sub-aspect widening: a `food` read on a card carrying
     // `berries` returns the berries value.
+    // Aspect values are f32 in the unified registry; the recipe
+    // matcher's predicate sums are integer counts (carries-of-X),
+    // so cast at the use site. Fractional carries don't appear in
+    // the inputs that flow through this path (aspect-category and
+    // feature-category entries authored as integer counts).
     let mut total: i32 = 0;
     for (id, v) in &def.aspects {
         if is_aspect_descendant(*id, aspect_id_val).unwrap_or(false) {
-            total += *v;
+            total += *v as i32;
         }
     }
     Ok(total)

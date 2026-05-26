@@ -19,10 +19,12 @@
 //!   `starter_packs = 1` (bit 0 → pack id 1, the human default
 //!   pack); future packs become available via separate unlock
 //!   reducers.
-//! - **Soul cap.** A player may own at most [`MAX_SOULS_PER_PLAYER`]
-//!   alive souls at once. Counted by walking
-//!   `cards.owner_id == player_id` and filtering on
-//!   `FLAG_OWNED_BY_PLAYER` + non-dead.
+//! - **Soul cap.** A player may own at most `soul_info.max` alive
+//!   souls at once (default `5`, configured per-profile and packed
+//!   into the low nibble of `PlayerProfile.soul_info`). The current
+//!   count lives in the high nibble of the same byte, maintained
+//!   delta-style by `crate::souls::on_card_write`, so the gate is a
+//!   single row read — no `cards` scan.
 //!
 //! # Side effects (success path)
 //!
@@ -53,7 +55,8 @@ use resonantdust_content::starter_pack_core::{
 };
 
 use crate::cards::{self, cards as _cards_table};
-use crate::packed::{pack_macro_zone, pack_micro_zone, StackedState};
+use crate::flags::state_flags;
+use crate::packed::{nibble_count, nibble_max, pack_macro_zone, pack_micro_zone, StackedState};
 use crate::players::{self, player_profiles as _player_profiles_table};
 use crate::souls::{soul_privates as _soul_privates_table, with_portrait, SoulPrivate};
 
@@ -65,50 +68,12 @@ const WORLD_LAYER: u8 = 64;
 /// soul's inventory bucket.
 const INVENTORY_LAYER: u8 = 1;
 
-/// `dead` flag bit (see `content/cards/flags.json`). A card whose
-/// latest row carries this is excluded from the soul count.
-const FLAG_DEAD: u32 = 1 << 7;
-
-/// Hard cap on concurrent soul cards per player. Tunable — pick a
-/// number we're comfortable defending in UI / subscription cost /
-/// inventory addressing terms. 5 leaves plenty of room without
-/// turning the character roster into a content-management chore.
-pub const MAX_SOULS_PER_PLAYER: usize = 5;
-
-fn now_ms(ctx: &ReducerContext) -> u64 {
-    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000) as u64
-}
-
-/// Count alive souls owned by `player_id`. Walks the `owner_id`
-/// btree index (soul cards carry `owner_id = player_id`), dedupes
-/// version rows by `card_id`, and counts only cards whose **latest**
-/// row carries `FLAG_OWNED_BY_PLAYER`, is non-dead, and still
-/// matches `owner_id == player_id` (defensive — a card that briefly
-/// held this owner_id in history but has since moved on shouldn't
-/// count).
-fn count_souls(ctx: &ReducerContext, player_id: u32) -> usize {
-    let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    let mut count = 0usize;
-    for row in ctx.db.cards().owner_id().filter(player_id) {
-        if !seen.insert(row.card_id) {
-            continue;
-        }
-        let Some(latest) = cards::latest(ctx, row.card_id) else {
-            continue;
-        };
-        if latest.flags & FLAG_DEAD != 0 {
-            continue;
-        }
-        if latest.flags & cards::FLAG_OWNED_BY_PLAYER == 0 {
-            continue;
-        }
-        if latest.owner_id != player_id {
-            continue;
-        }
-        count += 1;
-    }
-    count
-}
+/// Default soul cap baked into a new profile in `claim_or_login`.
+/// `PlayerProfile.soul_info`'s low nibble is the actual source of
+/// truth at runtime — this constant just seeds it. Picked so the
+/// roster is a manageable size without turning character management
+/// into a content-management chore.
+pub const DEFAULT_SOULS_PER_PLAYER: u8 = 5;
 
 /// Create a new character from a starter pack: spawn one soul plus
 /// its starting inventory for the calling player. See the module doc
@@ -116,13 +81,15 @@ fn count_souls(ctx: &ReducerContext, player_id: u32) -> usize {
 #[reducer]
 pub fn create_character(
     ctx: &ReducerContext,
+    client_time_ms: u64,
     starter_pack_id: StarterPackId,
 ) -> Result<(), String> {
     let player_id = players::resolve_caller(ctx)?;
+    let now_ms = crate::cards::effective_now_ms(ctx, client_time_ms)?;
     // Magnetic block gate — no carve-out. Spawning a new character
     // is card-progression and gated until expired magnetic actions
     // are resolved on the caller's existing souls.
-    crate::lifecycle_pending::block_check(ctx, player_id, now_ms(ctx), &[])?;
+    crate::lifecycle_pending::block_check(ctx, player_id, now_ms, &[])?;
 
     let pack = starter_pack(starter_pack_id)
         .map_err(|e| format!("create_character: registry: {e}"))?
@@ -157,13 +124,18 @@ pub fn create_character(
         ));
     }
 
-    // Cap: 5 souls per player. Checked AFTER unlock so the error
-    // message tells the player the most useful thing first ("you
-    // haven't unlocked this pack" beats "you're at the soul cap").
-    let current_count = count_souls(ctx, player_id);
-    if current_count >= MAX_SOULS_PER_PLAYER {
+    // Cap: per-profile `soul_info.max`. Checked AFTER unlock so the
+    // error message tells the player the most useful thing first
+    // ("you haven't unlocked this pack" beats "you're at the soul
+    // cap"). Count + max are packed into one byte and maintained by
+    // `crate::souls::on_card_write`, so this is a single row read
+    // — no `cards.owner_id` scan.
+    let max_souls = nibble_max(profile.soul_info);
+    let current_count = nibble_count(profile.soul_info);
+    if current_count >= max_souls {
         return Err(format!(
-            "create_character: player {player_id} already owns {current_count} souls (max {MAX_SOULS_PER_PLAYER})"
+            "create_character: player {player_id} already owns {current_count} souls \
+             (max {max_souls})"
         ));
     }
 
@@ -188,23 +160,24 @@ pub fn create_character(
     // player land on different portraits because `card_id`
     // monotonically increments). See [`cards/flags.json`] →
     // `cards.portrait_id` for the field layout.
-    let now = now_ms(ctx);
-    let portrait_seed = (now as u32)
-        ^ (now >> 32) as u32
+    let portrait_seed = (now_ms as u32)
+        ^ (now_ms >> 32) as u32
         ^ player_id
         ^ soul_card_id;
     let portrait_id = ((portrait_seed ^ (portrait_seed >> 4)) & 0xF) as u8;
-    let soul_flags = with_portrait(cards::FLAG_OWNED_BY_PLAYER, portrait_id);
-    cards::create(
+    let soul_flags_state = with_portrait(state_flags().is_owned_by_player, portrait_id);
+    cards::create_at(
         ctx,
         soul_card_id,
+        now_ms,
         /* surface         */ WORLD_LAYER,
         /* macro_zone      */ pack_macro_zone(0, 0),
         /* micro_zone      */ pack_micro_zone(0, 0, StackedState::Free),
         /* micro_location  */ 0,
         /* owner_id        */ player_id,
         soul_def,
-        /* flags           */ soul_flags,
+        /* flags_state     */ soul_flags_state,
+        /* flags_bk        */ 0,
     );
 
     // Seed the per-soul private state row. The soul's starter
@@ -237,6 +210,7 @@ pub fn create_character(
     ctx.db.soul_privates().insert(SoulPrivate {
         card_id: soul_card_id,
         blueprints_0,
+        active_blueprints: 0,
     });
 
     // ---- Spawn the pack contents into the soul's inventory --------
@@ -249,16 +223,18 @@ pub fn create_character(
     for item in &pack.contents {
         for _ in 0..item.count {
             let card_id = cards::next_card_id(ctx);
-            cards::create(
+            cards::create_at(
                 ctx,
                 card_id,
+                now_ms,
                 /* surface         */ INVENTORY_LAYER,
                 /* macro_zone      */ soul_card_id,
                 /* micro_zone      */ 0,
                 /* micro_location  */ 0,
                 /* owner_id        */ soul_card_id,
                 item.packed_definition,
-                /* flags           */ 0,
+                /* flags_state     */ 0,
+                /* flags_bk        */ 0,
             );
         }
     }

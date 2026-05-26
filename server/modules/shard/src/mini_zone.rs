@@ -67,9 +67,7 @@ const ADJACENT_MACRO_ZONES: [(i16, i16); 7] = [
     (-1, 1),
 ];
 
-// `cards/flags.json` bit positions. Local — same per-file pattern the
-// rest of the codebase uses.
-const FLAG_DEAD: u32 = 1 << 7;
+use crate::flags::state_flags;
 
 /// Look up the `card_type` id for `"mini_zone"` once and cache.
 /// Returns `None` if the type isn't registered in the content
@@ -234,29 +232,50 @@ pub fn tile_at_anchor(
 #[reducer]
 pub fn deploy_mini_zone(
     ctx: &ReducerContext,
+    client_time_ms: u64,
     anchor_card_id: u32,
     target_macro_zone: u32,
     target_micro_zone: u8,
 ) -> Result<(), String> {
     // ---- caller resolution ----------------------------------------
     let caller_player_id = players::resolve_caller(ctx)?;
+    let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
     // Magnetic block gate — no carve-out. Deploying a mini-zone is
     // an economic progression action and gated on expired-magnetic
     // resolution.
     crate::lifecycle_pending::block_check(
         ctx,
         caller_player_id,
-        cards::now_ms(ctx),
+        now_ms,
         &[],
     )?;
 
     // ---- anchor validation ----------------------------------------
-    let anchor = cards::latest(ctx, anchor_card_id).ok_or_else(|| {
+    let anchor = cards::prior_at(ctx, anchor_card_id, now_ms).ok_or_else(|| {
         format!("deploy_mini_zone: anchor card {anchor_card_id} not found")
     })?;
-    if anchor.flags & FLAG_DEAD != 0 {
+    let s = state_flags();
+    if anchor.flags_state & s.dead != 0 {
         return Err(format!(
             "deploy_mini_zone: anchor card {anchor_card_id} is dead"
+        ));
+    }
+    // Hold-kind gate: deploying writes new card + zone rows for
+    // the anchor, which is structurally a "claim" on the anchor card.
+    // Reject if any in-flight action is holding it.
+    if cards::slot_hold_count(anchor.flags_bk) > 0 {
+        return Err(format!(
+            "deploy_mini_zone: anchor card {anchor_card_id} is exclusively held by an in-flight action"
+        ));
+    }
+    if cards::slot_share_count(anchor.flags_bk) > 0 {
+        return Err(format!(
+            "deploy_mini_zone: anchor card {anchor_card_id} is shared-held by an in-flight action (borrow/share)"
+        ));
+    }
+    if cards::position_hold_count(anchor.flags_bk) > 0 {
+        return Err(format!(
+            "deploy_mini_zone: anchor card {anchor_card_id} is position-held by an in-flight action"
         ));
     }
     // Ownership: walk up via `owning_player` to verify the anchor
@@ -311,17 +330,17 @@ pub fn deploy_mini_zone(
             if c.surface != WORLD_LAYER {
                 return false;
             }
-            if c.flags & FLAG_DEAD != 0 {
+            if c.flags_state & s.dead != 0 {
                 return false;
             }
-            // Compare via latest() so we don't trip on stale history rows.
-            let Some(latest) = cards::latest(ctx, c.card_id) else {
+            // Compare via prior_at(now_ms) so we don't trip on stale history rows.
+            let Some(latest) = cards::prior_at(ctx, c.card_id, now_ms) else {
                 return false;
             };
             latest.surface == WORLD_LAYER
                 && latest.macro_zone == target_macro_zone
                 && latest.micro_zone == target_micro_zone
-                && latest.flags & FLAG_DEAD == 0
+                && latest.flags_state & s.dead == 0
         });
     if occupied {
         return Err(format!(
@@ -344,7 +363,7 @@ pub fn deploy_mini_zone(
     // not by being on the world surface. Position-preserve /
     // position-locked are NOT set — the user can still pick the
     // wagon back up via `pickup_mini_zone`.
-    cards::update_with(ctx, anchor_card_id, |c| {
+    cards::update_with_at(ctx, anchor_card_id, now_ms, |c| {
         c.surface = WORLD_LAYER;
         c.macro_zone = target_macro_zone;
         c.micro_zone = target_micro_zone;
@@ -368,7 +387,7 @@ pub fn deploy_mini_zone(
     // change.
     let tile_zone_packed_def = pack_zone_definition(/* tile */ 7);
     let zone_id = zones::next_zone_id(ctx);
-    zones::create(
+    zones::create_at(
         ctx,
         zone_id,
         MINI_ZONE_LAYER,
@@ -380,6 +399,7 @@ pub fn deploy_mini_zone(
         // they're always card_id-keyed.)
         /* owner_id */ anchor_card_id,
         /* tiles */ [0; crate::packed::ZONE_TILE_U64_COUNT],
+        now_ms,
     );
 
     Ok(())
@@ -401,15 +421,39 @@ pub fn deploy_mini_zone(
 /// 4. Delete the Zone row at `(surface=63, macro_zone=anchor.card_id)`.
 /// 5. Rewrite the anchor card to land in inventory.
 #[reducer]
-pub fn pickup_mini_zone(ctx: &ReducerContext, anchor_card_id: u32) -> Result<(), String> {
+pub fn pickup_mini_zone(
+    ctx: &ReducerContext,
+    client_time_ms: u64,
+    anchor_card_id: u32,
+) -> Result<(), String> {
     let caller_player_id = players::resolve_caller(ctx)?;
+    let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
 
-    let anchor = cards::latest(ctx, anchor_card_id).ok_or_else(|| {
+    let anchor = cards::prior_at(ctx, anchor_card_id, now_ms).ok_or_else(|| {
         format!("pickup_mini_zone: anchor card {anchor_card_id} not found")
     })?;
-    if anchor.flags & FLAG_DEAD != 0 {
+    let s = state_flags();
+    if anchor.flags_state & s.dead != 0 {
         return Err(format!(
             "pickup_mini_zone: anchor card {anchor_card_id} is dead"
+        ));
+    }
+    // Hold-kind gate: same as deploy — picking up moves the anchor
+    // back to the soul's inventory and tears down its zone rows;
+    // can't happen while an action is holding the anchor.
+    if cards::slot_hold_count(anchor.flags_bk) > 0 {
+        return Err(format!(
+            "pickup_mini_zone: anchor card {anchor_card_id} is exclusively held by an in-flight action"
+        ));
+    }
+    if cards::slot_share_count(anchor.flags_bk) > 0 {
+        return Err(format!(
+            "pickup_mini_zone: anchor card {anchor_card_id} is shared-held by an in-flight action (borrow/share)"
+        ));
+    }
+    if cards::position_hold_count(anchor.flags_bk) > 0 {
+        return Err(format!(
+            "pickup_mini_zone: anchor card {anchor_card_id} is position-held by an in-flight action"
         ));
     }
     // Ownership: walk up via `owning_player` to verify the anchor
@@ -488,17 +532,17 @@ pub fn pickup_mini_zone(ctx: &ReducerContext, anchor_card_id: u32) -> Result<(),
         if !seen.insert(id) {
             continue;
         }
-        let Some(latest) = cards::latest(ctx, id) else {
+        let Some(latest) = cards::prior_at(ctx, id, now_ms) else {
             continue;
         };
         if latest.surface != MINI_ZONE_LAYER || latest.macro_zone != anchor_card_id {
             // Moved out since we started iterating — leave alone.
             continue;
         }
-        if latest.flags & FLAG_DEAD != 0 {
+        if latest.flags_state & s.dead != 0 {
             continue;
         }
-        cards::update_with(ctx, id, |c| {
+        cards::update_with_at(ctx, id, now_ms, |c| {
             c.surface = WORLD_LAYER;
             c.macro_zone = world_macro_zone;
             c.micro_zone = world_micro_zone;
@@ -524,7 +568,7 @@ pub fn pickup_mini_zone(ctx: &ReducerContext, anchor_card_id: u32) -> Result<(),
     }
 
     // ---- return the anchor to inventory ---------------------------
-    cards::update_with(ctx, anchor_card_id, |c| {
+    cards::update_with_at(ctx, anchor_card_id, now_ms, |c| {
         c.surface = INVENTORY_LAYER;
         c.macro_zone = target_soul_card_id;
         c.micro_zone = 0;

@@ -6,33 +6,28 @@ use spacetimedb::{table, ReducerContext, Table};
 
 use crate::cards;
 use crate::cards::Card;
-use crate::packed::{pack_valid_at, valid_at_time};
+use crate::flags::state_flags;
+use crate::packed::{
+    nibble_count, nibble_max, pack_valid_at, valid_at_time, with_nibble_count,
+};
+use crate::players::player_profiles as _player_profiles_table;
 use crate::sequence;
 
-// Bit positions we read off `Card.flags`. Kept local to mirror the
-// pattern used elsewhere (action_completion, magnetic, etc.) — promote
-// to a shared flags module when there's a real consumer count.
-const FLAG_DEAD: u32 = 1 << 7;
-
-/// Bit position of the 4-bit `portrait_id` field in `Card.flags`
-/// (bits 28..=31). See `content/cards/flags.json` → `cards.portrait_id`.
-pub const FLAG_PORTRAIT_SHIFT: u32 = 28;
-/// Mask covering the `portrait_id` nibble.
-pub const FLAG_PORTRAIT_MASK: u32 = 0xF << FLAG_PORTRAIT_SHIFT;
-
-/// Read the soul portrait index (0..=15) out of a `Card.flags` value.
-/// Meaningful only on soul cards; non-soul callers should ignore the
-/// result.
-pub fn portrait_id(flags: u32) -> u8 {
-    ((flags & FLAG_PORTRAIT_MASK) >> FLAG_PORTRAIT_SHIFT) as u8
+/// Read the soul portrait index (0..=15) out of a `Card.flags_state`
+/// value. Meaningful only on soul cards; non-soul callers should
+/// ignore the result.
+pub fn portrait_id(flags_state: u32) -> u8 {
+    let s = state_flags();
+    ((flags_state & s.portrait_id_mask) >> s.portrait_id_shift) as u8
 }
 
-/// Stamp the soul portrait index into a `Card.flags` value, clearing
-/// any prior value first. `id` is masked to 4 bits, so callers don't
-/// have to range-check; passing `id >= 16` silently truncates to the
-/// low nibble — consistent with the [`quad_set`] helper above.
-pub fn with_portrait(flags: u32, id: u8) -> u32 {
-    (flags & !FLAG_PORTRAIT_MASK) | (((id as u32) & 0xF) << FLAG_PORTRAIT_SHIFT)
+/// Stamp the soul portrait index into a `Card.flags_state` value,
+/// clearing any prior value first. `id` is masked to 4 bits, so
+/// callers don't have to range-check; passing `id >= 16` silently
+/// truncates to the low nibble.
+pub fn with_portrait(flags_state: u32, id: u8) -> u32 {
+    let s = state_flags();
+    (flags_state & !s.portrait_id_mask) | (((id as u32) & 0xF) << s.portrait_id_shift)
 }
 
 /// Soul row — one per soul card, public so clients can subscribe.
@@ -118,6 +113,17 @@ pub struct SoulPrivate {
     /// past 64 entries. Default `0` — discovery is gameplay-driven,
     /// nothing is granted on signup. Flipping a bit on is one-way.
     pub blueprints_0: u64,
+    /// Count of live blueprint cards owned by this soul ("under
+    /// construction" slots). Maintained by `on_card_write` the
+    /// same way `Soul.stats` is maintained: a blueprint card
+    /// coming alive bumps +1 on the owning soul's
+    /// `active_blueprints`; going dead / changing owner bumps -1.
+    /// `blueprints::request_blueprint` reads this against the
+    /// soul's `builder` aspect value to decide whether to allow a
+    /// new request — no separate slot-release reducer needed,
+    /// because the hook handles release implicitly when the
+    /// blueprint dies. Saturates at `u8::MAX`.
+    pub active_blueprints: u8,
 }
 
 // ---- u32 quad packing -----------------------------------------------
@@ -303,8 +309,206 @@ pub fn read_slot(ctx: &ReducerContext, card_id: u32, slot: StatSlot) -> Option<u
 /// promote to a content-side helper if more modules need it.
 const SOUL_CARD_TYPE: u8 = 6;
 
-fn is_soul_card(packed_def: u16) -> bool {
+pub fn is_soul_card(packed_def: u16) -> bool {
     ((packed_def >> 12) & 0xF) as u8 == SOUL_CARD_TYPE
+}
+
+/// Card-type id for `blueprint` cards. Mirrors `cards/types.json`
+/// (same hardcode style as `SOUL_CARD_TYPE` above; type ids in
+/// `types.json` are stable, so embedding them avoids a registry
+/// lookup on every card write).
+const BLUEPRINT_CARD_TYPE: u8 = 1;
+
+fn is_blueprint_card(packed_def: u16) -> bool {
+    ((packed_def >> 12) & 0xF) as u8 == BLUEPRINT_CARD_TYPE
+}
+
+/// What this card row contributes to
+/// `SoulPrivate.active_blueprints` — the soul that owns it (via
+/// the owner chain). Returns `None` for non-blueprint cards, dead
+/// cards, world-owned cards (no soul in the chain), and the
+/// degenerate case where `owner_id == 0`. Mirrors the shape of
+/// [`card_contribution`] for stats.
+fn blueprint_contribution(ctx: &ReducerContext, card: &Card) -> Option<u32> {
+    if !is_blueprint_card(card.packed_definition) {
+        return None;
+    }
+    let s = state_flags();
+    if card.flags_state & s.dead != 0 {
+        return None;
+    }
+    if card.owner_id == 0 {
+        return None;
+    }
+    cards::owning_soul(ctx, card.owner_id)
+}
+
+/// Apply a signed `±1` delta to `SoulPrivate.active_blueprints`
+/// for `soul_card_id`. Saturating arithmetic on the `u8` field so
+/// a stale-row replay can't underflow / overflow. No-op when the
+/// soul has no `SoulPrivate` row yet (the row is created in
+/// `character_creation::create_character` alongside the soul card,
+/// so this only fires for hand-rolled / test-driven card writes
+/// without a real soul behind them).
+///
+/// `SoulPrivate` is a flat-row table (no history), so this is a
+/// delete + insert — same pattern as `PlayerProfile`'s
+/// `lifecycle_count` updates in `players.rs`.
+fn apply_blueprint_delta(ctx: &ReducerContext, soul_card_id: u32, delta: i8) {
+    let Some(mut row) = ctx.db.soul_privates().card_id().find(soul_card_id) else {
+        return;
+    };
+    row.active_blueprints = if delta > 0 {
+        row.active_blueprints.saturating_add(1)
+    } else {
+        row.active_blueprints.saturating_sub(1)
+    };
+    ctx.db.soul_privates().card_id().delete(soul_card_id);
+    ctx.db.soul_privates().insert(row);
+}
+
+/// Card-type id for `player_blueprint` cards — mirrors
+/// `cards/types.json`. Distinct from `blueprint` (=1): player-scoped
+/// build plans live in their own def-id namespace + registry, so the
+/// hook can distinguish them at the same low cost (a nibble check).
+const PLAYER_BLUEPRINT_CARD_TYPE: u8 = 3;
+
+fn is_player_blueprint_card(packed_def: u16) -> bool {
+    ((packed_def >> 12) & 0xF) as u8 == PLAYER_BLUEPRINT_CARD_TYPE
+}
+
+/// What this card row contributes to
+/// `PlayerProfile.blueprint_info` — the player it's owned by.
+/// Player-blueprints are spawned at the top of their own subtree
+/// with [`FLAG_OWNED_BY_PLAYER`] set (same convention souls use),
+/// so `owner_id` is the player_id directly — no chain walk needed.
+/// `None` for non-player_blueprint cards, dead cards, missing /
+/// world ownership.
+fn player_blueprint_contribution(card: &Card) -> Option<u32> {
+    if !is_player_blueprint_card(card.packed_definition) {
+        return None;
+    }
+    let s = state_flags();
+    if card.flags_state & s.dead != 0 {
+        return None;
+    }
+    if card.flags_state & s.is_owned_by_player == 0 {
+        return None;
+    }
+    if card.owner_id == 0 || card.owner_id == cards::WORLD_PLAYER_ID {
+        return None;
+    }
+    Some(card.owner_id)
+}
+
+/// What this soul-card row contributes to `PlayerProfile.soul_info`
+/// — the player that owns the soul. `None` for non-soul cards, dead
+/// souls, and world-owned souls. Souls themselves carry
+/// `FLAG_OWNED_BY_PLAYER` so their `owner_id` is the player_id
+/// directly.
+fn soul_contribution(card: &Card) -> Option<u32> {
+    if !is_soul_card(card.packed_definition) {
+        return None;
+    }
+    let s = state_flags();
+    if card.flags_state & s.dead != 0 {
+        return None;
+    }
+    // A soul carries FLAG_OWNED_BY_PLAYER, so `owner_id` is the
+    // player_id directly. Defensive bail if the flag is somehow
+    // missing — the hook would otherwise treat a chained card_id
+    // as a player_id.
+    if card.flags_state & s.is_owned_by_player == 0 {
+        return None;
+    }
+    if card.owner_id == 0 || card.owner_id == cards::WORLD_PLAYER_ID {
+        return None;
+    }
+    Some(card.owner_id)
+}
+
+/// Apply a signed `±1` delta to the `count` nibble of a packed
+/// `[count:u4 | max:u4]` byte on `PlayerProfile`, preserving the
+/// `max` nibble. `field_selector` picks which packed byte to mutate
+/// — see the call sites in [`on_card_write`]. Saturating at the
+/// 4-bit ceiling (15) so a runaway hook can't wrap into the max
+/// nibble.
+///
+/// `PlayerProfile` is a flat-row table (no history) — same
+/// delete + insert update pattern as
+/// `apply_blueprint_delta` above.
+fn apply_player_profile_count_delta(
+    ctx: &ReducerContext,
+    player_id: u32,
+    delta: i8,
+    field: PlayerCountField,
+) {
+    let Some(mut row) = ctx.db.player_profiles().player_id().find(player_id) else {
+        return;
+    };
+    let packed = match field {
+        PlayerCountField::Blueprint => row.blueprint_info,
+        PlayerCountField::Soul => row.soul_info,
+    };
+    let cur = nibble_count(packed);
+    let next = if delta > 0 {
+        cur.saturating_add(1).min(0xF)
+    } else {
+        cur.saturating_sub(1)
+    };
+    let updated = with_nibble_count(packed, next);
+    match field {
+        PlayerCountField::Blueprint => row.blueprint_info = updated,
+        PlayerCountField::Soul => row.soul_info = updated,
+    }
+    ctx.db.player_profiles().player_id().delete(player_id);
+    ctx.db.player_profiles().insert(row);
+}
+
+#[derive(Clone, Copy)]
+enum PlayerCountField {
+    Blueprint,
+    Soul,
+}
+
+/// Read the `max` nibble from `PlayerProfile.soul_info` for
+/// `player_id`. Returns `None` when the profile row is missing.
+/// `character_creation::create_character` uses this to gate the
+/// soul cap on the per-player configured max rather than the legacy
+/// `MAX_SOULS_PER_PLAYER` constant.
+pub fn soul_max_for_player(ctx: &ReducerContext, player_id: u32) -> Option<u8> {
+    ctx.db
+        .player_profiles()
+        .player_id()
+        .find(player_id)
+        .map(|p| nibble_max(p.soul_info))
+}
+
+/// Read the `max` nibble from `PlayerProfile.blueprint_info` for
+/// `player_id`. Returns `None` when the profile row is missing.
+/// Read by `request_player_blueprint` for the cap check.
+pub fn player_blueprint_max_for_player(
+    ctx: &ReducerContext,
+    player_id: u32,
+) -> Option<u8> {
+    ctx.db
+        .player_profiles()
+        .player_id()
+        .find(player_id)
+        .map(|p| nibble_max(p.blueprint_info))
+}
+
+/// Read the `count` nibble from `PlayerProfile.blueprint_info` for
+/// `player_id`. Returns `None` when the profile row is missing.
+pub fn player_blueprint_count_for_player(
+    ctx: &ReducerContext,
+    player_id: u32,
+) -> Option<u8> {
+    ctx.db
+        .player_profiles()
+        .player_id()
+        .find(player_id)
+        .map(|p| nibble_count(p.blueprint_info))
 }
 
 // ---- the hook ------------------------------------------------------
@@ -334,6 +538,70 @@ pub fn on_card_write(
     new_card: &Card,
     time_ms: u64,
 ) {
+    // (3) Blueprint-counter diff. A live blueprint card
+    // contributes +1 to its owning soul's
+    // `SoulPrivate.active_blueprints`. Same delta model as the
+    // stat-counter branch below: prev contribution -1, new
+    // contribution +1, both no-op when same soul. Lives at the
+    // top so soul-creation (in branch (1) below) is the only state
+    // mutation other branches still depend on having seen.
+    let prev_bp = prev_latest.and_then(|c| blueprint_contribution(ctx, c));
+    let new_bp = blueprint_contribution(ctx, new_card);
+    match (prev_bp, new_bp) {
+        (Some(p), Some(n)) if p == n => {}
+        (Some(p), Some(n)) => {
+            apply_blueprint_delta(ctx, p, -1);
+            apply_blueprint_delta(ctx, n, 1);
+        }
+        (Some(p), None) => apply_blueprint_delta(ctx, p, -1),
+        (None, Some(n)) => apply_blueprint_delta(ctx, n, 1),
+        (None, None) => {}
+    }
+
+    // (3b) Player-blueprint counter diff. Parallel to (3) but the
+    // contribution resolves to a player_id (via owning_player) and
+    // the count lives in `PlayerProfile.blueprint_info`'s high
+    // nibble — see `apply_player_profile_count_delta`.
+    let prev_pbp = prev_latest.and_then(player_blueprint_contribution);
+    let new_pbp = player_blueprint_contribution(new_card);
+    match (prev_pbp, new_pbp) {
+        (Some(p), Some(n)) if p == n => {}
+        (Some(p), Some(n)) => {
+            apply_player_profile_count_delta(ctx, p, -1, PlayerCountField::Blueprint);
+            apply_player_profile_count_delta(ctx, n, 1, PlayerCountField::Blueprint);
+        }
+        (Some(p), None) => {
+            apply_player_profile_count_delta(ctx, p, -1, PlayerCountField::Blueprint)
+        }
+        (None, Some(n)) => {
+            apply_player_profile_count_delta(ctx, n, 1, PlayerCountField::Blueprint)
+        }
+        (None, None) => {}
+    }
+
+    // (3c) Soul-counter diff. A live soul card contributes +1 to
+    // its owner-player's `PlayerProfile.soul_info` count nibble.
+    // Replaces the linear-scan `count_souls(ctx, player_id)` the
+    // soul-cap reducer used to do — the cap check is now a single
+    // row read against `soul_info`. Owner transfer between players
+    // would show up here as a delta from one player to another.
+    let prev_soul = prev_latest.and_then(soul_contribution);
+    let new_soul = soul_contribution(new_card);
+    match (prev_soul, new_soul) {
+        (Some(p), Some(n)) if p == n => {}
+        (Some(p), Some(n)) => {
+            apply_player_profile_count_delta(ctx, p, -1, PlayerCountField::Soul);
+            apply_player_profile_count_delta(ctx, n, 1, PlayerCountField::Soul);
+        }
+        (Some(p), None) => {
+            apply_player_profile_count_delta(ctx, p, -1, PlayerCountField::Soul)
+        }
+        (None, Some(n)) => {
+            apply_player_profile_count_delta(ctx, n, 1, PlayerCountField::Soul)
+        }
+        (None, None) => {}
+    }
+
     // (1) Identity sync. Only fires when the written card is a soul
     // card. Reads the *prior* soul row (max valid_at_time ≤ time_ms)
     // for the same reason `apply_slot_delta` does — out-of-order
@@ -416,11 +684,12 @@ pub fn on_card_write(
 /// by `card_id`, so we resolve the soul_card_id directly via
 /// `cards::owning_soul` rather than going player → soul.
 fn card_contribution(ctx: &ReducerContext, card: &Card) -> Option<(u32, StatSlot)> {
-    if card.flags & FLAG_DEAD != 0 {
+    let s = state_flags();
+    if card.flags_state & s.dead != 0 {
         return None;
     }
     // Soul cards don't contribute to their own stats.
-    if card.flags & cards::FLAG_OWNED_BY_PLAYER != 0 {
+    if card.flags_state & s.is_owned_by_player != 0 {
         return None;
     }
     let slot = stat_slot_for(card.packed_definition)?;

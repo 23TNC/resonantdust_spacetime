@@ -4,7 +4,7 @@ use spacetimedb::{reducer, ReducerContext, Table};
 
 use resonantdust_content::biome_core;
 use resonantdust_content::definition_core::{
-    cards_of_type, decode_definition, trait_id, CardDefinition, StockSlot, TraitId,
+    aspect_id, cards_of_type, decode_definition, AspectId, CardDefinition, StockSlot,
 };
 
 use crate::packed::{self, pack_definition, pack_macro_zone, pack_zone_definition, valid_at_time};
@@ -228,7 +228,7 @@ pub fn sample_climate(global_q: i32, global_r: i32, seed: u64) -> Climate {
 
 // ---- climate-trait id cache -----------------------------------------
 //
-// `trait_id("elevation_min")` is a BTreeMap lookup on the content
+// `aspect_id("elevation_min")` is a BTreeMap lookup on the content
 // crate's trait registry — cheap but called millions of times across
 // a worldgen pass (one per tile-def per cell). The OnceLock here
 // resolves each climate trait id exactly once at first use; subsequent
@@ -237,30 +237,35 @@ pub fn sample_climate(global_q: i32, global_r: i32, seed: u64) -> Climate {
 // authoring requirements, not runtime data, so a panic surfaces the
 // authoring bug at the first procedural-gen reducer call.
 
-struct ClimateTraitIds {
-    elevation_min: TraitId,
-    elevation_max: TraitId,
-    temperature_min: TraitId,
-    temperature_max: TraitId,
-    humidity_min: TraitId,
-    humidity_max: TraitId,
-    aether_min: TraitId,
-    aether_max: TraitId,
-    rarity: TraitId,
-    cluster_group: TraitId,
-    cluster_strength: TraitId,
+struct ClimateAspectIds {
+    elevation_min: AspectId,
+    elevation_max: AspectId,
+    temperature_min: AspectId,
+    temperature_max: AspectId,
+    humidity_min: AspectId,
+    humidity_max: AspectId,
+    aether_min: AspectId,
+    aether_max: AspectId,
+    rarity: AspectId,
+    cluster_group: AspectId,
+    cluster_strength: AspectId,
 }
 
-static CLIMATE_TRAITS: OnceLock<ClimateTraitIds> = OnceLock::new();
+static CLIMATE_TRAITS: OnceLock<ClimateAspectIds> = OnceLock::new();
 
-fn require_trait(name: &str) -> TraitId {
-    trait_id(name)
-        .expect("trait registry should build")
-        .unwrap_or_else(|| panic!("trait {:?} not declared in traits.json", name))
+fn require_trait(name: &str) -> AspectId {
+    aspect_id(name)
+        .expect("aspect registry should build")
+        .unwrap_or_else(|| {
+            panic!(
+                "trait-category aspect {:?} not declared in aspects.json's `traits` section",
+                name
+            )
+        })
 }
 
-fn climate_traits() -> &'static ClimateTraitIds {
-    CLIMATE_TRAITS.get_or_init(|| ClimateTraitIds {
+fn climate_traits() -> &'static ClimateAspectIds {
+    CLIMATE_TRAITS.get_or_init(|| ClimateAspectIds {
         elevation_min: require_trait("elevation_min"),
         elevation_max: require_trait("elevation_max"),
         temperature_min: require_trait("temperature_min"),
@@ -336,27 +341,48 @@ pub fn biome_for(global_q: i32, global_r: i32) -> u16 {
 // ---- envelope + rarity helpers --------------------------------------
 
 /// Is the cell's climate inside the tile def's declared envelope?
-/// Missing trait values default to the loose end of the axis (min →
-/// 0.0, max → 1.0), so a tile that declares no envelope at all is a
-/// candidate everywhere. Inclusive on both ends.
+///
+/// Missing trait values on an axis default to the loose end of that
+/// axis (min → 0.0, max → 1.0), so any axis the def doesn't
+/// constrain matches everywhere. A def must declare **at least one**
+/// climate trait to be a world-gen candidate, though — otherwise it
+/// would match every cell.
+///
+/// The "at least one" gate exists so non-terrain `tile`-type cards
+/// (buildings, future player-placed structures) don't pollute world
+/// gen just by living in the same card-type bucket as forest /
+/// plains / desert. Zones store tile rows by `card_type`, so
+/// buildings can't live in their own type — instead the convention
+/// is "if it has no climate envelope, it's not terrain."
 fn tile_envelope_contains(def: &CardDefinition, climate: &Climate) -> bool {
     let t = climate_traits();
-    let elev_min = def.trait_value(t.elevation_min).unwrap_or(0.0);
-    let elev_max = def.trait_value(t.elevation_max).unwrap_or(1.0);
-    let temp_min = def.trait_value(t.temperature_min).unwrap_or(0.0);
-    let temp_max = def.trait_value(t.temperature_max).unwrap_or(1.0);
-    let hum_min = def.trait_value(t.humidity_min).unwrap_or(0.0);
-    let hum_max = def.trait_value(t.humidity_max).unwrap_or(1.0);
-    let aeth_min = def.trait_value(t.aether_min).unwrap_or(0.0);
-    let aeth_max = def.trait_value(t.aether_max).unwrap_or(1.0);
-    climate[AXIS_ELEVATION] >= elev_min
-        && climate[AXIS_ELEVATION] <= elev_max
-        && climate[AXIS_TEMPERATURE] >= temp_min
-        && climate[AXIS_TEMPERATURE] <= temp_max
-        && climate[AXIS_HUMIDITY] >= hum_min
-        && climate[AXIS_HUMIDITY] <= hum_max
-        && climate[AXIS_AETHER] >= aeth_min
-        && climate[AXIS_AETHER] <= aeth_max
+    let elev_min = def.aspect_value(t.elevation_min);
+    let elev_max = def.aspect_value(t.elevation_max);
+    let temp_min = def.aspect_value(t.temperature_min);
+    let temp_max = def.aspect_value(t.temperature_max);
+    let hum_min = def.aspect_value(t.humidity_min);
+    let hum_max = def.aspect_value(t.humidity_max);
+    let aeth_min = def.aspect_value(t.aether_min);
+    let aeth_max = def.aspect_value(t.aether_max);
+    let has_any_climate = elev_min.is_some()
+        || elev_max.is_some()
+        || temp_min.is_some()
+        || temp_max.is_some()
+        || hum_min.is_some()
+        || hum_max.is_some()
+        || aeth_min.is_some()
+        || aeth_max.is_some();
+    if !has_any_climate {
+        return false;
+    }
+    climate[AXIS_ELEVATION] >= elev_min.unwrap_or(0.0)
+        && climate[AXIS_ELEVATION] <= elev_max.unwrap_or(1.0)
+        && climate[AXIS_TEMPERATURE] >= temp_min.unwrap_or(0.0)
+        && climate[AXIS_TEMPERATURE] <= temp_max.unwrap_or(1.0)
+        && climate[AXIS_HUMIDITY] >= hum_min.unwrap_or(0.0)
+        && climate[AXIS_HUMIDITY] <= hum_max.unwrap_or(1.0)
+        && climate[AXIS_AETHER] >= aeth_min.unwrap_or(0.0)
+        && climate[AXIS_AETHER] <= aeth_max.unwrap_or(1.0)
 }
 
 /// Weight-pick a tile from `candidates`, biased by each def's
@@ -376,7 +402,7 @@ fn weight_pick_candidate(
     let t = climate_traits();
     let mut total: f32 = 0.0;
     for d in candidates {
-        total += d.trait_value(t.rarity).unwrap_or(1.0).max(0.0);
+        total += d.aspect_value(t.rarity).unwrap_or(1.0).max(0.0);
     }
     if total <= 0.0 {
         // All candidates have rarity 0 (or negative — clamped to 0).
@@ -391,7 +417,7 @@ fn weight_pick_candidate(
     let h = hash2(global_q, global_r, seed.wrapping_add(0x4D2A_3A04_4E8D_2D85)) as u32;
     let mut roll = (h as f32) / 4_294_967_296.0 * total;
     for d in candidates {
-        let w = d.trait_value(t.rarity).unwrap_or(1.0).max(0.0);
+        let w = d.aspect_value(t.rarity).unwrap_or(1.0).max(0.0);
         roll -= w;
         if roll <= 0.0 {
             return d.definition_id;
@@ -565,7 +591,7 @@ fn neighbour_cluster_groups(global_q: i32, global_r: i32, seed: u64) -> [u8; 6] 
         }
         let packed = pack_definition(TILE_CARD_TYPE, def_id);
         if let Ok(Some(ndef)) = decode_definition(packed) {
-            out[i] = ndef.trait_value(t.cluster_group).unwrap_or(0.0) as u8;
+            out[i] = ndef.aspect_value(t.cluster_group).unwrap_or(0.0) as u8;
         }
     }
     out
@@ -597,15 +623,15 @@ fn weight_pick_with_cluster(
     let weights: Vec<f32> = candidates
         .iter()
         .map(|d| {
-            let rarity = d.trait_value(t.rarity).unwrap_or(1.0).max(0.0);
+            let rarity = d.aspect_value(t.rarity).unwrap_or(1.0).max(0.0);
             if !cluster_active {
                 return rarity;
             }
-            let group = d.trait_value(t.cluster_group).unwrap_or(0.0) as u8;
+            let group = d.aspect_value(t.cluster_group).unwrap_or(0.0) as u8;
             if group == 0 {
                 return rarity;
             }
-            let strength = d.trait_value(t.cluster_strength).unwrap_or(0.0).max(0.0);
+            let strength = d.aspect_value(t.cluster_strength).unwrap_or(0.0).max(0.0);
             if strength <= 0.0 {
                 return rarity;
             }

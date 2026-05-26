@@ -51,10 +51,13 @@ use std::collections::{HashMap, HashSet};
 
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table, TimeDuration};
 
-use crate::cards::{cards, owning_player, FLAG_DEAD, WORLD_PLAYER_ID};
-use crate::packed::valid_at_time;
+use crate::cards;
+use crate::cards::{cards as _cards_table, owning_player, WORLD_PLAYER_ID};
+use crate::flags::state_flags;
+use crate::packed::{unpack_definition, unpack_micro_zone, valid_at_time, StackedState};
 use crate::players::{player_sessions, players};
 use crate::souls::souls;
+use crate::zones;
 
 /// Sweep interval. 10 minutes — well below all retention windows so
 /// no dead row outlives its retention by more than one cadence.
@@ -116,8 +119,10 @@ pub fn gc_sweep(ctx: &ReducerContext, _row: GcSchedule) -> Result<(), String> {
     let last_login = last_login_map(ctx);
 
     sweep_cards(ctx, now_ms, &logged_in, &last_login);
+    sweep_tile_card_demotions(ctx, now_ms);
     sweep_players(ctx);
     sweep_souls(ctx);
+    crate::pending_actions::sweep_stale(ctx, now_ms);
 
     Ok(())
 }
@@ -192,7 +197,7 @@ fn sweep_cards(
             continue;
         }
         // Latest row for this card_id.
-        if c.flags & FLAG_DEAD == 0 {
+        if c.flags_state & state_flags().dead == 0 {
             // Alive — retain.
             continue;
         }
@@ -226,17 +231,16 @@ fn dead_row_reapable(
         return true;
     }
 
-    // In-flight death: the row has FLAG_DEAD but also carries
-    // slot_hold (forward-propagated onto this dead row by a later
-    // chain_stitch — a concurrent recipe claimed the card before
-    // its scheduled death fired). Retain so the client's animation-
-    // deferral path keeps seeing the dead+held state. The holding
-    // recipe's `action_completion` will write a future row at its
-    // own completion time that clears slot_hold; that newer row
-    // supersedes this one as "latest" and the non-latest sweep
-    // reaps this row on the next cadence.
-    const FLAG_SLOT_HOLD: u32 = 1 << 5;
-    if card.flags & FLAG_SLOT_HOLD != 0 {
+    // In-flight death: the row has `dead` but also carries a
+    // positive `slot_hold_count` (forward-propagated onto this dead
+    // row by a later chain_stitch — a concurrent recipe claimed
+    // the card before its scheduled death fired). Retain so the
+    // client's animation-deferral path keeps seeing the dead+held
+    // state. The holding recipe's `action_completion` writes a
+    // future row at completion that decrements `slot_hold_count`;
+    // that newer row supersedes this one as "latest" and the
+    // non-latest sweep reaps this row on the next cadence.
+    if cards::slot_hold_count(card.flags_bk) > 0 {
         return false;
     }
 
@@ -268,6 +272,142 @@ fn dead_row_reapable(
     let last_login_ms = (last_login_secs as u64).saturating_mul(1_000);
     let time_since_login_ms = now_ms.saturating_sub(last_login_ms);
     time_since_login_ms > POST_LOGIN_GRACE_MS
+}
+
+/// `card_type` value reserved for tile-cards. Mirrors the constant
+/// duplicated across `world_gen.rs` / `actions.rs` / `movement.rs`
+/// — one source of truth lives in `content/cards/types.json`
+/// (`tile` = 7).
+const TILE_CARD_TYPE: u8 = 7;
+
+/// Tile-card demotion pass. Folds at-rest promoted tile-cards back
+/// into the Zone packed tile slot they were derived from and deletes
+/// the card row. See `docs/TILE_AS_CARD.md` Phase 6.
+///
+/// Demotion preconditions (all must hold):
+/// - `card_type == TILE_CARD_TYPE`.
+/// - Card is its `card_id`'s latest row (i.e., no in-flight
+///   future-stamped writes — same `latest_by_id` discipline as the
+///   dead-row sweep).
+/// - `flags_state` carries nothing the zone slot can't express:
+///   `dead`, `magnetic`, `pos_need`, `pos_want` clear;
+///   `progress_style == 0`.
+/// - All six `flags_bk` count fields == 0 (`touch_count`,
+///   `server_count`, `slot_hold_count`, `slot_share_count`,
+///   `drop_hold_count`, `position_hold_count`). `slot_hold_count > 0`
+///   means an action is currently mid-flight on the card; never
+///   demote under those.
+/// - A Zone is registered at `(card.surface, card.macro_zone)`.
+/// - `card.owner_id == zone.owner_id` — divergence implies an
+///   ownership change (e.g. mid-harvest pickup); preserving the
+///   card row keeps the new owner's claim intact.
+///
+/// On demote: write the Zone tile slot at `now_ms` using
+/// [`zones::set_tile_at`] (which inherits the prior-row read +
+/// forward-prop discipline), then delete the card row.
+fn sweep_tile_card_demotions(ctx: &ReducerContext, now_ms: u64) {
+    // Identify latest row per card_id with a single pass — the
+    // dead-row sweep already built its own copy and consumed it, so
+    // we redo here. (Sharing across sweeps would require restructuring
+    // gc_sweep; the per-sweep walk is O(N) and N is bounded.)
+    let mut latest_by_id: HashMap<u32, u64> = HashMap::new();
+    for c in ctx.db.cards().iter() {
+        latest_by_id
+            .entry(c.card_id)
+            .and_modify(|m| {
+                if c.valid_at > *m {
+                    *m = c.valid_at;
+                }
+            })
+            .or_insert(c.valid_at);
+    }
+
+    let s = state_flags();
+    let demote_blocking_state_bits =
+        s.dead | s.magnetic | s.pos_need | s.pos_want | s.progress_style_mask;
+
+    let mut to_demote: Vec<crate::cards::Card> = Vec::new();
+    for c in ctx.db.cards().iter() {
+        if latest_by_id.get(&c.card_id) != Some(&c.valid_at) {
+            continue;
+        }
+        let (card_type, _) = unpack_definition(c.packed_definition);
+        if card_type != TILE_CARD_TYPE {
+            continue;
+        }
+        if c.flags_state & demote_blocking_state_bits != 0 {
+            continue;
+        }
+        if cards::touch_count(c.flags_bk) > 0
+            || cards::server_count(c.flags_bk) > 0
+            || cards::slot_hold_count(c.flags_bk) > 0
+            || cards::slot_share_count(c.flags_bk) > 0
+            || cards::drop_hold_count(c.flags_bk) > 0
+            || cards::position_hold_count(c.flags_bk) > 0
+        {
+            continue;
+        }
+        to_demote.push(c);
+    }
+
+    for card in to_demote {
+        let Some(zone) = zones::latest_for(ctx, card.surface, card.macro_zone) else {
+            continue;
+        };
+        if zone.owner_id != card.owner_id {
+            continue;
+        }
+        // Resolve the tile-card's hex. For Free tile-cards the
+        // `(q, r)` bits live directly in `micro_zone`. For OnRoot /
+        // Slot tile-cards (`chain_stitch` repacked `micro_zone` as
+        // `[position:4 | direction:2 | state:2]` and lost the hex
+        // bits), walk the parent chain to the first Free ancestor
+        // and inherit its `(q, r)`. An orphan (Free ancestor reaped
+        // before the tile-card demoted) skips demotion — leave the
+        // card alone rather than writing to the wrong slot.
+        let Some((q, r)) = resolve_tile_hex(ctx, &card, now_ms) else {
+            continue;
+        };
+        let (_, def_id) = unpack_definition(card.packed_definition);
+        let stock0 = cards::tile_stock(card.flags_bk, 0);
+        let stock1 = cards::tile_stock(card.flags_bk, 1);
+        // Fold the card's last state back into the zone slot at
+        // `now_ms`. Forward-prop discipline inside `set_tile_at`
+        // ensures zone rows past `now_ms` get the new slot only
+        // where they were inheriting the old value (no clobber).
+        let written =
+            zones::set_tile_at(ctx, zone.zone_id, now_ms, r, q, def_id, stock0, stock1);
+        if written.is_none() {
+            // Range fail or no prior zone row — leave the card row
+            // alone rather than orphaning the data.
+            continue;
+        }
+        ctx.db.cards().valid_at().delete(card.valid_at);
+    }
+}
+
+/// Resolve a tile-card's local `(q, r)` within its zone. Free cards
+/// read straight out of `micro_zone`'s `(q, r)` bits; OnRoot / Slot
+/// cards walk `micro_location` upward until a Free ancestor is
+/// found, then inherit its hex. Returns `None` for orphan chains
+/// (ancestor reaped) or chains that exceed the depth cap.
+fn resolve_tile_hex(
+    ctx: &ReducerContext,
+    card: &crate::cards::Card,
+    time_ms: u64,
+) -> Option<(u8, u8)> {
+    let mut cur_micro_zone = card.micro_zone;
+    let mut cur_micro_location = card.micro_location;
+    for _ in 0..32 {
+        let (q, r, state) = unpack_micro_zone(cur_micro_zone);
+        if matches!(state, StackedState::Free) {
+            return Some((q, r));
+        }
+        let parent = cards::prior_at(ctx, cur_micro_location, time_ms)?;
+        cur_micro_zone = parent.micro_zone;
+        cur_micro_location = parent.micro_location;
+    }
+    None
 }
 
 /// `players` sweep. No dead-row concept on this table — just the

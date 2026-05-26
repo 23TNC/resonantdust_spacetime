@@ -55,6 +55,8 @@ use spacetimedb::{reducer, ReducerContext};
 
 use crate::action_completion::{self, HexLocation};
 use crate::cards;
+use crate::flags::state_flags;
+use crate::pending_actions;
 use crate::packed::{
     micro_zone_direction, pack_micro_zone, pack_slot_micro_zone, pack_stack_micro_zone,
     unpack_micro_zone, StackedState,
@@ -64,23 +66,17 @@ use crate::players;
 // synthetic-tile lookup. Same `(self, … as _)` pattern as elsewhere.
 use crate::zones::zones as _zones_table;
 
-// `cards/flags.json` bit positions. Append-only — pinned by the data
-// crate. `#[allow(dead_code)]` until Stage 4 (locks/schedule) lands.
-#[allow(dead_code)]
-const FLAG_DEAD: u32 = 1 << 7;
-#[allow(dead_code)]
-const FLAG_SLOT_HOLD: u32 = 1 << 5;
-#[allow(dead_code)]
-const FLAG_POSITION_PRESERVE: u32 = 1 << 14;
-#[allow(dead_code)]
-const FLAG_FORCE_POSITION: u32 = 1 << 11;
-#[allow(dead_code)]
-const FLAG_LIFECYCLE_PENDING: u32 = 1 << 12;
+// Flag bit positions sourced from `content/cards/flags.json` via the
+// `state_flags()` / `bk_flags()` caches. Per-module `const FLAG_*`
+// declarations were retired when the cache landed — see
+// `crate::flags`.
 
 /// Surfaces ≥ this carry hex-tile data inside their backing `Zone` row.
 const SYNTHETIC_HEX_MIN_SURFACE: u8 = 32;
 
-/// Tile card_type — see `movement.rs::TILE_CARD_TYPE`.
+/// `card_type` value for tile-cards (promoted zone tiles). Mirrors
+/// the constant in `gc.rs` / `world_gen.rs` / `movement.rs` — source
+/// of truth lives in `content/cards/types.json` (`tile` = 7).
 const TILE_CARD_TYPE: u8 = 7;
 
 /// Resolve a synthetic tile when a recipe references branch 0 and
@@ -89,28 +85,36 @@ const TILE_CARD_TYPE: u8 = 7;
 /// `(q, r)` from `micro_zone`, returns the tile's `packed_definition`,
 /// per-row stocks (for stock-aware predicate eval), and a
 /// [`HexLocation`] the tape walker uses for tile-side modify ops.
+///
+/// `owner_id_filter` — `Some(player_id)` on
+/// `PLAYER_DIMENSION_LAYER` so the Zone + tile-card lookups
+/// disambiguate which player's dimension is being acted on.
+/// `None` everywhere else (world / mini_zone / pocket use the
+/// `(surface, macro_zone)` tuple as their unique address).
 fn derive_synthetic_hex(
     ctx: &ReducerContext,
     surface: u8,
     macro_zone: u32,
     micro_zone: u8,
+    owner_id_filter: Option<u32>,
+    now_ms: u64,
 ) -> Option<(u16, (u8, u8), HexLocation)> {
     if surface < SYNTHETIC_HEX_MIN_SURFACE {
         return None;
     }
     let (q, r, _state) = unpack_micro_zone(micro_zone);
-    let zone = ctx
-        .db
-        .zones()
-        .macro_zone()
-        .filter(macro_zone)
-        .filter(|z| z.surface == surface)
-        .max_by_key(|z| crate::packed::valid_at_time(z.valid_at))?;
-    let (def_id, stock0, stock1) = zone.tile_at(r, q)?;
-    if def_id == 0 {
-        return None;
-    }
-    let packed_def = crate::packed::pack_definition(TILE_CARD_TYPE, def_id);
+    // Card-priority read: a previously promoted tile-card (which may
+    // carry a mutated def — Phase 4+) wins over the Zone slot.
+    let (packed_def, stock0, stock1) =
+        cards::tile_full_view(ctx, surface, macro_zone, owner_id_filter, q, r, now_ms)?;
+    // HexLocation still references the Zone (zone_id / owner_id) —
+    // Phase 4 reroutes writes through cards and drops HexLocation's
+    // role here. Owner-aware resolution mirrors `tile_full_view` so
+    // the same Zone row backs both reads.
+    let zone = match owner_id_filter {
+        Some(o) => crate::zones::latest_for_owner(ctx, surface, macro_zone, o)?,
+        None => crate::zones::latest_for(ctx, surface, macro_zone)?,
+    };
     Some((
         packed_def,
         (stock0, stock1),
@@ -130,17 +134,68 @@ fn derive_synthetic_hex(
 /// stitch the chain, apply locks, schedule completion. See module
 /// docs for the four-stage flow.
 ///
+/// **Time discipline:** `client_time_ms` is the client's view of
+/// "now" at submission. The reducer uses [`cards::effective_now_ms`]
+/// to resolve a `now_ms` that's `min(client, server)` (within grace
+/// bounds); see that helper's doc for the rejection contract. All
+/// in-reducer time-reads (verifier lookups, chain-stitch writes,
+/// position-hold acquires, action-completion future-stamps) thread
+/// this single value, so the row visibilities the client observes
+/// stay consistent with the writes the server makes.
+///
 /// **Status:** Stage 1 verifier landed; Stages 2-4 stubbed.
 #[reducer]
 #[allow(clippy::too_many_arguments)]
 pub fn propose_action(
     ctx: &ReducerContext,
+    client_time_ms: u64,
     recipe_id: u16,
     surface: u8,
     macro_zone: u32,
     micro_zone: u8,
     root: u32,
     bindings: Vec<Vec<u32>>,
+) -> Result<(), String> {
+    let outcome = propose_action_inner(
+        ctx,
+        client_time_ms,
+        recipe_id,
+        surface,
+        macro_zone,
+        micro_zone,
+        root,
+        &bindings,
+    );
+    // Structured propose log — paired accepted/rejected with the
+    // `dedup_key` so post-hoc you can match an accepted propose to its
+    // completion (which logs nothing today; the registry release in
+    // `commit` is the implicit ack) or to a duplicate-rejection
+    // referencing the same key. The key is computed inline (cheap hash)
+    // so rejections at recipe-lookup / verify_input / validate_bindings
+    // — i.e. before the inner ran far enough to compute it — still
+    // surface the same shape.
+    let dedup_key = pending_actions::dedup_key(recipe_id, root, &bindings);
+    match &outcome {
+        Ok(()) => log::info!(
+            "[propose] verdict=accepted recipe={recipe_id} root={root} dedup_key={dedup_key:#018x}"
+        ),
+        Err(reason) => log::info!(
+            "[propose] verdict=rejected recipe={recipe_id} root={root} dedup_key={dedup_key:#018x} reason={reason:?}"
+        ),
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propose_action_inner(
+    ctx: &ReducerContext,
+    client_time_ms: u64,
+    recipe_id: u16,
+    surface: u8,
+    macro_zone: u32,
+    micro_zone: u8,
+    root: u32,
+    bindings: &[Vec<u32>],
 ) -> Result<(), String> {
     let caller_player_id = players::resolve_caller(ctx)?;
 
@@ -156,27 +211,105 @@ pub fn propose_action(
         ));
     }
 
+    // Resolve the time-base for this reducer. May reject with
+    // `time_drift:client_(behind|ahead)_by=N` — the client's
+    // ActionManager parses these and schedules a retry.
+    let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
+
+    // Owner filter for tile reads/writes on the action's target
+    // surface. Only `PLAYER_DIMENSION_LAYER` has multiple Zones at
+    // the same `(surface, macro_zone)` discriminated by `owner_id`;
+    // every other surface uses `None`. The discriminator is the
+    // caller's `player_id` — recipes targeting another player's
+    // dimension are rejected at the recipe-verify ownership gate
+    // (caller's soul must own the root/hex on private surfaces).
+    let owner_filter = if surface == crate::packed::PLAYER_DIMENSION_LAYER {
+        Some(caller_player_id)
+    } else {
+        None
+    };
+
     // If the recipe references branch 0 and the client sent 0
     // (sentinel) for that binding, resolve a synthetic tile from
     // zone data. Only valid when bindings is exactly [0].
     let synthetic_hex = resolve_synthetic_if_needed(
         ctx,
         recipe_ref,
-        &bindings,
+        bindings,
         surface,
         macro_zone,
         micro_zone,
+        owner_filter,
+        now_ms,
     )?;
 
+    // Promote the synthetic tile to a real Card row and substitute
+    // its `card_id` into the matching binding. After this block, the
+    // dedup gate, plan-builder, chain-stitch, lock acquire, and
+    // commit-time release all operate on a real card; the
+    // `synthetic_hex` carrier remains for the legacy verify/validate
+    // path until Phases 3/7 retire it. See `docs/TILE_AS_CARD.md`.
+    let substituted_bindings: Option<Vec<Vec<u32>>> = if synthetic_hex.is_some() {
+        let (q, r, _) = unpack_micro_zone(micro_zone);
+        let tile_card = cards::find_or_create_tile_card(ctx, surface, macro_zone, owner_filter, q, r, now_ms)
+            .map_err(|e| format!("promote tile: {e}"))?;
+        let mut new_bindings = bindings.to_vec();
+        for (iter_id, it) in recipe_ref.iterators.iter().enumerate() {
+            if it.parent.is_empty()
+                && it.branch == 0
+                && new_bindings
+                    .get(iter_id)
+                    .and_then(|b| b.first().copied())
+                    == Some(0)
+            {
+                new_bindings[iter_id][0] = tile_card.card_id;
+                break;
+            }
+        }
+        Some(new_bindings)
+    } else {
+        None
+    };
+    let bindings: &[Vec<u32>] = substituted_bindings.as_deref().unwrap_or(bindings);
+
     // Stage 1 — Recipe-vs-stack verification.
-    verify_input(ctx, recipe_ref, root, &bindings, synthetic_hex.as_ref())?;
+    verify_input(ctx, recipe_ref, root, &bindings, synthetic_hex.as_ref(), now_ms)?;
 
     // Stage 2 — Stack-vs-world cross-check.
-    validate_bindings(ctx, recipe_ref, recipe_id, &bindings, caller_player_id)?;
+    validate_bindings(
+        ctx, recipe_ref, recipe_id, root, &bindings, caller_player_id, now_ms,
+    )?;
+
+    // In-flight dedup gate. Hash the (recipe, root, bindings) tuple
+    // and reject if a row already exists in `pending_actions`. Catches
+    // every "same exact propose, twice" case regardless of whether
+    // the recipe declares a `slot_hold` / `style.set` / any other
+    // hold. The row is inserted here and deleted in
+    // `action_completion::commit`. Stale rows (commit never ran)
+    // are reaped by the GC sweep. See `pending_actions` module doc.
+    let dedup_key = pending_actions::dedup_key(recipe_id, root, &bindings);
+    if pending_actions::is_in_flight(ctx, dedup_key) {
+        return Err(format!(
+            "duplicate propose: recipe {recipe_id} root {root} bindings already in flight"
+        ));
+    }
+
+    // Walk the output tape into an `ActionPlan` so `commit` can emit
+    // completion-time writes from the same walk that determined the
+    // duration (= `completion_ms - now_ms`). The walk does DB reads
+    // but no writes.
+    let plan = action_completion::plan(
+        ctx,
+        recipe_ref,
+        bindings,
+        root,
+        synthetic_hex.as_ref().map(|(_, _, loc)| loc),
+    )?;
+    let completion_ms = now_ms + plan.duration_ms();
+    pending_actions::install(ctx, dedup_key, completion_ms);
 
     // Stage 3 — Chain-stitch (write per-card position bytes for root
-    // and every top-level iterator binding).
-    let now_ms = cards::now_ms(ctx);
+    // and every top-level iterator binding) stamped at `now_ms`.
     chain_stitch(
         ctx,
         recipe_ref,
@@ -184,25 +317,27 @@ pub fn propose_action(
         surface,
         macro_zone,
         micro_zone,
-        &bindings,
+        bindings,
+        now_ms,
     )?;
 
-    // Stage 4 — Locks (propose-time claims).
-    apply_locks(recipe_ref, &bindings, root, now_ms, ctx);
+    // Stage 4 — Locks (propose-time claims). Reads `plan.holds()`
+    // so the apply path and commit-time release mirror exactly — see
+    // `action_completion::compute_holds`.
+    apply_locks(&plan, now_ms, ctx);
 
-    // Run the tape walker — emits completion-time future-stamped
-    // writes (destroy / create / lock release) at
-    // `now_ms + walker.duration * 1000`. The walker computes
-    // `walker.duration` from `sys.duration.set` statements in the
-    // output tape.
-    action_completion::apply(
+    // Emit completion-time future-stamped writes (destroy / create /
+    // lock release) at `completion_ms`. The dedup_key is threaded
+    // through so commit can release the registry row in the same
+    // pass.
+    action_completion::commit(
         ctx,
-        recipe_ref,
-        &bindings,
+        plan,
+        bindings,
         root,
-        synthetic_hex.map(|(_, _, loc)| loc),
         now_ms,
         caller_player_id,
+        dedup_key,
     )?;
 
     Ok(())
@@ -220,6 +355,8 @@ fn resolve_synthetic_if_needed(
     surface: u8,
     macro_zone: u32,
     micro_zone: u8,
+    owner_id_filter: Option<u32>,
+    now_ms: u64,
 ) -> Result<Option<(u16, (u8, u8), HexLocation)>, String> {
     for (iter_id, it) in recipe.iterators.iter().enumerate() {
         if it.parent.is_empty() && it.branch == 0 {
@@ -230,7 +367,7 @@ fn resolve_synthetic_if_needed(
             // tiles. If the recipe uses slot.0.1+, those must be
             // real cards.
             if !binding.is_empty() && binding[0] == 0 {
-                let synth = derive_synthetic_hex(ctx, surface, macro_zone, micro_zone)
+                let synth = derive_synthetic_hex(ctx, surface, macro_zone, micro_zone, owner_id_filter, now_ms)
                     .ok_or_else(|| {
                         format!(
                             "recipe references branch 0 with synthetic sentinel \
@@ -249,15 +386,21 @@ fn resolve_synthetic_if_needed(
 
 /// Walk every input statement and evaluate its predicate. Errors
 /// are prefixed with the statement index for findability.
+///
+/// `now_ms` is the effective time-base resolved by
+/// [`cards::effective_now_ms`] — passed through to every card lookup
+/// so the verifier reads the card state the client thinks it's
+/// referencing.
 fn verify_input(
     ctx: &ReducerContext,
     recipe: &Recipe,
     root: u32,
     bindings: &[Vec<u32>],
     synthetic_hex: Option<&(u16, (u8, u8), HexLocation)>,
+    now_ms: u64,
 ) -> Result<(), String> {
     for (i, stmt) in recipe.input.iter().enumerate() {
-        verify_stmt(ctx, recipe, stmt, root, bindings, synthetic_hex)
+        verify_stmt(ctx, recipe, stmt, root, bindings, synthetic_hex, now_ms)
             .map_err(|e| format!("input[{i}]: {e}"))?;
     }
     Ok(())
@@ -276,6 +419,7 @@ fn verify_stmt(
     root: u32,
     bindings: &[Vec<u32>],
     synthetic_hex: Option<&(u16, (u8, u8), HexLocation)>,
+    now_ms: u64,
 ) -> Result<(), String> {
     let segs = stmt.segments.as_slice();
     let op = segs
@@ -300,6 +444,7 @@ fn verify_stmt(
                 root,
                 bindings,
                 synthetic_hex,
+                now_ms,
             )?;
             let def = decode_definition(packed_def)
                 .map_err(|e| format!("decode card def: {e}"))?
@@ -347,6 +492,7 @@ fn verify_stmt(
                 root,
                 bindings,
                 synthetic_hex,
+                now_ms,
             )?;
             let total = aspect_total(packed_def, aspect_id, stocks)?;
             if total < min_value {
@@ -397,7 +543,7 @@ fn aspect_total(
         .aspects
         .iter()
         .filter(|(a, _)| is_aspect_descendant(*a, aspect).unwrap_or(false))
-        .map(|(_, v)| *v)
+        .map(|(_, v)| *v as i32)
         .sum();
     Ok(total)
 }
@@ -424,6 +570,7 @@ fn resolve_target(
     root: u32,
     bindings: &[Vec<u32>],
     synthetic_hex: Option<&(u16, (u8, u8), HexLocation)>,
+    now_ms: u64,
 ) -> Result<(u16, Option<(u8, u8)>), String> {
     // Resolve the first segment to a card_id. Either `root` or a
     // top-level `Slot` reference.
@@ -490,7 +637,7 @@ fn resolve_target(
     while i < path.len() {
         match &path[i] {
             Seg::Word(w) if w == "owner" => {
-                let card = cards::latest(ctx, card_id)
+                let card = cards::prior_at(ctx, card_id, now_ms)
                     .ok_or_else(|| format!("card {card_id} not found"))?;
                 if card.owner_id == 0 {
                     return Err(format!(
@@ -502,7 +649,7 @@ fn resolve_target(
                 i += 1;
             }
             Seg::Word(w) if w == "parent" => {
-                let card = cards::latest(ctx, card_id)
+                let card = cards::prior_at(ctx, card_id, now_ms)
                     .ok_or_else(|| format!("card {card_id} not found"))?;
                 if card.micro_location == 0 {
                     return Err(format!(
@@ -568,7 +715,7 @@ fn resolve_target(
                 // — no check needed here since the server is the one
                 // writing it.)
                 if !it.parent.is_empty() {
-                    let card = cards::latest(ctx, resolved)
+                    let card = cards::prior_at(ctx, resolved, now_ms)
                         .ok_or_else(|| format!("card {resolved} not found"))?;
                     let actual_dir = micro_zone_direction(card.micro_zone);
                     if actual_dir != it.branch {
@@ -592,9 +739,24 @@ fn resolve_target(
         }
     }
 
-    let card = cards::latest(ctx, card_id)
+    let card = cards::prior_at(ctx, card_id, now_ms)
         .ok_or_else(|| format!("resolve target: card {card_id} not found"))?;
-    Ok((card.packed_definition, None))
+    // For tile-cards (the promoted-zone-tile family), surface
+    // `tile_stock_{0,1}` from `flags_bk` so stock-bound aspect
+    // predicates resolve against the card's current stock — same
+    // shape the legacy `synthetic_hex` branch above returns.
+    // Non-tile cards report `None` (their def.stock entries, if any,
+    // never had a row-stock channel pre-tile-as-card).
+    let (card_type, _) = crate::packed::unpack_definition(card.packed_definition);
+    let stocks = if card_type == TILE_CARD_TYPE {
+        Some((
+            cards::tile_stock(card.flags_bk, 0),
+            cards::tile_stock(card.flags_bk, 1),
+        ))
+    } else {
+        None
+    };
+    Ok((card.packed_definition, stocks))
 }
 
 // ----- Stage 2: stack-vs-world validation -----------------------------
@@ -614,14 +776,72 @@ fn resolve_target(
 ///
 /// Duplicate detection covers the whole bindings 2-D array; the
 /// same card can't appear at two different (iter, offset) slots.
-/// Card_id 0 is the synthetic-tile sentinel and is skipped.
+///
+/// **Card_id 0 handling.** Under the tile-as-card rework
+/// (`docs/TILE_AS_CARD.md`), `propose_action_inner` substitutes the
+/// branch-0 sentinel with the promoted tile-card's `card_id` BEFORE
+/// this function runs — so in normal flow no `0` reaches this loop.
+/// The `if card_id == 0 { continue; }` guard remains defensively
+/// for any future code path that might pass an unsubstituted 0 (e.g.,
+/// a recipe shape with `0` in a non-branch-0 position).
 fn validate_bindings(
     ctx: &ReducerContext,
     recipe: &Recipe,
     recipe_id: u16,
+    root: u32,
     bindings: &[Vec<u32>],
     caller_player_id: u32,
+    now_ms: u64,
 ) -> Result<(), String> {
+    // Root: dead-flag gate + hold-kind gate. The hold-kind matrix
+    // mirrors the per-binding loop below but reads `recipe.root_slot_hold`
+    // in place of `iter.slot_hold`. Duplicate-detection of the exact
+    // same propose tuple is owned by the `pending_actions` registry
+    // gate in `propose_action`; the hold-kind gate here is what catches
+    // **conflicting** in-flight actions on the same root.
+    // Hold-kind gate matrix (unified-counts era):
+    // - `slot_hold_count > 0` means an exclusive (`claim.` / `use.`)
+    //   hold is in flight — rejects everyone.
+    // - `slot_share_count > 0` means shared (`borrow.` / `share.`)
+    //   holds are in flight — rejects only new claims, not borrows.
+    // - `touch_count >= TOUCH_COUNT_CLIENT_CAP` means the per-card
+    //   client-concurrency ceiling is hit — rejects everyone.
+    //   Caps the hold-count fields well below their u3 saturation
+    //   under realistic gameplay.
+    let s = state_flags();
+    if root != 0 {
+        let card = cards::prior_at(ctx, root, now_ms)
+            .ok_or_else(|| format!("root card {root} not found"))?;
+        if card.flags_state & s.dead != 0 {
+            return Err(format!("root card {root} is dead"));
+        }
+        if cards::slot_hold_count(card.flags_bk) > 0 {
+            return Err(format!(
+                "root card {root} is exclusively held by another in-flight action"
+            ));
+        }
+        if recipe.root_slot_hold && cards::slot_share_count(card.flags_bk) > 0 {
+            return Err(format!(
+                "root card {root} is shared-held by another in-flight action; cannot claim"
+            ));
+        }
+        if cards::touch_count(card.flags_bk) >= crate::flags::TOUCH_COUNT_CLIENT_CAP {
+            return Err(format!(
+                "root card {root} has too many concurrent in-flight actions (cap {})",
+                crate::flags::TOUCH_COUNT_CLIENT_CAP
+            ));
+        }
+        // Drop-onto-target gate: chain_stitch will parent every
+        // top-level iterator binding onto root via the bindings'
+        // `micro_location = root` write. A drop-locked root rejects
+        // every such stitch attempt.
+        if cards::drop_hold_count(card.flags_bk) > 0 {
+            return Err(format!(
+                "root card {root} blocks stacking (drop_hold_count > 0)"
+            ));
+        }
+    }
+
     let mut seen: BTreeSet<u32> = BTreeSet::new();
     for (iter_id, binding_row) in bindings.iter().enumerate() {
         let iter_locks = recipe
@@ -638,21 +858,25 @@ fn validate_bindings(
                     "card {card_id} appears more than once in bindings"
                 ));
             }
-            let card = cards::latest(ctx, card_id)
+            let card = cards::prior_at(ctx, card_id, now_ms)
                 .ok_or_else(|| format!("card {card_id} not found"))?;
-            if card.flags & FLAG_DEAD != 0 {
+            if card.flags_state & s.dead != 0 {
                 return Err(format!("card {card_id} is dead"));
             }
-            // Borrow iterators (lookup-only, no `slot_hold` claim)
-            // skip the in-flight check so concurrent recipes can
-            // simultaneously borrow the same tool — e.g. two
-            // cut_tree actions running in parallel both referencing
-            // the soul's axe. Non-borrow (locked) iterators still
-            // reject if their bindings are already slot_held by
-            // another action.
-            if iter_locks && card.flags & FLAG_SLOT_HOLD != 0 {
+            if cards::slot_hold_count(card.flags_bk) > 0 {
                 return Err(format!(
-                    "card {card_id} is already claimed by another in-flight action"
+                    "card {card_id} is exclusively held by another in-flight action"
+                ));
+            }
+            if iter_locks && cards::slot_share_count(card.flags_bk) > 0 {
+                return Err(format!(
+                    "card {card_id} is shared-held by another in-flight action; cannot claim"
+                ));
+            }
+            if cards::touch_count(card.flags_bk) >= crate::flags::TOUCH_COUNT_CLIENT_CAP {
+                return Err(format!(
+                    "card {card_id} has too many concurrent in-flight actions (cap {})",
+                    crate::flags::TOUCH_COUNT_CLIENT_CAP
                 ));
             }
             // Ownership: walk up to the responsible player. Either
@@ -667,7 +891,7 @@ fn validate_bindings(
                 ));
             }
             // Magnetic discipline.
-            if card.flags & FLAG_LIFECYCLE_PENDING != 0 {
+            if card.flags_state & s.magnetic != 0 {
                 let def = decode_definition(card.packed_definition)
                     .map_err(|e| format!("decode def for magnetic check: {e}"))?
                     .ok_or_else(|| format!("card {card_id} has unknown def"))?;
@@ -714,11 +938,13 @@ fn chain_stitch(
     macro_zone: u32,
     micro_zone: u8,
     bindings: &[Vec<u32>],
+    now_ms: u64,
 ) -> Result<(), String> {
     if root != 0 {
         let (q, r, _) = unpack_micro_zone(micro_zone);
         let root_micro_zone = pack_micro_zone(q, r, StackedState::Free);
-        cards::update_with(ctx, root, |c| {
+        let pos_need = state_flags().pos_need;
+        cards::update_with_at(ctx, root, now_ms, |c| {
             c.surface = surface;
             c.macro_zone = macro_zone;
             c.micro_zone = root_micro_zone;
@@ -726,7 +952,7 @@ fn chain_stitch(
             // for action-rooted cards we don't carry sub-tile coords,
             // so 0 it.
             c.micro_location = 0;
-            c.flags |= FLAG_FORCE_POSITION;
+            c.flags_state |= pos_need;
         });
     }
 
@@ -762,12 +988,13 @@ fn chain_stitch(
                     binding_row[offset - 1],
                 )
             };
-            cards::update_with(ctx, card_id, |c| {
+            let pos_need = state_flags().pos_need;
+            cards::update_with_at(ctx, card_id, now_ms, |c| {
                 c.surface = surface;
                 c.macro_zone = macro_zone;
                 c.micro_zone = new_micro_zone;
                 c.micro_location = parent_id;
-                c.flags |= FLAG_FORCE_POSITION;
+                c.flags_state |= pos_need;
             });
         }
     }
@@ -776,86 +1003,47 @@ fn chain_stitch(
 
 // ----- Stage 4: locks ------------------------------------------------
 
-/// Apply `slot_hold` to every bound card (claims it for this action)
-/// and `position_hold` (ref-counted) to top-level chain cards
-/// (preserves chain integrity against movement / other actions).
+/// Acquire the hold flavors `plan.holds()` declares for every
+/// touched card, at `now_ms`. Three independent fields per card:
 ///
-/// Nested-iterator bindings get only `slot_hold` — they already
-/// live in their own chains, and that chain's structure isn't this
-/// action's responsibility to preserve.
+/// - `slot_hold` (single bit, exclusive) — set for `claim.` / `use.`
+///   iterators. Validate_bindings rejects new claims/uses if this bit
+///   is set on any of their bindings.
+/// - `slot_share_count` (3-bit refcount, multi-holder) — incremented
+///   for `borrow.` / `share.` iterators. Validate_bindings rejects
+///   new claims/uses if `count > 0`; new borrows are allowed
+///   (increment further) as long as `slot_hold == 0`.
+/// - `position_hold_count` (3-bit refcount) — incremented per
+///   `it.position_hold == true`. Used by the position-pin /
+///   chain-stitch infrastructure to block movement.
 ///
-/// **Note:** Phase 8 (`action_completion::apply`) will release these
-/// locks at completion time. Until Phase 8 lands, locks applied
-/// here persist indefinitely; expect to wipe state between dev
-/// iterations.
+/// Reads the (card_id → HoldKinds) map from the plan rather than
+/// re-deriving inline so the acquire pass here and the release pass
+/// in `action_completion::commit` cannot drift — same map, same
+/// keys, same kinds.
 fn apply_locks(
-    recipe: &Recipe,
-    bindings: &[Vec<u32>],
-    root: u32,
+    plan: &action_completion::ActionPlan,
     now_ms: u64,
     ctx: &ReducerContext,
 ) {
-    // Hold policy is fully explicit per the parser's prefix tokens
-    // (`borrow.` / `share.` / `claim.` / `use.`):
-    //   - `slot_hold`     → FLAG_SLOT_HOLD (exclusive claim + blocks user pickup)
-    //   - `position_hold` → ref-counted movement lock
-    //
-    // The parser aggregates per-statement prefixes to per-iterator
-    // and per-root tuples via last-write-wins. No more cross-anchor
-    // inference here — the recipe author writes what they want.
-
-    // Root: explicit anchor tokens, plus client root-promotion (root
-    // may appear in an iterator's bindings when a `slot.X.0` recipe
-    // matched against a stack whose bottom is the loose root).
-    let mut claim_root = recipe.anchors.root && recipe.root_slot_hold;
-    let mut pin_root = recipe.anchors.root && recipe.root_position_hold;
-    for (i, it) in recipe.iterators.iter().enumerate() {
-        let row = match bindings.get(i) {
-            Some(r) => r,
-            None => continue,
-        };
-        if row.iter().any(|&id| id == root) {
-            if it.slot_hold {
-                claim_root = true;
-            }
-            if it.position_hold {
-                pin_root = true;
-            }
-        }
-    }
-    if root != 0 {
-        if claim_root {
-            cards::update_with(ctx, root, |c| {
-                c.flags |= FLAG_SLOT_HOLD;
-            });
-        }
-        if pin_root {
-            cards::acquire_position_hold(ctx, root, now_ms);
-        }
-    }
-
-    for (iter_id, it) in recipe.iterators.iter().enumerate() {
-        if !it.slot_hold && !it.position_hold {
+    for (&card_id, kinds) in plan.holds() {
+        if card_id == 0 {
             continue;
         }
-        for &card_id in &bindings[iter_id] {
-            if card_id == 0 {
-                continue;
-            }
-            // Root's locks were applied above (with promotion-aware
-            // union across iterators); skip here to avoid double-
-            // acquire (would leak the position_hold refcount).
-            if card_id == root {
-                continue;
-            }
-            if it.position_hold {
-                cards::acquire_position_hold(ctx, card_id, now_ms);
-            }
-            if it.slot_hold {
-                cards::update_with(ctx, card_id, |c| {
-                    c.flags |= FLAG_SLOT_HOLD;
-                });
-            }
+        // `touch_count` increments once per recipe per card — the
+        // map is already per-card deduplicated by `compute_holds`,
+        // so root-promotion paths don't double-count. The cap is
+        // enforced in `validate_bindings`; by the time we reach
+        // here, the cap is known clear.
+        cards::acquire_touch(ctx, card_id, now_ms);
+        if kinds.slot_hold {
+            cards::acquire_slot_hold(ctx, card_id, now_ms);
+        }
+        if kinds.slot_share {
+            cards::acquire_slot_share(ctx, card_id, now_ms);
+        }
+        if kinds.position_hold {
+            cards::acquire_position_hold(ctx, card_id, now_ms);
         }
     }
 }

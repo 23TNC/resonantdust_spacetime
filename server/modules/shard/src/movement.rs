@@ -1,17 +1,16 @@
 use std::sync::OnceLock;
 
 use resonantdust_content::definition_core::{
-    decode_definition, trait_id as resolve_trait_id, TraitId,
+    aspect_id as resolve_aspect_id, decode_definition, AspectId,
 };
 use spacetimedb::{reducer, ReducerContext, SpacetimeType};
 
 use crate::cards;
 use crate::packed::{
     pack_definition, pack_macro_zone, pack_micro_zone, unpack_macro_zone,
-    unpack_micro_zone, valid_at_time, StackedState,
+    unpack_micro_zone, StackedState,
 };
 use crate::players;
-use crate::zones::zones as _zones_table;
 
 // ---- tuning ---------------------------------------------------------
 
@@ -21,6 +20,7 @@ use crate::zones::zones as _zones_table;
 /// so a cost-10 tile takes 1 second, a cost-100 tile takes 10
 /// seconds. At `speed: 1` the same terrain takes 10× longer.
 const DEFAULT_SOUL_SPEED: f32 = 10.0;
+
 
 // ---- pathfinding helpers ------------------------------------------
 //
@@ -56,7 +56,20 @@ fn hex_distance(a: Coord, b: Coord) -> i32 {
 /// the hex is treated as impassable (`None`) — the mini_zone occludes
 /// whatever's underneath. This matches `actions::derive_synthetic_hex`'s
 /// resolver so pathfinding and recipe-target lookups agree.
-fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u16> {
+///
+/// **Owner discrimination.** `owner_id_filter` is the per-surface
+/// discriminator threaded through to `cards::tile_def_id_view`:
+/// `Some(player_id)` on `PLAYER_DIMENSION_LAYER` where multiple
+/// players' Zones share `(surface, macro_zone)`; `None` elsewhere.
+/// The mini_zone-overlay branch always uses `None` because mini_zone
+/// macro_zones are anchor-card-ids (unique per anchor).
+fn tile_def_at(
+    ctx: &ReducerContext,
+    surface: u8,
+    owner_id_filter: Option<u32>,
+    c: Coord,
+    time_ms: u64,
+) -> Option<u16> {
     let macro_q = c.q.div_euclid(8);
     let macro_r = c.r.div_euclid(8);
     let local_q = c.q.rem_euclid(8) as u8;
@@ -66,10 +79,10 @@ fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u16> {
     if surface == crate::packed::WORLD_LAYER {
         let micro_zone = pack_micro_zone(local_q, local_r, crate::packed::StackedState::Free);
         if let Some(anchor) = crate::mini_zone::anchor_covering_hex(ctx, macro_zone, micro_zone) {
-            // Mini_zone covers this hex. Read its tile byte at the
-            // corresponding `(q, r)` within the mini_zone's grid.
-            let zone =
-                crate::zones::latest_for(ctx, crate::packed::MINI_ZONE_LAYER, anchor.card_id)?;
+            // Mini_zone covers this hex. Read its tile def at the
+            // corresponding `(q, r)` within the mini_zone's grid,
+            // routed through the card-priority view so a promoted
+            // mini_zone tile-card surfaces.
             let (anchor_local_q, anchor_local_r, _) =
                 unpack_micro_zone(anchor.micro_zone);
             let (anchor_macro_q, anchor_macro_r) = unpack_macro_zone(anchor.macro_zone);
@@ -78,21 +91,24 @@ fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u16> {
             // Mini_zone grid is centered at (3, 3) in 7×7 layout.
             let mz_q = (3 + dq) as u8;
             let mz_r = (3 + dr) as u8;
-            let def_id = zone.tile_def_id_at(mz_r, mz_q)?;
-            // `0` = empty mini_zone cell. Treat as impassable — the
-            // mini_zone occludes the underlying world tile.
-            return if def_id == 0 { None } else { Some(def_id) };
+            // `0` (or no Zone) = empty mini_zone cell. Treat as
+            // impassable — the mini_zone occludes the underlying
+            // world tile. Mini_zone uses anchor.card_id as macro_zone
+            // (unique per mini_zone) — no owner filter needed.
+            return cards::tile_def_id_view(
+                ctx,
+                crate::packed::MINI_ZONE_LAYER,
+                anchor.card_id,
+                /* owner_id_filter */ None,
+                mz_q,
+                mz_r,
+                time_ms,
+            )
+            .filter(|&d| d != 0);
         }
     }
 
-    let zone = ctx
-        .db
-        .zones()
-        .macro_zone()
-        .filter(macro_zone)
-        .filter(|z| z.surface == surface)
-        .max_by_key(|z| valid_at_time(z.valid_at))?;
-    zone.tile_def_id_at(local_r, local_q)
+    cards::tile_def_id_view(ctx, surface, macro_zone, owner_id_filter, local_q, local_r, time_ms)
 }
 
 /// `card_type` of the tile-card bucket. Tiles live under `tile/` in
@@ -103,25 +119,25 @@ fn tile_def_at(ctx: &ReducerContext, surface: u8, c: Coord) -> Option<u16> {
 /// the per-tile field to u12).
 const TILE_CARD_TYPE: u8 = 7;
 
-/// `cost` trait id, resolved once via `trait_id("cost")` and cached.
-/// Lazy-init avoids paying the trait-registry build on every
-/// pathfinding call (registry builds once per process via
-/// `OnceLock`, but the `BTreeMap` lookup still has a cost). `0` is
-/// the `TRAIT_NONE` sentinel — if the trait isn't declared in
-/// `traits.json`, the cache stays at `0` and `tile_cost` falls back
-/// to `DEFAULT_TILE_COST`.
-static COST_TRAIT_ID: OnceLock<TraitId> = OnceLock::new();
-fn cost_trait_id() -> TraitId {
-    *COST_TRAIT_ID.get_or_init(|| resolve_trait_id("cost").ok().flatten().unwrap_or(0))
+/// `cost` aspect id (a trait-category aspect — declared in the
+/// `traits` section of `aspects.json`), resolved once and cached.
+/// Lazy-init avoids paying the aspect-registry build on every
+/// pathfinding call. `0` is the `ASPECT_NONE` sentinel — if the
+/// aspect isn't declared, the cache stays at `0` and `tile_cost`
+/// falls back to `DEFAULT_TILE_COST`.
+static COST_TRAIT_ID: OnceLock<AspectId> = OnceLock::new();
+fn cost_trait_id() -> AspectId {
+    *COST_TRAIT_ID.get_or_init(|| resolve_aspect_id("cost").ok().flatten().unwrap_or(0))
 }
 
-/// `speed` trait id, same cache pattern as [`cost_trait_id`]. Soul
-/// definitions carry this trait (see `content/cards/data/souls/*.json`)
-/// to set their movement rate. Falls back to `0` when the trait isn't
+/// `speed` aspect id (a feature-category aspect — declared in the
+/// `features` section of `aspects.json`). Soul definitions carry
+/// this so souls have a per-card movement rate. Same cache pattern
+/// as [`cost_trait_id`]. Falls back to `0` when the aspect isn't
 /// declared, in which case `soul_speed` returns `DEFAULT_SOUL_SPEED`.
-static SPEED_TRAIT_ID: OnceLock<TraitId> = OnceLock::new();
-fn speed_trait_id() -> TraitId {
-    *SPEED_TRAIT_ID.get_or_init(|| resolve_trait_id("speed").ok().flatten().unwrap_or(0))
+static SPEED_TRAIT_ID: OnceLock<AspectId> = OnceLock::new();
+fn speed_trait_id() -> AspectId {
+    *SPEED_TRAIT_ID.get_or_init(|| resolve_aspect_id("speed").ok().flatten().unwrap_or(0))
 }
 
 /// Fallback when a tile def carries no `cost` trait. Cost is measured
@@ -146,7 +162,7 @@ fn tile_cost(def_id: u16) -> Option<f32> {
     }
     let packed = pack_definition(TILE_CARD_TYPE, def_id);
     let def = decode_definition(packed).ok().flatten()?;
-    Some(def.trait_value(cost_trait_id()).unwrap_or(DEFAULT_TILE_COST))
+    Some(def.aspect_value(cost_trait_id()).unwrap_or(DEFAULT_TILE_COST))
 }
 
 /// Read a soul card's `speed` trait (in cost-units-per-second),
@@ -156,7 +172,7 @@ fn soul_speed(packed_def: u16) -> f32 {
     decode_definition(packed_def)
         .ok()
         .flatten()
-        .and_then(|def| def.trait_value(speed_trait_id()))
+        .and_then(|def| def.aspect_value(speed_trait_id()))
         .unwrap_or(DEFAULT_SOUL_SPEED)
 }
 
@@ -236,16 +252,38 @@ pub struct TilePoint {
 #[reducer]
 pub fn move_soul(
     ctx: &ReducerContext,
+    client_time_ms: u64,
     soul_id: u32,
     path: Vec<TilePoint>,
 ) -> Result<(), String> {
     let player_id = players::resolve_caller(ctx)?;
-    let soul = cards::latest(ctx, soul_id)
+    let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
+    let soul = cards::prior_at(ctx, soul_id, now_ms)
         .ok_or_else(|| format!("movement: soul card {soul_id} not found"))?;
     if soul.owner_id != player_id {
         return Err(format!(
             "movement: soul card {soul_id} is owned by player {} (not {player_id})",
             soul.owner_id
+        ));
+    }
+
+    // Hold-kind gate. Souls aren't currently slot/share/position-held by
+    // any action today (recipes don't bind souls as iterators), but the
+    // check is free insurance against future recipes that might. Moving
+    // a held soul would shift it out from under an in-flight chain.
+    if cards::slot_hold_count(soul.flags_bk) > 0 {
+        return Err(format!(
+            "movement: soul card {soul_id} is exclusively held by an in-flight action"
+        ));
+    }
+    if cards::slot_share_count(soul.flags_bk) > 0 {
+        return Err(format!(
+            "movement: soul card {soul_id} is shared-held by an in-flight action (borrow/share)"
+        ));
+    }
+    if cards::position_hold_count(soul.flags_bk) > 0 {
+        return Err(format!(
+            "movement: soul card {soul_id} is position-held by an in-flight action"
         ));
     }
 
@@ -270,6 +308,18 @@ pub fn move_soul(
 
     let speed = soul_speed(soul.packed_definition);
 
+    // Owner filter for `tile_def_at` — only needed when the soul is
+    // inside a `PLAYER_DIMENSION_LAYER` (62), where multiple players'
+    // Zones share the same `(surface, macro_zone)`. `soul.owner_id`
+    // is the player_id directly (souls carry `FLAG_OWNED_BY_PLAYER`),
+    // which is the canonical surface-62 discriminator. Cross-surface
+    // paths are rejected below, so this filter applies to every step.
+    let owner_filter = if soul.surface == crate::packed::PLAYER_DIMENSION_LAYER {
+        Some(soul.owner_id)
+    } else {
+        None
+    };
+
     // First pass: full validation walk. Resolve every step's tile cost
     // up-front so we don't write rows for a path that turns out to be
     // invalid halfway through.
@@ -280,7 +330,7 @@ pub fn move_soul(
     // (for `step_cost`), and stashing both with each step keeps the
     // loop straightforward.
     let mut decoded: Vec<(TilePoint, Coord, f32)> = Vec::with_capacity(path.len());
-    let start_cost = tile_def_at(ctx, soul.surface, prev)
+    let start_cost = tile_def_at(ctx, soul.surface, owner_filter, prev, now_ms)
         .and_then(tile_cost)
         .ok_or_else(|| {
             format!(
@@ -314,7 +364,7 @@ pub fn move_soul(
                 coord.q, coord.r, prev.q, prev.r,
             ));
         }
-        let to_def = tile_def_at(ctx, point.surface, coord).ok_or_else(|| {
+        let to_def = tile_def_at(ctx, point.surface, owner_filter, coord, now_ms).ok_or_else(|| {
             format!(
                 "movement: step {idx} ({}, {}) — no zone data (off-map or subscription gap server-side)",
                 coord.q, coord.r,
@@ -337,11 +387,10 @@ pub fn move_soul(
     // Validation passed — scrub any future-stamped rows on the soul
     // from a prior path so the new path's writes start from a clean
     // future. Same call site / semantics as today's `move_soul`.
-    let now = cards::now_ms(ctx);
     cards::scrub_or_repath_position_forward(
         ctx,
         soul.card_id,
-        now,
+        now_ms,
         soul.surface,
         soul.macro_zone,
         soul.micro_zone,
@@ -352,11 +401,11 @@ pub fn move_soul(
     // `step_cost` formula `move_soul` uses, force strictly-ascending
     // `valid_at` to dodge PK collisions on cheap consecutive steps.
     let mut elapsed: f32 = 0.0;
-    let mut last_time = now;
+    let mut last_time = now_ms;
     let mut from_cost = start_cost;
     for (point, _coord, to_cost) in decoded {
         elapsed += step_cost(speed, from_cost, to_cost);
-        let mut step_time = now.saturating_add((elapsed * 1_000.0).ceil() as u64);
+        let mut step_time = now_ms.saturating_add((elapsed * 1_000.0).ceil() as u64);
         if step_time <= last_time {
             step_time = last_time.saturating_add(1);
         }
