@@ -103,7 +103,7 @@ fn derive_synthetic_hex(
     // HexLocation still references the Zone (zone_id / owner_id) —
     // Phase 4 reroutes writes through cards and drops HexLocation's
     // role here.
-    let zone = crate::zones::latest_for(ctx, surface, macro_zone)?;
+    let zone = crate::zones::latest_for(ctx, crate::packed::with_surface(macro_zone, surface))?;
     Some((
         packed_def,
         (stock0, stock1),
@@ -919,8 +919,7 @@ fn chain_stitch(
         let root_micro_zone = pack_micro_zone(q, r, StackedState::Free);
         let pos_need = state_flags().pos_need;
         cards::update_with_at(ctx, root, now_ms, |c| {
-            c.surface = surface;
-            c.macro_zone = macro_zone;
+            c.macro_zone = crate::packed::with_surface(macro_zone, surface);
             c.micro_zone = root_micro_zone;
             // Free state uses micro_location for [x, y] pixel coords;
             // for action-rooted cards we don't carry sub-tile coords,
@@ -964,8 +963,7 @@ fn chain_stitch(
             };
             let pos_need = state_flags().pos_need;
             cards::update_with_at(ctx, card_id, now_ms, |c| {
-                c.surface = surface;
-                c.macro_zone = macro_zone;
+                c.macro_zone = crate::packed::with_surface(macro_zone, surface);
                 c.micro_zone = new_micro_zone;
                 c.micro_location = parent_id;
                 c.flags_state |= pos_need;

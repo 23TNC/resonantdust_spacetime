@@ -308,7 +308,7 @@ pub fn move_soul(
     // (for `step_cost`), and stashing both with each step keeps the
     // loop straightforward.
     let mut decoded: Vec<(TilePoint, Coord, f32)> = Vec::with_capacity(path.len());
-    let start_cost = tile_def_at(ctx, soul.surface, prev, now_ms)
+    let start_cost = tile_def_at(ctx, crate::packed::surface_of(soul.macro_zone), prev, now_ms)
         .and_then(tile_cost)
         .ok_or_else(|| {
             format!(
@@ -319,10 +319,10 @@ pub fn move_soul(
     let mut prev_cost = start_cost;
 
     for (idx, &point) in path.iter().enumerate() {
-        if point.surface != soul.surface {
+        if point.surface != crate::packed::surface_of(soul.macro_zone) {
             return Err(format!(
                 "movement: step {idx} surface {} differs from soul surface {} (cross-surface not supported)",
-                point.surface, soul.surface,
+                point.surface, crate::packed::surface_of(soul.macro_zone),
             ));
         }
         let (lq, lr, state) = unpack_micro_zone(point.micro_zone);
@@ -369,7 +369,6 @@ pub fn move_soul(
         ctx,
         soul.card_id,
         now_ms,
-        soul.surface,
         soul.macro_zone,
         soul.micro_zone,
         soul.micro_location,
@@ -390,8 +389,7 @@ pub fn move_soul(
         last_time = step_time;
 
         cards::update_with_at(ctx, soul.card_id, step_time, |c| {
-            c.surface = point.surface;
-            c.macro_zone = point.macro_zone;
+            c.macro_zone = crate::packed::with_surface(point.macro_zone, point.surface);
             c.micro_zone = point.micro_zone;
             c.micro_location = 0;
         });

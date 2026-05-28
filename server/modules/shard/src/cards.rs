@@ -234,7 +234,9 @@ pub struct Card {
     pub valid_at: u64,
     #[index(btree)]
     pub card_id: u32,
-    pub surface: u8,
+    /// Packed location key `[reserved:u32 | surface:u8 | payload:u24]`.
+    /// `surface` is bits 24-31 (read via `packed::surface_of`); no separate
+    /// surface column. Payload is world `(zone_q, zone_r)` or a container id.
     #[index(btree)]
     pub macro_zone: u64,
     pub micro_zone: u8,
@@ -501,8 +503,9 @@ fn write_at(ctx: &ReducerContext, mut card: Card, time_ms: u64) -> Card {
     card.flags_bk &= !(bk.position_dirty | bk.data_dirty);
     let (auto_pos, auto_data) = match prev_latest.as_ref() {
         Some(prev) => {
-            let pos_changed = card.surface != prev.surface
-                || card.macro_zone != prev.macro_zone
+            // `macro_zone` encodes surface (bits 24-31), so its diff covers
+            // a surface change too.
+            let pos_changed = card.macro_zone != prev.macro_zone
                 || card.micro_zone != prev.micro_zone
                 || card.micro_location != prev.micro_location;
             // Data diff: `flags_state` is the data field directly —
@@ -605,7 +608,8 @@ fn cascade_to_state_3_followers(
 ) {
     let s = crate::flags::state_flags();
     let position_changed = match prev {
-        Some(p) => p.surface != new.surface || p.macro_zone != new.macro_zone,
+        // `macro_zone` encodes surface, so this covers a surface move too.
+        Some(p) => p.macro_zone != new.macro_zone,
         None => false, // first row for this card — no followers can be anchored yet.
     };
     let became_dead = match prev {
@@ -627,9 +631,9 @@ fn cascade_to_state_3_followers(
                 c.micro_location = 0;
             });
         } else if position_changed {
-            // Host moved zones — pull the follower along.
+            // Host moved zones — pull the follower along. `macro_zone`
+            // carries the surface band, so this single field suffices.
             update_with_at(ctx, follower.card_id, time_ms, |c| {
-                c.surface = new.surface;
                 c.macro_zone = new.macro_zone;
             });
         }
@@ -850,7 +854,6 @@ pub fn scrub_or_repath_position_forward(
     ctx: &ReducerContext,
     card_id: u32,
     after_ms: u64,
-    new_surface: u8,
     new_macro_zone: u64,
     new_micro_zone: u8,
     new_micro_location: u32,
@@ -890,13 +893,11 @@ pub fn scrub_or_repath_position_forward(
         // the new destination. Leave the data fields (flags_state /
         // owner / packed_def) alone so a future flag-change row still
         // applies its intended change at the correct moment.
-        let pos_changed = row.surface != new_surface
-            || row.macro_zone != new_macro_zone
+        let pos_changed = row.macro_zone != new_macro_zone
             || row.micro_zone != new_micro_zone
             || row.micro_location != new_micro_location;
         ctx.db.cards().valid_at().delete(v);
         let mut updated = row;
-        updated.surface = new_surface;
         updated.macro_zone = new_macro_zone;
         updated.micro_zone = new_micro_zone;
         updated.micro_location = new_micro_location;
@@ -928,7 +929,6 @@ pub fn scrub_or_repath_position_forward(
 pub fn create(
     ctx: &ReducerContext,
     card_id: u32,
-    surface: u8,
     macro_zone: u64,
     micro_zone: u8,
     micro_location: u32,
@@ -942,7 +942,6 @@ pub fn create(
         Card {
             valid_at: 0,
             card_id,
-            surface,
             macro_zone,
             micro_zone,
             micro_location,
@@ -1050,7 +1049,6 @@ pub fn create_at(
     ctx: &ReducerContext,
     card_id: u32,
     time_ms: u64,
-    surface: u8,
     macro_zone: u64,
     micro_zone: u8,
     micro_location: u32,
@@ -1064,7 +1062,6 @@ pub fn create_at(
         Card {
             valid_at: 0,
             card_id,
-            surface,
             macro_zone,
             micro_zone,
             micro_location,
@@ -1083,6 +1080,12 @@ pub fn create_at(
 /// PK is always `0` — this is a one-row table; we use `id` as a
 /// fixed sentinel rather than `#[auto_inc]` because we want stable
 /// access to the same row across calls.
+/// First `card_id` `next_card_id` will hand out on a fresh deployment. Ids
+/// `0..FIRST_CARD_ID` are reserved for system / sentinel use — notably
+/// `macro_zone`'s owner band uses `0` as the WORLD sentinel. Mirrors
+/// `players::FIRST_PLAYER_ID`.
+pub const FIRST_CARD_ID: u32 = 1024;
+
 #[table(accessor = card_id_counter)]
 pub struct CardIdCounter {
     #[primary_key]
@@ -1125,7 +1128,10 @@ pub fn next_card_id(ctx: &ReducerContext) -> u32 {
             .map(|c| c.card_id)
             .max()
             .unwrap_or(0);
-        let allocated = current_max.saturating_add(1);
+        // Reserve ids `0..FIRST_CARD_ID` for system / sentinel use (e.g.
+        // `macro_zone`'s owner band uses `0` for WORLD). Mirrors
+        // `players::FIRST_PLAYER_ID`.
+        let allocated = current_max.saturating_add(1).max(FIRST_CARD_ID);
         ctx.db.card_id_counter().insert(CardIdCounter {
             id: 0,
             next: allocated.saturating_add(1),
@@ -1188,14 +1194,15 @@ fn inspect_hex(
     let mut rect_root: Option<Card> = None;
     let mut tile_children: Vec<Card> = Vec::new();
 
-    for c in ctx.db.cards().macro_zone().filter(macro_zone) {
+    let key = crate::packed::with_surface(macro_zone, surface);
+    for c in ctx.db.cards().macro_zone().filter(key) {
         if !seen.insert(c.card_id) {
             continue;
         }
         let Some(latest) = prior_at(ctx, c.card_id, time_ms) else {
             continue;
         };
-        if latest.surface != surface {
+        if crate::packed::surface_of(latest.macro_zone) != surface {
             continue;
         }
         let (cq, cr, state) = unpack_micro_zone(latest.micro_zone);
@@ -1293,7 +1300,7 @@ pub fn find_or_create_tile_card(
     r: u8,
     time_ms: u64,
 ) -> Result<Card, String> {
-    let zone = crate::zones::latest_for(ctx, surface, macro_zone).ok_or_else(|| {
+    let zone = crate::zones::latest_for(ctx, crate::packed::with_surface(macro_zone, surface)).ok_or_else(|| {
         format!(
             "find_or_create_tile_card: no zone at (surface={surface}, macro_zone={macro_zone})"
         )
@@ -1341,8 +1348,7 @@ pub fn find_or_create_tile_card(
         ctx,
         card_id,
         time_ms,
-        surface,
-        macro_zone,
+        crate::packed::with_surface(macro_zone, surface),
         micro_zone_byte,
         micro_location,
         zone.owner_id,
@@ -1439,7 +1445,7 @@ pub fn tile_def_id_view(
     r: u8,
     time_ms: u64,
 ) -> Option<u16> {
-    let zone = crate::zones::latest_for(ctx, surface, macro_zone)?;
+    let zone = crate::zones::latest_for(ctx, crate::packed::with_surface(macro_zone, surface))?;
     let tile_card_type = unpack_zone_definition(zone.packed_definition);
     if let Some(tile) =
         find_tile_card_at(ctx, surface, macro_zone, q, r, tile_card_type, time_ms)
@@ -1467,7 +1473,7 @@ pub fn tile_full_view(
     r: u8,
     time_ms: u64,
 ) -> Option<(u16, u8, u8)> {
-    let zone = crate::zones::latest_for(ctx, surface, macro_zone)?;
+    let zone = crate::zones::latest_for(ctx, crate::packed::with_surface(macro_zone, surface))?;
     let tile_card_type = unpack_zone_definition(zone.packed_definition);
 
     if let Some(tile) =
@@ -1490,10 +1496,6 @@ pub fn tile_full_view(
 }
 
 // ---- single-field setters ---------------------------------------------
-
-pub fn set_surface(ctx: &ReducerContext, card_id: u32, surface: u8) -> Option<Card> {
-    update_with(ctx, card_id, |c| c.surface = surface)
-}
 
 pub fn set_macro_zone(ctx: &ReducerContext, card_id: u32, macro_zone: u64) -> Option<Card> {
     update_with(ctx, card_id, |c| c.macro_zone = macro_zone)

@@ -349,8 +349,7 @@ pub fn commit(
                     ctx,
                     new_id,
                     completion_ms,
-                    *surface,
-                    *macro_zone,
+                    crate::packed::with_surface(*macro_zone, *surface),
                     /* micro_zone     */ 0,
                     /* micro_location */ 0,
                     *owner_id,
@@ -381,7 +380,7 @@ pub fn commit(
                 })?;
                 let tile_card = cards::find_or_create_tile_card(
                     ctx,
-                    zone.surface,
+                    crate::packed::surface_of(zone.macro_zone),
                     zone.macro_zone,
                     *col,
                     *row,
@@ -442,7 +441,7 @@ pub fn commit(
                             crate::packed::StackedState::Deferred,
                         );
                         (
-                            h.surface,
+                            crate::packed::surface_of(h.macro_zone),
                             h.macro_zone,
                             deferred_micro_zone,
                             *host_card_id,
@@ -469,8 +468,7 @@ pub fn commit(
                     ctx,
                     new_id,
                     completion_ms,
-                    surface,
-                    macro_zone,
+                    crate::packed::with_surface(macro_zone, surface),
                     micro_zone,
                     micro_location,
                     owner_id,
@@ -838,7 +836,9 @@ fn execute_card_op(
                 walker.pending.push(Effect::Create {
                     def_key,
                     surface: INVENTORY_LAYER,
-                    macro_zone: owner_card_id as u64,
+                    // Inventory product: the owner card_id goes in the owner
+                    // band (bits 32-63), coords (0,0).
+                    macro_zone: crate::packed::pack_macro_zone_full(owner_card_id, INVENTORY_LAYER, 0, 0),
                     owner_id: owner_card_id,
                 });
                 Ok(())

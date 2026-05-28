@@ -813,7 +813,9 @@ pub fn generate_forest_terrain(
         let r_min = std::cmp::max(-radius, -q - radius);
         let r_max = std::cmp::min(radius, -q + radius);
         for r in r_min..=r_max {
-            let macro_zone = pack_macro_zone(q, r);
+            // `macro_zone` carries the surface band (bits 24-31), so it's the
+            // complete key for both the existing-zone filter and `create`.
+            let macro_zone = crate::packed::with_surface(pack_macro_zone(q, r), WORLD_SURFACE);
             let tiles = generate_zone_tiles(q, r, seed);
 
             // Existing zone at this macro coord? Use the latest
@@ -833,7 +835,6 @@ pub fn generate_forest_terrain(
                     zones::create(
                         ctx,
                         next_zone_id,
-                        WORLD_SURFACE,
                         macro_zone,
                         zone_def,
                         /* owner_id */ 0,

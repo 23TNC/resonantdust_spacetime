@@ -76,8 +76,7 @@ pub fn apply(ctx: &ReducerContext, stack: &CardStack) -> Result<(), String> {
     // Bottom card sits Free at the stack's spatial position.
     let bottom = chain[0];
     cards::update_with(ctx, bottom, |c| {
-        c.surface = stack.surface;
-        c.macro_zone = stack.macro_zone;
+        c.macro_zone = crate::packed::with_surface(stack.macro_zone, stack.surface);
         c.micro_zone = micro_zone_free;
         c.micro_location = stack.micro_location;
     })
@@ -90,8 +89,7 @@ pub fn apply(ctx: &ReducerContext, stack: &CardStack) -> Result<(), String> {
         let below = window[0];
         let above = window[1];
         cards::update_with(ctx, above, |c| {
-            c.surface = stack.surface;
-            c.macro_zone = stack.macro_zone;
+            c.macro_zone = crate::packed::with_surface(stack.macro_zone, stack.surface);
             c.micro_zone = micro_zone_on;
             c.micro_location = below;
         })

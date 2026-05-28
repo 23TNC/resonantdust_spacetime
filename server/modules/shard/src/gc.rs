@@ -351,7 +351,7 @@ fn sweep_tile_card_demotions(ctx: &ReducerContext, now_ms: u64) {
     }
 
     for card in to_demote {
-        let Some(zone) = zones::latest_for(ctx, card.surface, card.macro_zone) else {
+        let Some(zone) = zones::latest_for(ctx, card.macro_zone) else {
             continue;
         };
         if zone.owner_id != card.owner_id {

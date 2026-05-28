@@ -132,7 +132,9 @@ pub fn anchor_covering_hex(
     for (dmq, dmr) in ADJACENT_MACRO_ZONES {
         let scan_macro_q = target_macro_q.saturating_add(dmq);
         let scan_macro_r = target_macro_r.saturating_add(dmr);
-        let scan_macro_zone = pack_macro_zone(scan_macro_q, scan_macro_r);
+        // Fold WORLD_LAYER into the key so it matches stored (folded) rows.
+        let scan_macro_zone =
+            crate::packed::with_surface(pack_macro_zone(scan_macro_q, scan_macro_r), WORLD_LAYER);
 
         // Walk every card row at this macro_zone. Multiple history
         // rows per card_id appear here; dedupe via card_id BTreeSet
@@ -149,7 +151,7 @@ pub fn anchor_covering_hex(
             let Some(latest) = cards::latest(ctx, c.card_id) else {
                 continue;
             };
-            if latest.surface != WORLD_LAYER {
+            if crate::packed::surface_of(latest.macro_zone) != WORLD_LAYER {
                 continue;
             }
             if latest.macro_zone != scan_macro_zone {
@@ -182,7 +184,7 @@ pub fn tile_at_anchor(
     world_macro_zone: u64,
     world_micro_zone: u8,
 ) -> Option<(u16, (u8, u8), action_completion::HexLocation)> {
-    let zone = zones::latest_for(ctx, MINI_ZONE_LAYER, anchor.card_id as u64)?;
+    let zone = zones::latest_for(ctx, crate::packed::pack_macro_zone_full(anchor.card_id, MINI_ZONE_LAYER, 0, 0))?;
     let target_global = global_hex(world_macro_zone, world_micro_zone);
     let anchor_global = global_hex(anchor.macro_zone, anchor.micro_zone);
     let dq = target_global.0 - anchor_global.0;
@@ -294,11 +296,11 @@ pub fn deploy_mini_zone(
             "deploy_mini_zone: card {anchor_card_id} is not a `mini_zone`-type card"
         ));
     }
-    if anchor.surface != INVENTORY_LAYER {
+    if crate::packed::surface_of(anchor.macro_zone) != INVENTORY_LAYER {
         return Err(format!(
             "deploy_mini_zone: anchor card {anchor_card_id} must be in inventory \
              (surface={INVENTORY_LAYER}); current surface={}",
-            anchor.surface
+            crate::packed::surface_of(anchor.macro_zone)
         ));
     }
 
@@ -310,9 +312,12 @@ pub fn deploy_mini_zone(
              (world-position encoding); got {t_state:?}"
         ));
     }
+    // Fold WORLD_LAYER into the target key once — every lookup / compare /
+    // write below uses the complete (folded) `macro_zone`.
+    let target_macro_zone = crate::packed::with_surface(target_macro_zone, WORLD_LAYER);
     // Confirm a world Zone exists at the target macro_zone — placing
     // on unmapped area is rejected.
-    if zones::latest_for(ctx, WORLD_LAYER, target_macro_zone).is_none() {
+    if zones::latest_for(ctx, target_macro_zone).is_none() {
         return Err(format!(
             "deploy_mini_zone: no world zone exists at macro_zone={target_macro_zone}; \
              cannot deploy in unmapped area"
@@ -327,7 +332,7 @@ pub fn deploy_mini_zone(
         .macro_zone()
         .filter(target_macro_zone)
         .any(|c| {
-            if c.surface != WORLD_LAYER {
+            if crate::packed::surface_of(c.macro_zone) != WORLD_LAYER {
                 return false;
             }
             if c.flags_state & s.dead != 0 {
@@ -337,8 +342,9 @@ pub fn deploy_mini_zone(
             let Some(latest) = cards::prior_at(ctx, c.card_id, now_ms) else {
                 return false;
             };
-            latest.surface == WORLD_LAYER
-                && latest.macro_zone == target_macro_zone
+            // `target_macro_zone` is folded, so the macro_zone equality covers
+            // the surface band too.
+            latest.macro_zone == target_macro_zone
                 && latest.micro_zone == target_micro_zone
                 && latest.flags_state & s.dead == 0
         });
@@ -364,7 +370,7 @@ pub fn deploy_mini_zone(
     // position-locked are NOT set — the user can still pick the
     // wagon back up via `pickup_mini_zone`.
     cards::update_with_at(ctx, anchor_card_id, now_ms, |c| {
-        c.surface = WORLD_LAYER;
+        // `target_macro_zone` is folded with WORLD_LAYER — sets surface too.
         c.macro_zone = target_macro_zone;
         c.micro_zone = target_micro_zone;
         c.micro_location = 0;
@@ -390,8 +396,7 @@ pub fn deploy_mini_zone(
     zones::create_at(
         ctx,
         zone_id,
-        MINI_ZONE_LAYER,
-        anchor_card_id as u64,
+        crate::packed::pack_macro_zone_full(anchor_card_id, MINI_ZONE_LAYER, 0, 0),
         tile_zone_packed_def,
         // `Zone.owner_id` is a card_id under the new model — the
         // anchor itself is the container card for the mini_zone's
@@ -482,13 +487,17 @@ pub fn pickup_mini_zone(
             "pickup_mini_zone: card {anchor_card_id} is not a `mini_zone`-type card"
         ));
     }
-    if anchor.surface != WORLD_LAYER {
+    if crate::packed::surface_of(anchor.macro_zone) != WORLD_LAYER {
         return Err(format!(
             "pickup_mini_zone: anchor card {anchor_card_id} must be on world layer \
              (surface={WORLD_LAYER}); current surface={}",
-            anchor.surface
+            crate::packed::surface_of(anchor.macro_zone)
         ));
     }
+
+    // The mini_zone's Zone row and the cards on its tiles share this folded
+    // key (`surface=MINI_ZONE_LAYER` over the anchor id).
+    let mini_key = crate::packed::pack_macro_zone_full(anchor_card_id, MINI_ZONE_LAYER, 0, 0);
 
     // Snapshot the anchor's world position so we can spill mini_zone
     // contents onto it before the anchor moves to inventory.
@@ -511,9 +520,9 @@ pub fn pickup_mini_zone(
         .db
         .cards()
         .macro_zone()
-        .filter(anchor_card_id as u64)
+        .filter(mini_key)
         .filter_map(|c| {
-            if c.surface != MINI_ZONE_LAYER {
+            if crate::packed::surface_of(c.macro_zone) != MINI_ZONE_LAYER {
                 return None;
             }
             // Skip the anchor itself (it's on WORLD_LAYER, but
@@ -535,15 +544,16 @@ pub fn pickup_mini_zone(
         let Some(latest) = cards::prior_at(ctx, id, now_ms) else {
             continue;
         };
-        if latest.surface != MINI_ZONE_LAYER || latest.macro_zone != anchor_card_id as u64 {
+        if latest.macro_zone != mini_key {
             // Moved out since we started iterating — leave alone.
+            // (`mini_key` encodes the surface, so this covers it.)
             continue;
         }
         if latest.flags_state & s.dead != 0 {
             continue;
         }
         cards::update_with_at(ctx, id, now_ms, |c| {
-            c.surface = WORLD_LAYER;
+            // `world_macro_zone` is the anchor's folded world key — sets surface.
             c.macro_zone = world_macro_zone;
             c.micro_zone = world_micro_zone;
             c.micro_location = 0;
@@ -559,8 +569,7 @@ pub fn pickup_mini_zone(
         .db
         .zones()
         .macro_zone()
-        .filter(anchor_card_id as u64)
-        .filter(|z| z.surface == MINI_ZONE_LAYER)
+        .filter(mini_key)
         .map(|z| z.valid_at)
         .collect();
     for v in zone_pks {
@@ -569,8 +578,7 @@ pub fn pickup_mini_zone(
 
     // ---- return the anchor to inventory ---------------------------
     cards::update_with_at(ctx, anchor_card_id, now_ms, |c| {
-        c.surface = INVENTORY_LAYER;
-        c.macro_zone = target_soul_card_id as u64;
+        c.macro_zone = crate::packed::pack_macro_zone_full(target_soul_card_id, INVENTORY_LAYER, 0, 0);
         c.micro_zone = 0;
         c.micro_location = 0;
         // Back in the soul's inventory bucket — `owner_id` carries

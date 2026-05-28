@@ -10,7 +10,10 @@ pub struct Zone {
     pub valid_at: u64,
     #[index(btree)]
     pub zone_id: u32,
-    pub surface: u8,
+    /// Packed location key `[reserved:u32 | surface:u8 | payload:u24]`.
+    /// `surface` lives at bits 24-31 (read via `packed::surface_of`); there
+    /// is no separate surface column. World payload = `(zone_q, zone_r)`,
+    /// non-world payload = container id.
     #[index(btree)]
     pub macro_zone: u64,
     pub packed_definition: u8,
@@ -152,18 +155,16 @@ pub fn latest(ctx: &ReducerContext, zone_id: u32) -> Option<Zone> {
         .max_by_key(|z| valid_at_time(z.valid_at))
 }
 
-/// Latest row for the zone at `(surface, macro_zone)`. The
-/// `(surface, macro_zone)` tuple identifies a container — world
-/// chunks at `surface=WORLD_LAYER`, mini_zones at
-/// `surface=MINI_ZONE_LAYER` (with `macro_zone = anchor.card_id`),
-/// pocket dimensions at `surface=POCKET_DIMENSION_LAYER`. Returns
-/// `None` if no Zone exists at that address.
-pub fn latest_for(ctx: &ReducerContext, surface: u8, macro_zone: u64) -> Option<Zone> {
+/// Latest row for the zone keyed by `macro_zone`. `macro_zone` now encodes
+/// the surface band in bits 24-31 (world chunks at `surface=WORLD_LAYER`,
+/// mini_zones at `surface=MINI_ZONE_LAYER` over the anchor id, etc.), so the
+/// single packed value identifies the container exactly — no separate
+/// surface filter. Returns `None` if no Zone exists at that address.
+pub fn latest_for(ctx: &ReducerContext, macro_zone: u64) -> Option<Zone> {
     ctx.db
         .zones()
         .macro_zone()
         .filter(macro_zone)
-        .filter(|z| z.surface == surface)
         .max_by_key(|z| valid_at_time(z.valid_at))
 }
 
@@ -220,13 +221,12 @@ fn write_at(ctx: &ReducerContext, mut zone: Zone, time_ms: u64) -> Zone {
 pub fn create(
     ctx: &ReducerContext,
     zone_id: u32,
-    surface: u8,
     macro_zone: u64,
     packed_definition: u8,
     owner_id: u32,
     tiles: [u64; packed::ZONE_TILE_U64_COUNT],
 ) -> Zone {
-    create_at(ctx, zone_id, surface, macro_zone, packed_definition, owner_id, tiles, now_ms(ctx))
+    create_at(ctx, zone_id, macro_zone, packed_definition, owner_id, tiles, now_ms(ctx))
 }
 
 // Insert a brand-new zone stamped at `time_ms`. Mirrors
@@ -237,7 +237,6 @@ pub fn create(
 pub fn create_at(
     ctx: &ReducerContext,
     zone_id: u32,
-    surface: u8,
     macro_zone: u64,
     packed_definition: u8,
     owner_id: u32,
@@ -249,7 +248,6 @@ pub fn create_at(
         Zone {
             valid_at: 0,
             zone_id,
-            surface,
             macro_zone,
             packed_definition,
             owner_id,
@@ -291,10 +289,6 @@ where
 }
 
 // ---- single-field setters ---------------------------------------------
-
-pub fn set_surface(ctx: &ReducerContext, zone_id: u32, surface: u8) -> Option<Zone> {
-    update_with(ctx, zone_id, |z| z.surface = surface)
-}
 
 pub fn set_macro_zone(ctx: &ReducerContext, zone_id: u32, macro_zone: u64) -> Option<Zone> {
     update_with(ctx, zone_id, |z| z.macro_zone = macro_zone)
@@ -516,7 +510,6 @@ fn in_disk(row: u8, col: u8) -> bool {
 /// shifts.
 pub fn create_disk_at(
     ctx: &ReducerContext,
-    surface: u8,
     macro_zone: u64,
     owner_id: u32,
     time_ms: u64,
@@ -541,7 +534,6 @@ pub fn create_disk_at(
     Ok(create_at(
         ctx,
         zone_id,
-        surface,
         macro_zone,
         pack_zone_definition(card_type),
         owner_id,

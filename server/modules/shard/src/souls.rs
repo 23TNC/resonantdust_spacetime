@@ -60,7 +60,6 @@ pub struct Soul {
     pub card_id: u32,
     #[index(btree)]
     pub owner_id: u32,
-    pub surface: u8,
     pub macro_zone: u64,
     pub micro_zone: u8,
     pub micro_location: u32,
@@ -434,7 +433,6 @@ pub fn on_card_write(
         match prior {
             Some(mut s) => {
                 s.owner_id = new_card.owner_id;
-                s.surface = new_card.surface;
                 s.macro_zone = new_card.macro_zone;
                 s.micro_zone = new_card.micro_zone;
                 s.micro_location = new_card.micro_location;
@@ -447,7 +445,6 @@ pub fn on_card_write(
                         valid_at: 0,
                         card_id: new_card.card_id,
                         owner_id: new_card.owner_id,
-                        surface: new_card.surface,
                         macro_zone: new_card.macro_zone,
                         micro_zone: new_card.micro_zone,
                         micro_location: new_card.micro_location,

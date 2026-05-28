@@ -202,10 +202,10 @@ pub fn place_card(
             }
         };
 
-    // Source write. `owner_id` is intentionally untouched.
+    // Source write. `owner_id` is intentionally untouched. `surface` folds
+    // into `macro_zone` (bits 24-31) — there's no separate surface column.
     cards::update_with_at(ctx, card_id, now_ms, |c| {
-        c.surface = new_surface;
-        c.macro_zone = new_macro_zone;
+        c.macro_zone = crate::packed::with_surface(new_macro_zone, new_surface);
         c.micro_zone = new_micro_zone;
         c.micro_location = new_micro_location;
     });
@@ -216,8 +216,7 @@ pub fn place_card(
     // (independent of position) stay intact.
     for d in &descendants {
         cards::update_with_at(ctx, d.card_id, now_ms, |c| {
-            c.surface = new_surface;
-            c.macro_zone = new_macro_zone;
+            c.macro_zone = crate::packed::with_surface(new_macro_zone, new_surface);
         });
     }
 
@@ -315,7 +314,7 @@ fn resolve_stack_target(
     };
 
     Ok((
-        parent.surface,
+        crate::packed::surface_of(parent.macro_zone),
         parent.macro_zone,
         new_micro_zone,
         immediate_parent_id,
@@ -354,7 +353,9 @@ fn walk_branch_top(
         let Some(latest) = cards::prior_at(ctx, row.card_id, now_ms) else {
             continue;
         };
-        if latest.surface != parent.surface || latest.macro_zone != parent.macro_zone {
+        // `macro_zone` encodes surface (bits 24-31), so this single
+        // comparison covers both the surface band and the payload.
+        if latest.macro_zone != parent.macro_zone {
             continue;
         }
         let (_, _, state) = unpack_micro_zone(latest.micro_zone);
@@ -420,8 +421,8 @@ fn resolve_loose_target(
 ) -> Result<(u8, u64, u8, u32), String> {
     match surface {
         INVENTORY_LAYER => {
-            // macro_zone is the soul's card_id; the soul must belong to caller.
-            let soul_player = cards::owning_player(ctx, macro_zone as u32).unwrap_or(cards::WORLD_PLAYER_ID);
+            // The owner band holds the soul's card_id; the soul must belong to caller.
+            let soul_player = cards::owning_player(ctx, crate::packed::owner_of(macro_zone)).unwrap_or(cards::WORLD_PLAYER_ID);
             if soul_player != caller_player_id {
                 return Err(format!(
                     "place_card: inventory target soul {macro_zone} is owned by player {soul_player} (not {caller_player_id})"
@@ -435,9 +436,9 @@ fn resolve_loose_target(
             ))
         }
         PLAYER_INVENTORY_LAYER => {
-            // macro_zone IS the player_id directly — must match the
-            // caller to prevent dropping into another player's bag.
-            if macro_zone != caller_player_id as u64 {
+            // The owner band holds the player_id — must match the caller to
+            // prevent dropping into another player's bag.
+            if crate::packed::owner_of(macro_zone) != caller_player_id {
                 return Err(format!(
                     "place_card: player-inventory target {macro_zone} is not the caller's player_id ({caller_player_id})"
                 ));
@@ -469,7 +470,7 @@ fn resolve_loose_target(
             // anchor (same gate as inventory). Mini-zone has internal
             // hex coords; pocket-dimension typically uses `xy`.
             let anchor_player =
-                cards::owning_player(ctx, macro_zone as u32).unwrap_or(cards::WORLD_PLAYER_ID);
+                cards::owning_player(ctx, crate::packed::owner_of(macro_zone)).unwrap_or(cards::WORLD_PLAYER_ID);
             if anchor_player != caller_player_id {
                 return Err(format!(
                     "place_card: container anchor {macro_zone} is owned by player {anchor_player} (not {caller_player_id})"
