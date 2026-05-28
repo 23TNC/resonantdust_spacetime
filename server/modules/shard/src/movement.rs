@@ -56,17 +56,9 @@ fn hex_distance(a: Coord, b: Coord) -> i32 {
 /// the hex is treated as impassable (`None`) — the mini_zone occludes
 /// whatever's underneath. This matches `actions::derive_synthetic_hex`'s
 /// resolver so pathfinding and recipe-target lookups agree.
-///
-/// **Owner discrimination.** `owner_id_filter` is the per-surface
-/// discriminator threaded through to `cards::tile_def_id_view`:
-/// `Some(player_id)` on `PLAYER_DIMENSION_LAYER` where multiple
-/// players' Zones share `(surface, macro_zone)`; `None` elsewhere.
-/// The mini_zone-overlay branch always uses `None` because mini_zone
-/// macro_zones are anchor-card-ids (unique per anchor).
 fn tile_def_at(
     ctx: &ReducerContext,
     surface: u8,
-    owner_id_filter: Option<u32>,
     c: Coord,
     time_ms: u64,
 ) -> Option<u16> {
@@ -93,13 +85,11 @@ fn tile_def_at(
             let mz_r = (3 + dr) as u8;
             // `0` (or no Zone) = empty mini_zone cell. Treat as
             // impassable — the mini_zone occludes the underlying
-            // world tile. Mini_zone uses anchor.card_id as macro_zone
-            // (unique per mini_zone) — no owner filter needed.
+            // world tile.
             return cards::tile_def_id_view(
                 ctx,
                 crate::packed::MINI_ZONE_LAYER,
-                anchor.card_id,
-                /* owner_id_filter */ None,
+                anchor.card_id as u64,
                 mz_q,
                 mz_r,
                 time_ms,
@@ -108,7 +98,7 @@ fn tile_def_at(
         }
     }
 
-    cards::tile_def_id_view(ctx, surface, macro_zone, owner_id_filter, local_q, local_r, time_ms)
+    cards::tile_def_id_view(ctx, surface, macro_zone, local_q, local_r, time_ms)
 }
 
 /// `card_type` of the tile-card bucket. Tiles live under `tile/` in
@@ -214,7 +204,7 @@ const MAX_VALIDATION_STEPS: usize = 256;
 #[derive(SpacetimeType, Debug, Clone, Copy)]
 pub struct TilePoint {
     pub surface: u8,
-    pub macro_zone: u32,
+    pub macro_zone: u64,
     pub micro_zone: u8,
 }
 
@@ -308,18 +298,6 @@ pub fn move_soul(
 
     let speed = soul_speed(soul.packed_definition);
 
-    // Owner filter for `tile_def_at` — only needed when the soul is
-    // inside a `PLAYER_DIMENSION_LAYER` (62), where multiple players'
-    // Zones share the same `(surface, macro_zone)`. `soul.owner_id`
-    // is the player_id directly (souls carry `FLAG_OWNED_BY_PLAYER`),
-    // which is the canonical surface-62 discriminator. Cross-surface
-    // paths are rejected below, so this filter applies to every step.
-    let owner_filter = if soul.surface == crate::packed::PLAYER_DIMENSION_LAYER {
-        Some(soul.owner_id)
-    } else {
-        None
-    };
-
     // First pass: full validation walk. Resolve every step's tile cost
     // up-front so we don't write rows for a path that turns out to be
     // invalid halfway through.
@@ -330,7 +308,7 @@ pub fn move_soul(
     // (for `step_cost`), and stashing both with each step keeps the
     // loop straightforward.
     let mut decoded: Vec<(TilePoint, Coord, f32)> = Vec::with_capacity(path.len());
-    let start_cost = tile_def_at(ctx, soul.surface, owner_filter, prev, now_ms)
+    let start_cost = tile_def_at(ctx, soul.surface, prev, now_ms)
         .and_then(tile_cost)
         .ok_or_else(|| {
             format!(
@@ -364,7 +342,7 @@ pub fn move_soul(
                 coord.q, coord.r, prev.q, prev.r,
             ));
         }
-        let to_def = tile_def_at(ctx, point.surface, owner_filter, coord, now_ms).ok_or_else(|| {
+        let to_def = tile_def_at(ctx, point.surface, coord, now_ms).ok_or_else(|| {
             format!(
                 "movement: step {idx} ({}, {}) — no zone data (off-map or subscription gap server-side)",
                 coord.q, coord.r,

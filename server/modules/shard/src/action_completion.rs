@@ -37,7 +37,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use resonantdust_content::blueprint_core::{find_blueprint_any_scope, BlueprintScope};
+use resonantdust_content::blueprint_core::find_blueprint;
 use resonantdust_content::definition_core::{
     aspect_id as core_aspect_id, decode_definition, find_packed_by_key, is_aspect_descendant,
 };
@@ -57,7 +57,7 @@ use crate::zones;
 #[derive(Debug, Clone, Copy)]
 pub struct HexLocation {
     pub zone_id: u32,
-    pub macro_zone: u32,
+    pub macro_zone: u64,
     pub col: u8,
     pub row: u8,
     pub owner_id: u32,
@@ -99,7 +99,7 @@ enum Effect {
     Create {
         def_key: String,
         surface: u8,
-        macro_zone: u32,
+        macro_zone: u64,
         owner_id: u32,
     },
     /// Modify a stock slot on a tile inside a Zone row. Only
@@ -114,15 +114,12 @@ enum Effect {
         op: StockOp,
         delta: u8,
     },
-    /// Set a blueprint's discovery bit on either `SoulPrivate.blueprints_0`
-    /// or `PlayerProfile.blueprints_0`, picked by the blueprint catalog
-    /// entry's `scope`. Target card is whatever the recipe path
-    /// resolved to before the `.blueprint.unlock` suffix; for soul-
-    /// scope it must be a soul card itself, for player-scope the
-    /// commit walks `card.owner_id` to the owning player. Idempotent —
-    /// re-firing the recipe doesn't reject when the bit's already
-    /// set, so authors can use unlock as a "first-time gate" without
-    /// blocking later runs.
+    /// Set a blueprint's discovery bit on `SoulPrivate.blueprints_0`.
+    /// Target card is whatever the recipe path resolved to before the
+    /// `.blueprint.unlock` suffix — it must be a soul card itself.
+    /// Idempotent — re-firing the recipe doesn't reject when the bit's
+    /// already set, so authors can use unlock as a "first-time gate"
+    /// without blocking later runs.
     UnlockBlueprint {
         blueprint_key: String,
         target_card_id: u32,
@@ -382,24 +379,10 @@ pub fn commit(
                         zone_id
                     )
                 })?;
-                // Owner filter only matters on `PLAYER_DIMENSION_LAYER`
-                // where multiple Zones share `(surface, macro_zone)`.
-                // The completing action's HexLocation is already
-                // owner-resolved (it was bound at propose time via
-                // `derive_synthetic_hex` with the caller's owner
-                // filter), and `zone.owner_id` carries the
-                // discriminator forward — pass it through so the
-                // tile-card lookup lands on the same player's row.
-                let owner_filter = if zone.surface == crate::packed::PLAYER_DIMENSION_LAYER {
-                    Some(zone.owner_id)
-                } else {
-                    None
-                };
                 let tile_card = cards::find_or_create_tile_card(
                     ctx,
                     zone.surface,
                     zone.macro_zone,
-                    owner_filter,
                     *col,
                     *row,
                     completion_ms,
@@ -855,7 +838,7 @@ fn execute_card_op(
                 walker.pending.push(Effect::Create {
                     def_key,
                     surface: INVENTORY_LAYER,
-                    macro_zone: owner_card_id,
+                    macro_zone: owner_card_id as u64,
                     owner_id: owner_card_id,
                 });
                 Ok(())
@@ -1043,90 +1026,49 @@ fn execute_card_op(
 
 /// Commit handler for `Effect::UnlockBlueprint`. Looks up the
 /// blueprint catalog entry by key, sets the matching bit in
-/// `SoulPrivate.blueprints_0` (Soul scope) or `PlayerProfile.
-/// blueprints_0` (Player scope), and tolerates an already-set bit
-/// as a no-op so authors can use unlock as a "first-time gate"
-/// without blocking recipe rematches.
+/// `SoulPrivate.blueprints_0`, and tolerates an already-set bit as a
+/// no-op so authors can use unlock as a "first-time gate" without
+/// blocking recipe rematches.
 ///
 /// Bucket / id-range invariant: only ids 1..=64 fit in
 /// `blueprints_0`. When the catalog grows past 64 a new
-/// `blueprints_1` column needs to land on both `SoulPrivate` and
-/// `PlayerProfile`; this helper rejects out-of-range ids loudly
-/// until that column exists so the failure mode is "can't
-/// express in storage" rather than "silently dropped."
+/// `blueprints_1` column needs to land on `SoulPrivate`; this helper
+/// rejects out-of-range ids loudly until that column exists so the
+/// failure mode is "can't express in storage" rather than "silently
+/// dropped."
 fn apply_unlock_blueprint(
     ctx: &ReducerContext,
     blueprint_key: &str,
     target_card_id: u32,
 ) -> Result<(), String> {
-    let bp = find_blueprint_any_scope(blueprint_key)
+    let bp = find_blueprint(blueprint_key)
         .map_err(|e| format!("unlock: catalog lookup: {e}"))?
         .ok_or_else(|| {
-            format!("unlock: blueprint {blueprint_key:?} not registered in any scope")
+            format!("unlock: blueprint {blueprint_key:?} not registered")
         })?;
     if bp.id == 0 || bp.id > 64 {
         return Err(format!(
             "unlock: blueprint id {} (key={blueprint_key:?}) outside the \
              blueprints_0 bucket (1..=64); add a `blueprints_1` column on \
-             {} before authoring this unlock",
+             SoulPrivate before authoring this unlock",
             bp.id,
-            match bp.scope {
-                BlueprintScope::Soul => "SoulPrivate",
-                BlueprintScope::Player => "PlayerProfile",
-            },
         ));
     }
     let bit = 1u64 << (bp.id - 1);
-    match bp.scope {
-        BlueprintScope::Soul => {
-            // Target must be a soul card — `SoulPrivate` is keyed by
-            // `soul.card_id`.
-            let Some(mut row) =
-                ctx.db.soul_privates().card_id().find(target_card_id)
-            else {
-                return Err(format!(
-                    "unlock: no SoulPrivate row for target card {target_card_id} \
-                     (key={blueprint_key:?}, scope=Soul)"
-                ));
-            };
-            if row.blueprints_0 & bit != 0 {
-                return Ok(()); // already discovered — idempotent
-            }
-            row.blueprints_0 |= bit;
-            ctx.db.soul_privates().card_id().delete(target_card_id);
-            ctx.db.soul_privates().insert(row);
-        }
-        BlueprintScope::Player => {
-            // Target is typically a soul (via `slot.X.Y.owner`); walk
-            // one step through the card's `owner_id` to find the
-            // player_id. A player isn't a Card row, so we don't keep
-            // walking — we just need the id to look up
-            // `PlayerProfile`.
-            let card = cards::latest(ctx, target_card_id)
-                .ok_or_else(|| format!("unlock: target card {target_card_id} not found"))?;
-            if card.owner_id == 0 {
-                return Err(format!(
-                    "unlock: target card {target_card_id} has no owner; can't resolve \
-                     player_id for player-scope unlock (key={blueprint_key:?})"
-                ));
-            }
-            let player_id = card.owner_id;
-            let Some(mut row) =
-                ctx.db.player_profiles().player_id().find(player_id)
-            else {
-                return Err(format!(
-                    "unlock: no PlayerProfile row for player {player_id} \
-                     (key={blueprint_key:?}, scope=Player)"
-                ));
-            };
-            if row.blueprints_0 & bit != 0 {
-                return Ok(()); // already discovered — idempotent
-            }
-            row.blueprints_0 |= bit;
-            ctx.db.player_profiles().player_id().delete(player_id);
-            ctx.db.player_profiles().insert(row);
-        }
+    // Target must be a soul card — `SoulPrivate` is keyed by
+    // `soul.card_id`.
+    let Some(mut row) = ctx.db.soul_privates().card_id().find(target_card_id) else {
+        return Err(format!(
+            "unlock: no SoulPrivate row for target card {target_card_id} \
+             (key={blueprint_key:?})"
+        ));
+    };
+    if row.blueprints_0 & bit != 0 {
+        return Ok(()); // already discovered — idempotent
     }
+    row.blueprints_0 |= bit;
+    ctx.db.soul_privates().card_id().delete(target_card_id);
+    ctx.db.soul_privates().insert(row);
     Ok(())
 }
 

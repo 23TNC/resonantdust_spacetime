@@ -13,7 +13,6 @@ use spacetimedb::{reducer, ReducerContext, SpacetimeType};
 
 use crate::cards::{self, cards as _cards_table};
 use crate::flags::state_flags;
-use crate::packed::PLAYER_DIMENSION_LAYER;
 use crate::packed::PLAYER_INVENTORY_LAYER;
 use crate::packed::{
     pack_micro_zone, pack_slot_micro_zone, pack_stack_micro_zone, unpack_micro_zone,
@@ -44,7 +43,7 @@ pub struct Placement {
     pub parent_id: u32,
     pub direction: u8,
     pub surface: u8,
-    pub macro_zone: u32,
+    pub macro_zone: u64,
     pub q: u8,
     pub r: u8,
     pub xy: u32,
@@ -240,7 +239,7 @@ fn resolve_stack_target(
     direction: u8,
     caller_player_id: u32,
     now_ms: u64,
-) -> Result<(u8, u32, u8, u32), String> {
+) -> Result<(u8, u64, u8, u32), String> {
     if parent_id == 0 {
         return Err("place_card: Stack placement with parent_id == 0".to_string());
     }
@@ -414,15 +413,15 @@ fn resolve_loose_target(
     ctx: &ReducerContext,
     caller_player_id: u32,
     surface: u8,
-    macro_zone: u32,
+    macro_zone: u64,
     q: u8,
     r: u8,
     xy: u32,
-) -> Result<(u8, u32, u8, u32), String> {
+) -> Result<(u8, u64, u8, u32), String> {
     match surface {
         INVENTORY_LAYER => {
             // macro_zone is the soul's card_id; the soul must belong to caller.
-            let soul_player = cards::owning_player(ctx, macro_zone).unwrap_or(cards::WORLD_PLAYER_ID);
+            let soul_player = cards::owning_player(ctx, macro_zone as u32).unwrap_or(cards::WORLD_PLAYER_ID);
             if soul_player != caller_player_id {
                 return Err(format!(
                     "place_card: inventory target soul {macro_zone} is owned by player {soul_player} (not {caller_player_id})"
@@ -438,7 +437,7 @@ fn resolve_loose_target(
         PLAYER_INVENTORY_LAYER => {
             // macro_zone IS the player_id directly — must match the
             // caller to prevent dropping into another player's bag.
-            if macro_zone != caller_player_id {
+            if macro_zone != caller_player_id as u64 {
                 return Err(format!(
                     "place_card: player-inventory target {macro_zone} is not the caller's player_id ({caller_player_id})"
                 ));
@@ -448,29 +447,6 @@ fn resolve_loose_target(
                 macro_zone,
                 pack_micro_zone(0, 0, StackedState::Free),
                 xy,
-            ))
-        }
-        PLAYER_DIMENSION_LAYER => {
-            // Player-dim placement: `macro_zone` is the packed chunk
-            // coord (same encoding as world). `(q, r)` is the local
-            // hex within the chunk. We trust the dim's owner_id
-            // discriminator to scope the placement — the card
-            // keeps its existing `owner_id` through `place_card`, so
-            // dropping a card you don't own into another player's
-            // dim address would just leave it owner-mismatched and
-            // the dim subscription would skip it client-side.
-            // (Future hardening: explicitly require the card's
-            // current `owner_id == caller_player_id` here too.)
-            if q >= 8 || r >= 8 {
-                return Err(format!(
-                    "place_card: player-dim target ({q}, {r}) out of range (0..=7 each)"
-                ));
-            }
-            Ok((
-                PLAYER_DIMENSION_LAYER,
-                macro_zone,
-                pack_micro_zone(q, r, StackedState::Free),
-                0,
             ))
         }
         s if s >= WORLD_LAYER => {
@@ -493,7 +469,7 @@ fn resolve_loose_target(
             // anchor (same gate as inventory). Mini-zone has internal
             // hex coords; pocket-dimension typically uses `xy`.
             let anchor_player =
-                cards::owning_player(ctx, macro_zone).unwrap_or(cards::WORLD_PLAYER_ID);
+                cards::owning_player(ctx, macro_zone as u32).unwrap_or(cards::WORLD_PLAYER_ID);
             if anchor_player != caller_player_id {
                 return Err(format!(
                     "place_card: container anchor {macro_zone} is owned by player {anchor_player} (not {caller_player_id})"
@@ -508,7 +484,7 @@ fn resolve_loose_target(
             Ok((surface, macro_zone, micro_zone, micro_location))
         }
         other => Err(format!(
-            "place_card: unsupported surface {other} (expected INVENTORY, PLAYER_INVENTORY, POCKET_DIMENSION, PLAYER_DIMENSION, MINI_ZONE, or WORLD_LAYER+)"
+            "place_card: unsupported surface {other} (expected INVENTORY, PLAYER_INVENTORY, POCKET_DIMENSION, MINI_ZONE, or WORLD_LAYER+)"
         )),
     }
 }

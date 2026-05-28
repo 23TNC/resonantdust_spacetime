@@ -236,7 +236,7 @@ pub struct Card {
     pub card_id: u32,
     pub surface: u8,
     #[index(btree)]
-    pub macro_zone: u32,
+    pub macro_zone: u64,
     pub micro_zone: u8,
     /// Index motivator: state-3 (`StackedState::Deferred`) cards
     /// carry their host's `card_id` in `micro_location`. When the
@@ -851,7 +851,7 @@ pub fn scrub_or_repath_position_forward(
     card_id: u32,
     after_ms: u64,
     new_surface: u8,
-    new_macro_zone: u32,
+    new_macro_zone: u64,
     new_micro_zone: u8,
     new_micro_location: u32,
 ) {
@@ -929,7 +929,7 @@ pub fn create(
     ctx: &ReducerContext,
     card_id: u32,
     surface: u8,
-    macro_zone: u32,
+    macro_zone: u64,
     micro_zone: u8,
     micro_location: u32,
     owner_id: u32,
@@ -1051,7 +1051,7 @@ pub fn create_at(
     card_id: u32,
     time_ms: u64,
     surface: u8,
-    macro_zone: u32,
+    macro_zone: u64,
     micro_zone: u8,
     micro_location: u32,
     owner_id: u32,
@@ -1173,19 +1173,10 @@ struct HexOccupancy {
 /// dedupes by `card_id` (history rows produce multiple entries per
 /// card_id), and resolves each card_id to its row current at
 /// `time_ms` via [`prior_at`].
-///
-/// `owner_id_filter` is the per-surface discriminator: pass
-/// `Some(player_id)` on `PLAYER_DIMENSION_LAYER` (where multiple
-/// players' Zones share `(surface, macro_zone)`) to scope iteration
-/// to that player's cards; pass `None` on every other surface
-/// (world / mini_zone / pocket / inventory) where the
-/// `(surface, macro_zone)` tuple already uniquely identifies one
-/// container.
 fn inspect_hex(
     ctx: &ReducerContext,
     surface: u8,
-    macro_zone: u32,
-    owner_id_filter: Option<u32>,
+    macro_zone: u64,
     q: u8,
     r: u8,
     tile_card_type: u8,
@@ -1206,11 +1197,6 @@ fn inspect_hex(
         };
         if latest.surface != surface {
             continue;
-        }
-        if let Some(want) = owner_id_filter {
-            if latest.owner_id != want {
-                continue;
-            }
         }
         let (cq, cr, state) = unpack_micro_zone(latest.micro_zone);
         let (card_type, _) = unpack_definition(latest.packed_definition);
@@ -1256,20 +1242,16 @@ fn inspect_hex(
 /// (standalone Free at the hex, or OnRoot/STACK_DIR_HEX beneath a
 /// rect). `time_ms` filters future-stamped rows so concurrent accepts
 /// see a consistent snapshot.
-///
-/// `owner_id_filter` — see [`inspect_hex`]. `Some(player_id)` on
-/// `PLAYER_DIMENSION_LAYER`, `None` elsewhere.
 pub fn find_tile_card_at(
     ctx: &ReducerContext,
     surface: u8,
-    macro_zone: u32,
-    owner_id_filter: Option<u32>,
+    macro_zone: u64,
     q: u8,
     r: u8,
     tile_card_type: u8,
     time_ms: u64,
 ) -> Option<Card> {
-    inspect_hex(ctx, surface, macro_zone, owner_id_filter, q, r, tile_card_type, time_ms).tile_card
+    inspect_hex(ctx, surface, macro_zone, q, r, tile_card_type, time_ms).tile_card
 }
 
 /// Promote a zone tile to a real Card row, or return the existing
@@ -1301,29 +1283,24 @@ pub fn find_tile_card_at(
 /// macro_zone)`, when `(q, r)` is out of range, or when the zone
 /// slot is empty (`def_id == 0`).
 ///
-/// `owner_id_filter` — see [`inspect_hex`]. `Some(player_id)` on
-/// `PLAYER_DIMENSION_LAYER`, `None` elsewhere. The created card's
-/// `owner_id` comes from the resolved Zone's `owner_id`, so on
-/// surface 62 the promoted tile-card lands with `owner_id =
-/// player_id` (the player owns it), matching the dim's
-/// discriminator.
+/// The created card's `owner_id` comes from the resolved Zone's
+/// `owner_id`.
 pub fn find_or_create_tile_card(
     ctx: &ReducerContext,
     surface: u8,
-    macro_zone: u32,
-    owner_id_filter: Option<u32>,
+    macro_zone: u64,
     q: u8,
     r: u8,
     time_ms: u64,
 ) -> Result<Card, String> {
-    let zone = resolve_zone(ctx, surface, macro_zone, owner_id_filter).ok_or_else(|| {
+    let zone = crate::zones::latest_for(ctx, surface, macro_zone).ok_or_else(|| {
         format!(
-            "find_or_create_tile_card: no zone at (surface={surface}, macro_zone={macro_zone}, owner={owner_id_filter:?})"
+            "find_or_create_tile_card: no zone at (surface={surface}, macro_zone={macro_zone})"
         )
     })?;
     let tile_card_type = unpack_zone_definition(zone.packed_definition);
 
-    let occupancy = inspect_hex(ctx, surface, macro_zone, owner_id_filter, q, r, tile_card_type, time_ms);
+    let occupancy = inspect_hex(ctx, surface, macro_zone, q, r, tile_card_type, time_ms);
     if let Some(existing) = occupancy.tile_card {
         return Ok(existing);
     }
@@ -1444,56 +1421,28 @@ pub fn set_tile_stock(
 // (Phase 4+) surfaces here without callers having to know about
 // promotion.
 //
-// **Owner discrimination.** Every read takes `owner_id_filter:
-// Option<u32>`. Pass `Some(player_id)` on `PLAYER_DIMENSION_LAYER`
-// (where the same `(surface, macro_zone)` is shared across players)
-// so the read resolves to the right player's Zone and only iterates
-// that player's cards. Pass `None` on every other surface — there's
-// one container per `(surface, macro_zone)` and the filter would
-// incorrectly reject world cards (whose `owner_id` varies by
-// owning chain, not by the Zone's `owner_id`).
-//
 // **Stock caveat.** Tile-cards don't carry stock until the Phase 4
 // write-reroute lands. Until then `tile_full_view` returns stock
 // from the Zone slot even when a tile-card is present. Callers that
 // need post-Phase-4-correct stock should keep reading through these
 // helpers — the stock source flips silently when Phase 4 lands.
 
-/// Resolve the Zone at `(surface, macro_zone)`, applying owner
-/// discrimination when `owner_id_filter == Some(_)`. Shared internal
-/// helper for the tile-read entry points so they all dispatch the
-/// `latest_for` vs `latest_for_owner` choice the same way.
-fn resolve_zone(
-    ctx: &ReducerContext,
-    surface: u8,
-    macro_zone: u32,
-    owner_id_filter: Option<u32>,
-) -> Option<crate::zones::Zone> {
-    match owner_id_filter {
-        Some(o) => crate::zones::latest_for_owner(ctx, surface, macro_zone, o),
-        None => crate::zones::latest_for(ctx, surface, macro_zone),
-    }
-}
-
 /// Card-priority view of the tile def at `(surface, macro_zone, q,
 /// r)`. Returns the promoted tile-card's def_id when one exists,
 /// else the Zone slot's def_id. Returns `None` when no Zone is
 /// registered or `(q, r)` is out of range.
-///
-/// `owner_id_filter` — see module-level comment above.
 pub fn tile_def_id_view(
     ctx: &ReducerContext,
     surface: u8,
-    macro_zone: u32,
-    owner_id_filter: Option<u32>,
+    macro_zone: u64,
     q: u8,
     r: u8,
     time_ms: u64,
 ) -> Option<u16> {
-    let zone = resolve_zone(ctx, surface, macro_zone, owner_id_filter)?;
+    let zone = crate::zones::latest_for(ctx, surface, macro_zone)?;
     let tile_card_type = unpack_zone_definition(zone.packed_definition);
     if let Some(tile) =
-        find_tile_card_at(ctx, surface, macro_zone, owner_id_filter, q, r, tile_card_type, time_ms)
+        find_tile_card_at(ctx, surface, macro_zone, q, r, tile_card_type, time_ms)
     {
         let (_, def_id) = unpack_definition(tile.packed_definition);
         return Some(def_id);
@@ -1510,22 +1459,19 @@ pub fn tile_def_id_view(
 /// Returns `None` when no Zone is registered, `(q, r)` is out of
 /// range, OR when there's no tile-card and the Zone slot is empty
 /// (`def_id == 0`).
-///
-/// `owner_id_filter` — see module-level comment above.
 pub fn tile_full_view(
     ctx: &ReducerContext,
     surface: u8,
-    macro_zone: u32,
-    owner_id_filter: Option<u32>,
+    macro_zone: u64,
     q: u8,
     r: u8,
     time_ms: u64,
 ) -> Option<(u16, u8, u8)> {
-    let zone = resolve_zone(ctx, surface, macro_zone, owner_id_filter)?;
+    let zone = crate::zones::latest_for(ctx, surface, macro_zone)?;
     let tile_card_type = unpack_zone_definition(zone.packed_definition);
 
     if let Some(tile) =
-        find_tile_card_at(ctx, surface, macro_zone, owner_id_filter, q, r, tile_card_type, time_ms)
+        find_tile_card_at(ctx, surface, macro_zone, q, r, tile_card_type, time_ms)
     {
         // Card-resident def AND stock win — Phase 4's per-card stock
         // storage in `flags_bk.tile_stock_{0,1}` is canonical for
@@ -1549,7 +1495,7 @@ pub fn set_surface(ctx: &ReducerContext, card_id: u32, surface: u8) -> Option<Ca
     update_with(ctx, card_id, |c| c.surface = surface)
 }
 
-pub fn set_macro_zone(ctx: &ReducerContext, card_id: u32, macro_zone: u32) -> Option<Card> {
+pub fn set_macro_zone(ctx: &ReducerContext, card_id: u32, macro_zone: u64) -> Option<Card> {
     update_with(ctx, card_id, |c| c.macro_zone = macro_zone)
 }
 

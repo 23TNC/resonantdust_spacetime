@@ -26,7 +26,7 @@ use crate::packed::{pack_micro_zone, unpack_micro_zone, StackedState};
 pub struct CardStack {
     pub root: u32,
     pub surface: u8,
-    pub macro_zone: u32,
+    pub macro_zone: u64,
     pub micro_zone: u8,
     pub micro_location: u32,
     pub stack_up: Vec<u32>,

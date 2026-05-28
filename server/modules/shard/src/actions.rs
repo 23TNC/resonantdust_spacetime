@@ -5,7 +5,7 @@
 //! ```text
 //! propose_action(
 //!   recipe_id: u16,
-//!   surface: u8, macro_zone: u32, micro_zone: u8,  // root's intended location
+//!   surface: u8, macro_zone: u64, micro_zone: u8,  // root's intended location
 //!   root: u32,
 //!   bindings: Vec<Vec<u32>>,    // bindings[iter_id][offset] = card_id
 //! )
@@ -85,18 +85,11 @@ const TILE_CARD_TYPE: u8 = 7;
 /// `(q, r)` from `micro_zone`, returns the tile's `packed_definition`,
 /// per-row stocks (for stock-aware predicate eval), and a
 /// [`HexLocation`] the tape walker uses for tile-side modify ops.
-///
-/// `owner_id_filter` — `Some(player_id)` on
-/// `PLAYER_DIMENSION_LAYER` so the Zone + tile-card lookups
-/// disambiguate which player's dimension is being acted on.
-/// `None` everywhere else (world / mini_zone / pocket use the
-/// `(surface, macro_zone)` tuple as their unique address).
 fn derive_synthetic_hex(
     ctx: &ReducerContext,
     surface: u8,
-    macro_zone: u32,
+    macro_zone: u64,
     micro_zone: u8,
-    owner_id_filter: Option<u32>,
     now_ms: u64,
 ) -> Option<(u16, (u8, u8), HexLocation)> {
     if surface < SYNTHETIC_HEX_MIN_SURFACE {
@@ -106,15 +99,11 @@ fn derive_synthetic_hex(
     // Card-priority read: a previously promoted tile-card (which may
     // carry a mutated def — Phase 4+) wins over the Zone slot.
     let (packed_def, stock0, stock1) =
-        cards::tile_full_view(ctx, surface, macro_zone, owner_id_filter, q, r, now_ms)?;
+        cards::tile_full_view(ctx, surface, macro_zone, q, r, now_ms)?;
     // HexLocation still references the Zone (zone_id / owner_id) —
     // Phase 4 reroutes writes through cards and drops HexLocation's
-    // role here. Owner-aware resolution mirrors `tile_full_view` so
-    // the same Zone row backs both reads.
-    let zone = match owner_id_filter {
-        Some(o) => crate::zones::latest_for_owner(ctx, surface, macro_zone, o)?,
-        None => crate::zones::latest_for(ctx, surface, macro_zone)?,
-    };
+    // role here.
+    let zone = crate::zones::latest_for(ctx, surface, macro_zone)?;
     Some((
         packed_def,
         (stock0, stock1),
@@ -151,7 +140,7 @@ pub fn propose_action(
     client_time_ms: u64,
     recipe_id: u16,
     surface: u8,
-    macro_zone: u32,
+    macro_zone: u64,
     micro_zone: u8,
     root: u32,
     bindings: Vec<Vec<u32>>,
@@ -192,7 +181,7 @@ fn propose_action_inner(
     client_time_ms: u64,
     recipe_id: u16,
     surface: u8,
-    macro_zone: u32,
+    macro_zone: u64,
     micro_zone: u8,
     root: u32,
     bindings: &[Vec<u32>],
@@ -216,19 +205,6 @@ fn propose_action_inner(
     // ActionManager parses these and schedules a retry.
     let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
 
-    // Owner filter for tile reads/writes on the action's target
-    // surface. Only `PLAYER_DIMENSION_LAYER` has multiple Zones at
-    // the same `(surface, macro_zone)` discriminated by `owner_id`;
-    // every other surface uses `None`. The discriminator is the
-    // caller's `player_id` — recipes targeting another player's
-    // dimension are rejected at the recipe-verify ownership gate
-    // (caller's soul must own the root/hex on private surfaces).
-    let owner_filter = if surface == crate::packed::PLAYER_DIMENSION_LAYER {
-        Some(caller_player_id)
-    } else {
-        None
-    };
-
     // If the recipe references branch 0 and the client sent 0
     // (sentinel) for that binding, resolve a synthetic tile from
     // zone data. Only valid when bindings is exactly [0].
@@ -239,7 +215,6 @@ fn propose_action_inner(
         surface,
         macro_zone,
         micro_zone,
-        owner_filter,
         now_ms,
     )?;
 
@@ -251,7 +226,7 @@ fn propose_action_inner(
     // path until Phases 3/7 retire it. See `docs/TILE_AS_CARD.md`.
     let substituted_bindings: Option<Vec<Vec<u32>>> = if synthetic_hex.is_some() {
         let (q, r, _) = unpack_micro_zone(micro_zone);
-        let tile_card = cards::find_or_create_tile_card(ctx, surface, macro_zone, owner_filter, q, r, now_ms)
+        let tile_card = cards::find_or_create_tile_card(ctx, surface, macro_zone, q, r, now_ms)
             .map_err(|e| format!("promote tile: {e}"))?;
         let mut new_bindings = bindings.to_vec();
         for (iter_id, it) in recipe_ref.iterators.iter().enumerate() {
@@ -353,9 +328,8 @@ fn resolve_synthetic_if_needed(
     recipe: &Recipe,
     bindings: &[Vec<u32>],
     surface: u8,
-    macro_zone: u32,
+    macro_zone: u64,
     micro_zone: u8,
-    owner_id_filter: Option<u32>,
     now_ms: u64,
 ) -> Result<Option<(u16, (u8, u8), HexLocation)>, String> {
     for (iter_id, it) in recipe.iterators.iter().enumerate() {
@@ -367,7 +341,7 @@ fn resolve_synthetic_if_needed(
             // tiles. If the recipe uses slot.0.1+, those must be
             // real cards.
             if !binding.is_empty() && binding[0] == 0 {
-                let synth = derive_synthetic_hex(ctx, surface, macro_zone, micro_zone, owner_id_filter, now_ms)
+                let synth = derive_synthetic_hex(ctx, surface, macro_zone, micro_zone, now_ms)
                     .ok_or_else(|| {
                         format!(
                             "recipe references branch 0 with synthetic sentinel \
@@ -935,7 +909,7 @@ fn chain_stitch(
     recipe: &Recipe,
     root: u32,
     surface: u8,
-    macro_zone: u32,
+    macro_zone: u64,
     micro_zone: u8,
     bindings: &[Vec<u32>],
     now_ms: u64,

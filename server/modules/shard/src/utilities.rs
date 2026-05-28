@@ -63,7 +63,7 @@ pub fn add_card(
         card_id,
         now_ms,
         /* surface         */ 1,
-        /* macro_zone      */ soul_card_id,
+        /* macro_zone      */ soul_card_id as u64,
         /* micro_zone      */ 0,
         /* micro_location  */ 0,
         /* owner_id        */ soul_card_id,
@@ -90,10 +90,10 @@ pub fn add_card(
 /// and the world-card spawn path skips tiles already holding a world
 /// card.
 ///
-/// **No per-player setup happens here anymore.** Soul + starter
-/// cards are spawned by `character_creation::create_character` when
-/// the player picks a starter pack at character select. This reducer
-/// is purely a world-seeding entry point (admin / dev tooling).
+/// **No per-player setup happens here anymore.** A player's soul +
+/// starter cards are spawned by `players::spawn_soul_for` on signup.
+/// This reducer is purely a world-seeding entry point (admin / dev
+/// tooling).
 ///
 /// **Surface convention:** zone rows use `surface = 64` (first world
 /// layer; the `< 64` range is reserved for inventory-ish surfaces,

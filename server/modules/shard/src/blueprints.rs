@@ -1,8 +1,8 @@
 //! Blueprint-request reducer.
 //!
 //! Players "request" a blueprint by clicking a known blueprint in
-//! the wrench panel and choosing a placement target (typically
-//! inside their pocket dimension). The reducer spawns a real
+//! the wrench panel and choosing a placement target. The reducer
+//! spawns a real
 //! `blueprint`-card-type row at the requested address, owned by
 //! the acting soul, and counts it against the soul's
 //! `active_blueprints` cap (sourced from the soul's
@@ -10,14 +10,14 @@
 //!
 //! Auth: the caller's identity must resolve to the player who
 //! owns the requesting soul. Without this gate a malicious client
-//! could spawn blueprints into another player's dimension or under
+//! could spawn blueprints at an arbitrary address or under
 //! another player's soul.
 //!
 //! Resolution of placed blueprints (commit / cancel — building the
 //! actual structure, returning the slot to the cap) is TBD; this
 //! reducer only owns the SPAWN side.
 
-use resonantdust_content::blueprint_core::{blueprint, BlueprintScope, BLUEPRINT_NONE};
+use resonantdust_content::blueprint_core::{blueprint, BLUEPRINT_NONE};
 use resonantdust_content::definition_core::{
     aspect_id as core_aspect_id, decode_definition, is_aspect_descendant,
 };
@@ -25,11 +25,8 @@ use spacetimedb::{reducer, ReducerContext};
 
 use crate::cards;
 use crate::flags::state_flags;
-use crate::players::{self, player_profiles as _player_profiles_table};
-use crate::souls::{
-    is_soul_card, player_blueprint_count_for_player, player_blueprint_max_for_player,
-    soul_privates as _soul_privates_table,
-};
+use crate::players;
+use crate::souls::{is_soul_card, soul_privates as _soul_privates_table};
 
 /// Place a blueprint card at the requested location, owned by the
 /// caller's soul.
@@ -66,7 +63,7 @@ pub fn request_blueprint(
     soul_card_id: u32,
     blueprint_id: u16,
     surface: u8,
-    macro_zone: u32,
+    macro_zone: u64,
     micro_zone: u8,
     micro_location: u32,
 ) -> Result<(), String> {
@@ -119,7 +116,7 @@ pub fn request_blueprint(
     if blueprint_id == BLUEPRINT_NONE {
         return Err("request_blueprint: blueprint_id 0 is reserved".to_string());
     }
-    let bp = blueprint(BlueprintScope::Soul, blueprint_id)
+    let bp = blueprint(blueprint_id)
         .map_err(|e| format!("request_blueprint: blueprint registry: {e}"))?
         .ok_or_else(|| format!("request_blueprint: blueprint id {blueprint_id} not registered"))?;
 
@@ -203,125 +200,6 @@ pub fn request_blueprint(
         /* owner_id */ soul_card_id,
         bp.blueprint_packed_definition,
         /* flags_state */ 0,
-        /* flags_bk */ 0,
-    );
-
-    Ok(())
-}
-
-/// Place a `player_blueprint` card at the requested location, owned
-/// by the caller player directly. Mirrors [`request_blueprint`] but
-/// operates in the player scope:
-///
-/// 1. Caller identity → `player_id`. `now_ms` via `effective_now_ms`.
-/// 2. Validate the blueprint:
-///    - `blueprint_id` is non-zero and registered in the *player*
-///      scope of the blueprint catalog
-///    - player has the discovery bit set in
-///      `PlayerProfile.blueprints_0`
-/// 3. Validate the cap:
-///    - read `nibble_max(blueprint_info)` for the caller
-///    - reject if `nibble_count(blueprint_info) >= max`
-/// 4. Spawn the card at the requested address with `owner_id =
-///    player_id`. The card carries `card_type = player_blueprint`,
-///    so [`crate::souls::on_card_write`] bumps the count nibble on
-///    its own.
-///
-/// **Idempotency.** Same as `request_blueprint` — no dedup, the
-/// client should suppress the next request until the spawn row
-/// arrives via subscription.
-#[reducer]
-#[allow(clippy::too_many_arguments)]
-pub fn request_player_blueprint(
-    ctx: &ReducerContext,
-    client_time_ms: u64,
-    blueprint_id: u16,
-    surface: u8,
-    macro_zone: u32,
-    micro_zone: u8,
-    micro_location: u32,
-) -> Result<(), String> {
-    let caller_player_id = players::resolve_caller(ctx)?;
-    let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
-
-    // ---- blueprint catalog + access lookups ----------------------
-    if blueprint_id == BLUEPRINT_NONE {
-        return Err("request_player_blueprint: blueprint_id 0 is reserved".to_string());
-    }
-    let bp = blueprint(BlueprintScope::Player, blueprint_id)
-        .map_err(|e| format!("request_player_blueprint: blueprint registry: {e}"))?
-        .ok_or_else(|| {
-            format!("request_player_blueprint: blueprint id {blueprint_id} not registered")
-        })?;
-
-    let profile = ctx
-        .db
-        .player_profiles()
-        .player_id()
-        .find(caller_player_id)
-        .ok_or_else(|| {
-            format!(
-                "request_player_blueprint: no PlayerProfile row for player {caller_player_id}"
-            )
-        })?;
-    // `blueprints_0` covers ids 1..=64 (bit position = id - 1). Past
-    // that bucket lives in a future `blueprints_1`; reject with an
-    // explicit error rather than silently denying.
-    if blueprint_id > 64 {
-        return Err(format!(
-            "request_player_blueprint: blueprint id {blueprint_id} outside the blueprints_0 \
-             bucket (1..=64); extend PlayerProfile before requesting"
-        ));
-    }
-    let bit = 1u64 << (blueprint_id - 1);
-    if profile.blueprints_0 & bit == 0 {
-        return Err(format!(
-            "request_player_blueprint: player {caller_player_id} has not discovered \
-             blueprint {blueprint_id} (key={:?})",
-            bp.key
-        ));
-    }
-
-    // ---- cap check: profile max vs live count -------------------
-    let max_active = player_blueprint_max_for_player(ctx, caller_player_id).unwrap_or(0);
-    if max_active == 0 {
-        return Err(format!(
-            "request_player_blueprint: player {caller_player_id} has no player-blueprint \
-             slots (max=0)"
-        ));
-    }
-    let current = player_blueprint_count_for_player(ctx, caller_player_id).unwrap_or(0);
-    if current >= max_active {
-        return Err(format!(
-            "request_player_blueprint: player {caller_player_id} already has {current} \
-             active player blueprints (cap {max_active})"
-        ));
-    }
-
-    // ---- spawn the player_blueprint card -------------------------
-    //
-    // Carries `FLAG_OWNED_BY_PLAYER` so the owner-chain walk
-    // terminates immediately at this row and `owner_id` is read as
-    // the player_id directly — same shape souls use. Without the
-    // flag, `owning_player` would try to treat `caller_player_id`
-    // as a card_id and walk further (almost certainly wrong, since
-    // card_id and player_id share an integer namespace at the row
-    // level). Bookkeeping is hook-driven:
-    // `crate::souls::on_card_write` picks up the new
-    // player_blueprint row and bumps the count nibble.
-    let owned_by_player = state_flags().is_owned_by_player;
-    let card_id = cards::next_card_id(ctx);
-    cards::create_at(
-        ctx,
-        card_id,
-        now_ms,
-        surface,
-        macro_zone,
-        micro_zone,
-        micro_location,
-        /* owner_id */ caller_player_id,
-        bp.blueprint_packed_definition,
-        /* flags_state */ owned_by_player,
         /* flags_bk */ 0,
     );
 

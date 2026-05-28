@@ -126,7 +126,7 @@ const BLOCK_ERROR_PREFIX: &str = "magnetic_blocked:";
 /// `involved_card_ids` is the set of card_ids the calling reducer is
 /// touching as part of its action — typically `[hex, root, ...slots]`
 /// for `propose_action`, or empty for reducers that don't reference
-/// existing cards (`character_creation`, `deploy_mini_zone`).
+/// existing cards (`deploy_mini_zone`).
 ///
 /// Returns:
 ///

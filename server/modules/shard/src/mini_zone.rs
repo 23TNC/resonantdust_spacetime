@@ -103,7 +103,7 @@ fn hex_distance(a: (i32, i32), b: (i32, i32)) -> i32 {
 /// Convert `(macro_zone, micro_zone)` to a global hex coord
 /// `(global_q, global_r)`. Each macro_zone is an 8×8 chunk; the
 /// global axis is `macro * 8 + local`.
-fn global_hex(macro_zone: u32, micro_zone: u8) -> (i32, i32) {
+fn global_hex(macro_zone: u64, micro_zone: u8) -> (i32, i32) {
     let (mq, mr) = unpack_macro_zone(macro_zone);
     let (lq, lr, _) = unpack_micro_zone(micro_zone);
     (mq as i32 * 8 + lq as i32, mr as i32 * 8 + lr as i32)
@@ -123,7 +123,7 @@ fn global_hex(macro_zone: u32, micro_zone: u8) -> (i32, i32) {
 /// meaningful otherwise.
 pub fn anchor_covering_hex(
     ctx: &ReducerContext,
-    world_macro_zone: u32,
+    world_macro_zone: u64,
     world_micro_zone: u8,
 ) -> Option<Card> {
     let target_global = global_hex(world_macro_zone, world_micro_zone);
@@ -179,10 +179,10 @@ pub fn anchor_covering_hex(
 pub fn tile_at_anchor(
     ctx: &ReducerContext,
     anchor: &Card,
-    world_macro_zone: u32,
+    world_macro_zone: u64,
     world_micro_zone: u8,
 ) -> Option<(u16, (u8, u8), action_completion::HexLocation)> {
-    let zone = zones::latest_for(ctx, MINI_ZONE_LAYER, anchor.card_id)?;
+    let zone = zones::latest_for(ctx, MINI_ZONE_LAYER, anchor.card_id as u64)?;
     let target_global = global_hex(world_macro_zone, world_micro_zone);
     let anchor_global = global_hex(anchor.macro_zone, anchor.micro_zone);
     let dq = target_global.0 - anchor_global.0;
@@ -234,7 +234,7 @@ pub fn deploy_mini_zone(
     ctx: &ReducerContext,
     client_time_ms: u64,
     anchor_card_id: u32,
-    target_macro_zone: u32,
+    target_macro_zone: u64,
     target_micro_zone: u8,
 ) -> Result<(), String> {
     // ---- caller resolution ----------------------------------------
@@ -391,7 +391,7 @@ pub fn deploy_mini_zone(
         ctx,
         zone_id,
         MINI_ZONE_LAYER,
-        anchor_card_id,
+        anchor_card_id as u64,
         tile_zone_packed_def,
         // `Zone.owner_id` is a card_id under the new model — the
         // anchor itself is the container card for the mini_zone's
@@ -511,7 +511,7 @@ pub fn pickup_mini_zone(
         .db
         .cards()
         .macro_zone()
-        .filter(anchor_card_id)
+        .filter(anchor_card_id as u64)
         .filter_map(|c| {
             if c.surface != MINI_ZONE_LAYER {
                 return None;
@@ -535,7 +535,7 @@ pub fn pickup_mini_zone(
         let Some(latest) = cards::prior_at(ctx, id, now_ms) else {
             continue;
         };
-        if latest.surface != MINI_ZONE_LAYER || latest.macro_zone != anchor_card_id {
+        if latest.surface != MINI_ZONE_LAYER || latest.macro_zone != anchor_card_id as u64 {
             // Moved out since we started iterating — leave alone.
             continue;
         }
@@ -559,7 +559,7 @@ pub fn pickup_mini_zone(
         .db
         .zones()
         .macro_zone()
-        .filter(anchor_card_id)
+        .filter(anchor_card_id as u64)
         .filter(|z| z.surface == MINI_ZONE_LAYER)
         .map(|z| z.valid_at)
         .collect();
@@ -570,7 +570,7 @@ pub fn pickup_mini_zone(
     // ---- return the anchor to inventory ---------------------------
     cards::update_with_at(ctx, anchor_card_id, now_ms, |c| {
         c.surface = INVENTORY_LAYER;
-        c.macro_zone = target_soul_card_id;
+        c.macro_zone = target_soul_card_id as u64;
         c.micro_zone = 0;
         c.micro_location = 0;
         // Back in the soul's inventory bucket — `owner_id` carries

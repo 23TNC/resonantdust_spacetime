@@ -5,10 +5,11 @@ use std::collections::BTreeSet;
 use crate::cards::{self, cards as _cards_table};
 use crate::flags::state_flags;
 use crate::packed::{
-    pack_macro_zone, pack_micro_zone, pack_nibbles, pack_valid_at, valid_at_time, StackedState,
-    PLAYER_DIMENSION_LAYER, PLAYER_INVENTORY_LAYER,
+    pack_macro_zone, pack_micro_zone, pack_valid_at, valid_at_time,
+    StackedState,
 };
 use crate::sequence;
+use crate::souls::{soul_privates as _soul_privates_table, with_portrait, SoulPrivate};
 
 /// Maximum byte length of a `Player.name`. Enforced by `validate_player_name`
 /// on the input name and again after normalization in `claim_or_login`.
@@ -26,8 +27,8 @@ pub const FIRST_PLAYER_ID: u32 = 1024;
 /// (entitlements, settings) lives in `PlayerProfile` instead.
 ///
 /// "Which soul is this player currently controlling" is **not**
-/// stored on the server — it's a purely client-side construct
-/// driven by `CharacterSelectScene` and held by `SoulManager`. Each
+/// stored on the server — it's a purely client-side construct held
+/// by `SoulManager`. Each
 /// reducer that needs a soul takes `soul_card_id` explicitly (or
 /// derives one via `cards::owning_soul` from a card already in
 /// context). Souls themselves live as cards with
@@ -164,21 +165,12 @@ pub struct PlayerSession {
 /// `valid_at` history machinery would be deadweight.
 ///
 /// **Initial row.** Created in `claim_or_login`'s new-player branch
-/// alongside the soul spawn. Default `starter_packs = 1` grants the
-/// human starter pack (bit 0) on signup.
+/// alongside the soul spawn (`spawn_soul_for`).
 #[spacetimedb::table(accessor = player_profiles, public)]
 #[derive(Debug, Clone)]
 pub struct PlayerProfile {
     #[primary_key]
     pub player_id: u32,
-    /// Bit field of unlocked starter packs. Bit position is assigned
-    /// by `content/starter_packs/id.json` (matching the bare-key →
-    /// id mapping used elsewhere). Bit 0 (= `human`) is set on
-    /// signup so a fresh player can redeem the default pack
-    /// immediately. Toggling a bit on (= unlock) is one-way under
-    /// today's rules; "removing" a pack would require a tombstone
-    /// policy we don't have yet.
-    pub starter_packs: u64,
     /// Number of active magnetic actions owned by this player —
     /// summary of the `lifecycle_pending` detail table, kept on the
     /// row so the block-check in `propose_action` doesn't need a
@@ -193,33 +185,6 @@ pub struct PlayerProfile {
     /// gate (`now_ms > earliest + GRACE`). Recomputed from the
     /// `lifecycle_pending` detail rows whenever an entry changes.
     pub earliest_lifecycle_expires_ms: u64,
-    /// Bit field of discovered **player-scope** blueprints, ids
-    /// 1..=64. Bit position is `id - 1`, matching the 1-indexed
-    /// mapping in `content/player_blueprints/id.json`. Player-scope
-    /// is distinct from soul-scope: soul blueprints live on
-    /// `SoulPrivate.blueprints_0` with their own id namespace.
-    /// `0` on signup — discovery is gameplay-driven. Flipping a
-    /// bit on is one-way.
-    pub blueprints_0: u64,
-    /// Packed `[count: u4 | max: u4]` — placed `player_blueprint`
-    /// cards owned by this player vs the cap. Use
-    /// [`packed::pack_nibbles`] / [`packed::unpack_nibbles`] to
-    /// access. Maintained by the `souls::on_card_write` hook the
-    /// same way `lifecycle_count` is — a spawn / death of a
-    /// player-blueprint card adjusts the `count` nibble. The
-    /// `max` nibble is set on signup (default 1) and grown later
-    /// via a (TBD) unlock mechanism. Cap reached → server's
-    /// `request_player_blueprint` rejects.
-    pub blueprint_info: u8,
-    /// Packed `[count: u4 | max: u4]` — live soul cards owned by
-    /// this player vs the cap. Replaces the old hardcoded
-    /// `MAX_SOULS_PER_PLAYER = 5` constant: `count` is maintained
-    /// by the `on_card_write` hook (incremented on soul-card
-    /// create, decremented on soul-card dead); `max` defaults to
-    /// 5 on signup and can be grown via gameplay. The
-    /// character-creation reducer reads both nibbles to gate
-    /// new-soul spawns.
-    pub soul_info: u8,
 }
 
 fn now_ms(ctx: &ReducerContext) -> u64 {
@@ -397,8 +362,7 @@ pub fn resync_lifecycle_summary(ctx: &ReducerContext, player_id: u32) {
     profile.earliest_lifecycle_expires_ms = earliest;
     // PlayerProfile is mutated in place (one row per player, not
     // history-style), so a delete+insert keyed by player_id is the
-    // pattern. Same as the existing starter_packs update path (if
-    // one existed).
+    // pattern.
     ctx.db.player_profiles().player_id().delete(player_id);
     ctx.db.player_profiles().insert(profile);
 }
@@ -645,54 +609,19 @@ pub fn claim_or_login(
         }
         None => {
             let new_id = next_player_id(ctx);
-            // Character creation (via starter-pack redemption) is a
-            // separate, explicit flow — a freshly-claimed player has
-            // no souls until they pick one through
-            // `CharacterSelectScene`'s create-character path.
+            // A freshly-claimed player is auto-granted exactly one
+            // soul (see `spawn_soul_for` below) — there is no
+            // separate character-creation step.
             create_at(ctx, new_id, name, now_ms);
-            // Seed the per-player private state row. `starter_packs
-            // = 1` grants bit 0 (the `human` default pack) on signup
-            // so the player can immediately redeem the starter
-            // content.
+            // Seed the per-player private state row.
             ctx.db.player_profiles().insert(PlayerProfile {
                 player_id: new_id,
-                starter_packs: 1,
                 lifecycle_count: 0,
                 earliest_lifecycle_expires_ms: 0,
-                // No player-blueprints discovered on signup.
-                blueprints_0: 0,
-                // 1 placement slot to start, 0 in use. Grows via
-                // (TBD) unlock mechanism.
-                blueprint_info: pack_nibbles(0, 1),
-                // 5-soul cap matches the legacy
-                // `MAX_SOULS_PER_PLAYER = 5` constant. `count`
-                // starts at 0 — the new-player branch doesn't spawn
-                // a soul itself; that happens via
-                // `create_character`.
-                soul_info: pack_nibbles(0, 5),
             });
-            // Eager-create the player's private pocket dimension —
-            // a 2×2 grid of full-8×8 Zones on
-            // `PLAYER_DIMENSION_LAYER (62)` seeded with a 7-cell
-            // hex-ring-1 walkable cluster around local (3, 3) so
-            // souls have somewhere to stand on entry. Souls visit
-            // it via `enter_player_dimension`. Failure here
-            // propagates and rolls the whole new-player txn back so
-            // player + profile + dim Zones commit together or not
-            // at all.
-            crate::zones::create_player_dimension(ctx, new_id, now_ms)?;
-            // Seed the player-wide inventory bucket with a single
-            // `dust` card so the inventory UI has something to show
-            // on first login. Cards on `PLAYER_INVENTORY_LAYER`
-            // carry `owner_id = player_id` with
-            // `FLAG_OWNED_BY_PLAYER` set — `owning_player` resolves
-            // them in one hop without walking a soul chain.
-            seed_player_inventory(ctx, new_id, now_ms)?;
-            // Drop a couple of `corpse` cards onto random walkable
-            // tiles in chunk (0, 0) of the freshly-created dim. They
-            // share the inventory layer's player-owned flag pattern
-            // but live on `PLAYER_DIMENSION_LAYER`.
-            seed_player_dim_corpses(ctx, new_id, now_ms)?;
+            // Grant the player their (empty) player-soul. Nothing
+            // else is seeded — no account-wide inventory, no soul kit.
+            spawn_soul_for(ctx, new_id, now_ms)?;
             new_id
         }
     };
@@ -736,174 +665,71 @@ pub fn client_disconnected(ctx: &ReducerContext) {
     ctx.db.player_sessions().identity().delete(sender);
 }
 
-/// Seed a freshly-created player's account-wide inventory bucket.
-/// Drops one of each starter card into
-/// `(surface=PLAYER_INVENTORY_LAYER, macro_zone=player_id)` with
-/// `owner_id = player_id` and `FLAG_OWNED_BY_PLAYER` set so
-/// `owning_player` resolves them directly.
-///
-/// Called from `claim_or_login`'s new-player branch. Failure
-/// propagates and rolls the whole signup transaction back — the
-/// player either gets their full starter set or doesn't exist
-/// at all.
-///
-/// Starter cards: `dust` (the player-scope currency / catch-all),
-/// `food` (sustenance), `reliquary` (spiritual vessel). Add new
-/// entries to the list below to expand the kit.
-const STARTER_CARD_KEYS: &[&str] = &["dust", "food", "reliquary"];
+/// Surface the player's `player_soul` lives on. Deliberately `0` (not
+/// the world band `64`) so the player-soul is never rendered anywhere
+/// — it *is* the player, a thin soul that owns the world-facing souls
+/// in its inventory rather than standing on the map itself.
+const PLAYER_SOUL_SURFACE: u8 = 0;
 
-fn seed_player_inventory(
+/// Soul auto-granted to every new player. Hardcoded since the
+/// starter-pack content layer was removed — a fresh account is always
+/// a `player_soul`, resolved through the content catalog at signup.
+const STARTER_SOUL_KEY: &str = "player_soul";
+
+/// Grant a player their `player_soul`: spawn it on surface 0 (never
+/// rendered — it *is* the player) and seed an empty `SoulPrivate`
+/// row. Called once from `claim_or_login`'s new-player branch.
+///
+/// Deliberately minimal — the player-soul is a thin owner of other
+/// souls. It gets no starter inventory and no starter blueprints;
+/// those belong to the world-facing souls it will come to own.
+///
+/// The soul card write triggers `souls::on_card_write` branch (1),
+/// which auto-creates the matching `Soul` row — so this fn never
+/// touches the `Soul` table directly.
+///
+/// Failure propagates and rolls the whole signup transaction back.
+fn spawn_soul_for(
     ctx: &ReducerContext,
     player_id: u32,
     time_ms: u64,
 ) -> Result<(), String> {
-    for &key in STARTER_CARD_KEYS {
-        let packed = find_packed_by_key(key)?
-            .ok_or_else(|| format!(
-                "seed_player_inventory: card def {:?} not in content catalog",
-                key,
-            ))?;
-        let card_id = cards::next_card_id(ctx);
-        cards::create_at(
-            ctx,
-            card_id,
-            time_ms,
-            /* surface         */ PLAYER_INVENTORY_LAYER,
-            /* macro_zone      */ player_id,
-            /* micro_zone      */ 0,
-            /* micro_location  */ 0,
-            /* owner_id        */ player_id,
-            packed,
-            /* flags_state     */ state_flags().is_owned_by_player,
-            /* flags_bk        */ 0,
-        );
-    }
-    Ok(())
-}
-
-/// Drop a handful of `corpse` cards into the player's pocket dim on
-/// pseudo-random tiles. Called from `claim_or_login`'s new-player
-/// branch right after `create_player_dimension` lays down the dim's
-/// seed tiles. Cells are picked from the same hex-disc cluster the
-/// dim seeds — `concrete` ring tiles around the central `alter` — so
-/// every corpse lands on something walkable. Deterministic in
-/// `player_id` so the same player sees the same layout each login
-/// (and different players see different layouts).
-const SEED_RESONANCE_CORPSE_COUNT: usize = 2;
-const SEED_CHORD_CORPSE_COUNT: usize = 1;
-const SEED_CORPSE_COUNT: usize = SEED_RESONANCE_CORPSE_COUNT + SEED_CHORD_CORPSE_COUNT;
-
-fn seed_player_dim_corpses(
-    ctx: &ReducerContext,
-    player_id: u32,
-    time_ms: u64,
-) -> Result<(), String> {
-    // Faction-flavoured corpses — each variant's `<faction>` feature
-    // locks its art to that faction's folder regardless of who's
-    // looking. Two resonance + one chord today; swap for
-    // `corpse_bio` / `corpse_relic` / generic `corpse` (player-
-    // faction-tinted) as the seed content evolves.
-    let resonance_packed = find_packed_by_key("corpse_resonance")?.ok_or_else(|| {
-        "seed_player_dim_corpses: card def \"corpse_resonance\" not in content catalog".to_string()
+    let soul_def = find_packed_by_key(STARTER_SOUL_KEY)?.ok_or_else(|| {
+        format!(
+            "spawn_soul_for: soul def {:?} not in content catalog",
+            STARTER_SOUL_KEY,
+        )
     })?;
-    let chord_packed = find_packed_by_key("corpse_chord")?.ok_or_else(|| {
-        "seed_player_dim_corpses: card def \"corpse_chord\" not in content catalog".to_string()
-    })?;
+    let soul_card_id = cards::next_card_id(ctx);
 
-    let positions = walkable_dim_cells();
-    let picks = pseudo_random_picks(&positions, SEED_CORPSE_COUNT, player_id);
+    // Deterministic 4-bit portrait pick — mixing the soul's card id
+    // with `time_ms` and `player_id` gives a stable per-soul value
+    // without an rng (reducers must stay deterministic).
+    let portrait_seed =
+        (time_ms as u32) ^ (time_ms >> 32) as u32 ^ player_id ^ soul_card_id;
+    let portrait_id = ((portrait_seed ^ (portrait_seed >> 4)) & 0xF) as u8;
+    let soul_flags_state =
+        with_portrait(state_flags().is_owned_by_player, portrait_id);
 
-    // Chunk (0, 0) — the first chunk of the player's 2×2 dim. The
-    // seed disc is identical across all 4 chunks, but we drop the
-    // corpses in one chunk so the player finds them in the same
-    // place they spawn.
-    let macro_zone = pack_macro_zone(0, 0);
-    for (i, (local_q, local_r)) in picks.into_iter().enumerate() {
-        let corpse_packed = if i < SEED_RESONANCE_CORPSE_COUNT {
-            resonance_packed
-        } else {
-            chord_packed
-        };
-        let card_id = cards::next_card_id(ctx);
-        let micro_zone = pack_micro_zone(local_q, local_r, StackedState::Free);
-        cards::create_at(
-            ctx,
-            card_id,
-            time_ms,
-            /* surface         */ PLAYER_DIMENSION_LAYER,
-            macro_zone,
-            micro_zone,
-            /* micro_location  */ 0,
-            /* owner_id        */ player_id,
-            corpse_packed,
-            /* flags_state     */ state_flags().is_owned_by_player,
-            /* flags_bk        */ 0,
-        );
-    }
+    cards::create_at(
+        ctx,
+        soul_card_id,
+        time_ms,
+        /* surface         */ PLAYER_SOUL_SURFACE,
+        /* macro_zone      */ pack_macro_zone(0, 0),
+        /* micro_zone      */ pack_micro_zone(0, 0, StackedState::Free),
+        /* micro_location  */ 0,
+        /* owner_id        */ player_id,
+        soul_def,
+        /* flags_state     */ soul_flags_state,
+        /* flags_bk        */ 0,
+    );
+
+    // Empty per-soul private state — no starter blueprints granted.
+    ctx.db.soul_privates().insert(SoulPrivate {
+        card_id: soul_card_id,
+        blueprints_0: 0,
+        active_blueprints: 0,
+    });
     Ok(())
-}
-
-/// The concrete-tile cells in any player-dim chunk — the ring around
-/// the central non-concrete fixtures. Mirrors the seed pattern in
-/// `zones::create_player_dimension`: a hex disc of radius 2 around
-/// local (3, 3) MINUS every fixture cell (alter, fountains, tables)
-/// so corpses don't share a tile with one. Keep `NON_CONCRETE` in
-/// sync with the `match (dq, dr)` arm in
-/// `zones::build_dim_tiles` whenever a fixture moves or a new one
-/// joins the seed layout.
-fn walkable_dim_cells() -> Vec<(u8, u8)> {
-    const CENTER: (i8, i8) = (3, 3);
-    const RADIUS: i8 = 2;
-    // (dq, dr) offsets from CENTER that hold non-concrete tiles in
-    // the seed layout — must mirror `zones::build_dim_tiles`'s
-    // `match (dq, dr)` arm.
-    //
-    //   (1, -2)  alter
-    //   (2,  0)  anima fountain
-    //   (-2, 0)  aether fountain
-    //   (0,  1)  table SE
-    //   (-1, 1)  table SW
-    const NON_CONCRETE: &[(i8, i8)] = &[
-        (1, -2),
-        (2, 0),
-        (-2, 0),
-        (0, 1),
-        (-1, 1),
-    ];
-    let mut out = Vec::new();
-    for dq in -RADIUS..=RADIUS {
-        for dr in -RADIUS..=RADIUS {
-            let dist = (dq.abs() + dr.abs() + (dq + dr).abs()) / 2;
-            if dist > RADIUS {
-                continue;
-            }
-            if NON_CONCRETE.contains(&(dq, dr)) {
-                continue;
-            }
-            let q = CENTER.0 + dq;
-            let r = CENTER.1 + dr;
-            if !(0..8).contains(&q) || !(0..8).contains(&r) {
-                continue;
-            }
-            out.push((q as u8, r as u8));
-        }
-    }
-    out
-}
-
-/// Pick `n` distinct entries from `positions` deterministically from
-/// `seed`. Fisher-Yates partial shuffle backed by a small LCG —
-/// enough randomness for "drop a few cards somewhere", not for
-/// anything security-sensitive. Returns at most `positions.len()`
-/// entries if `n` exceeds the pool.
-fn pseudo_random_picks<T: Copy>(positions: &[T], n: usize, seed: u32) -> Vec<T> {
-    let take = n.min(positions.len());
-    let mut indices: Vec<usize> = (0..positions.len()).collect();
-    let mut state: u32 = seed.wrapping_mul(0x9E37_79B9).wrapping_add(0x1234_5678);
-    for i in (1..indices.len()).rev() {
-        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        let j = (state as usize) % (i + 1);
-        indices.swap(i, j);
-    }
-    indices.into_iter().take(take).map(|i| positions[i]).collect()
 }
