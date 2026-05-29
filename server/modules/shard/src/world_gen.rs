@@ -25,7 +25,7 @@ const TILE_CARD_TYPE: u8 = 7;
 // `card_type = 7` ("tile"). Same id `utilities::bootstrap` uses for
 // its seed zones. (The `card_category` dimension was retired — see
 // docs/CATEGORY_RETIRE_AND_TILE_EXPAND.md.)
-const TILE_ZONE_TYPE: u8 = 7;
+pub const TILE_ZONE_TYPE: u8 = 7;
 
 // First world surface. Surfaces `< 64` are reserved for inventory-ish
 // layers (the `q == 1` force rule in `actions.rs` and the inventory
@@ -769,9 +769,8 @@ pub fn generate_zone_tiles(
 /// for a tree (40%), rock (10%), or nothing (50%). Hits become world
 /// cards owned by [`WORLD_OWNER_ID`] — the auto-created World
 /// pseudo-player. Card placement: `surface = 64`, `macro_zone` is the
-/// zone's, `micro_zone` packs the tile's local `(q, r)` with
-/// `StackedState::Free`, `micro_location = 0` (no sub-hex pixel
-/// offset — centered on the hex).
+/// zone's, `micro` is `Loose` at the tile's local `(q, r)` with zero
+/// within-cell offset (centered on the hex), loose-hex kind.
 ///
 /// **Idempotent on re-run.** Tile bytes are pure functions of
 /// `(seed, q, r)`, so re-running with the same seed regenerates

@@ -38,7 +38,7 @@ keys
 Thumbs.db
 
 # Rust build artifacts
-/target/
+*/target/*
 **/*.rs.bk
 
 # Cargo

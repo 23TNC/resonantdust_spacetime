@@ -16,13 +16,12 @@
 //! traversal that's orthogonal to recipe evaluation — it just collects
 //! every alive card resting on one branch of a soul's stack.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use spacetimedb::ReducerContext;
 
 use crate::cards::{self, cards as _cards_table, Card};
 use crate::flags::state_flags;
-use crate::packed::{micro_zone_direction, unpack_micro_zone, StackedState};
 
 /// Max depth of the soul-stack walk. Bounds pathological chains and
 /// keeps traversal O(1) in chain length under normal gameplay. The
@@ -58,9 +57,13 @@ pub fn soul_stack(
     if soul_card_id == 0 {
         return Vec::new();
     }
+    // Flat-root: every card stacked on the soul points at it directly via
+    // `micro_location`. One btree lookup gets the members; filter to the
+    // requested branch and sort by `stack_index` for chain order (index 0 =
+    // closest to root). No BFS/parent-walk needed.
     let mut seen: BTreeSet<u32> = BTreeSet::new();
-    let mut children_of: BTreeMap<u32, Vec<Card>> = BTreeMap::new();
-    for row in ctx.db.cards().owner_id().filter(soul_card_id) {
+    let mut out: Vec<Card> = Vec::new();
+    for row in ctx.db.cards().micro_location().filter(soul_card_id) {
         if !seen.insert(row.card_id) {
             continue;
         }
@@ -72,40 +75,14 @@ pub fn soul_stack(
         {
             continue;
         }
-        let (_, _, state) = unpack_micro_zone(latest.micro_zone);
-        if !matches!(state, StackedState::OnRoot | StackedState::Slot) {
+        if !cards::micro_is_card(&latest) || latest.micro_location != soul_card_id {
             continue;
         }
-        if micro_zone_direction(latest.micro_zone) != direction {
+        if cards::stack_branch(&latest) != direction {
             continue;
         }
-        if latest.micro_location == 0 {
-            continue;
-        }
-        children_of
-            .entry(latest.micro_location)
-            .or_default()
-            .push(latest);
+        out.push(latest);
     }
-
-    // BFS from the soul. Depth-capped so a pathological cycle (which
-    // shouldn't be possible but defensive coding) terminates.
-    let mut out: Vec<Card> = Vec::new();
-    let mut frontier: Vec<u32> = vec![soul_card_id];
-    for _depth in 0..SOUL_STACK_MAX_DEPTH {
-        let mut next: Vec<u32> = Vec::new();
-        for parent in &frontier {
-            if let Some(children) = children_of.remove(parent) {
-                for child in children {
-                    next.push(child.card_id);
-                    out.push(child);
-                }
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next;
-    }
+    out.sort_by_key(cards::stack_index);
     out
 }

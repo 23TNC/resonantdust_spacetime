@@ -2,7 +2,6 @@ use resonantdust_content::definition_core::find_packed_by_key;
 use spacetimedb::{reducer, ReducerContext};
 
 use crate::cards;
-use crate::regions;
 
 /// Add a single card to a specific soul's inventory bucket.
 ///
@@ -66,23 +65,6 @@ pub fn add_card(
     // auto-triggers anything on card creation.
     let _ = soul_player;
 
-    Ok(())
-}
-
-/// Seed the world's spawnable region.
-///
-/// Inserts the origin region — `(0, 0)` on `surface = 64`, owner `0` — with
-/// every zone marked spawnable (`zone_presence = u64::MAX`) and none yet
-/// spawned. Zones themselves are no longer eagerly generated here; they come
-/// into existence on demand via `regions::request_zone`, which biome-generates
-/// world zones inside a presence-bearing region. Idempotent: re-runs no-op
-/// once the region row exists (see [`regions::seed_world_region`]).
-///
-/// **No per-player setup happens here.** A player's soul + starter cards are
-/// spawned by `players::spawn_soul_for` on signup.
-#[reducer]
-pub fn bootstrap(ctx: &ReducerContext) -> Result<(), String> {
-    regions::seed_world_region(ctx);
     Ok(())
 }
 

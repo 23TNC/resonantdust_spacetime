@@ -47,7 +47,7 @@ use crate::souls::{is_soul_card, soul_privates as _soul_privates_table};
 ///    - read the soul def's `aspects.builder` (sum descendants —
 ///      `crafting` → `builder` widening) as `max_active`
 ///    - reject if `active_blueprints >= max_active`
-/// 5. Spawn the blueprint card at `(surface, macro_zone, micro_zone,
+/// 5. Spawn the blueprint card at `(surface, macro_zone, micro_location
 ///    micro_location)` with `owner_id = soul_card_id`. Bump
 ///    `SoulPrivate.active_blueprints`.
 ///
@@ -64,7 +64,6 @@ pub fn request_blueprint(
     blueprint_id: u16,
     surface: u8,
     macro_zone: u64,
-    micro_zone: u8,
     micro_location: u32,
 ) -> Result<(), String> {
     // ---- caller + soul resolution --------------------------------
@@ -189,13 +188,21 @@ pub fn request_blueprint(
     // decrements when the blueprint goes `FLAG_DEAD` or its owner
     // changes, so no slot-release reducer is needed.
     let card_id = cards::next_card_id(ctx);
+    // The blueprint lands loose at the requested cell/offset on `surface`.
+    let (lq, lr, x, y) = crate::packed::unpack_micro_loose(micro_location);
+    let micro = cards::Micro::Loose {
+        local_q: lq,
+        local_r: lr,
+        x,
+        y,
+        kind: crate::packed::loose_kind_for_surface(surface),
+    };
     cards::create_at(
         ctx,
         card_id,
         now_ms,
         crate::packed::with_surface(macro_zone, surface),
-        micro_zone,
-        micro_location,
+        micro,
         /* owner_id */ soul_card_id,
         bp.blueprint_packed_definition,
         /* flags_state */ 0,

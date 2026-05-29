@@ -1,9 +1,12 @@
-//! `action_completion::apply` — output-tape executor for the tape-form
-//! recipe model.
+//! `action_completion::plan` + `commit` — output-tape executor for the
+//! tape-form recipe model. Neither is a reducer; both are invoked
+//! synchronously from `propose_action`.
 //!
-//! Walks `recipe.output` top-to-bottom, accumulates state into a
-//! [`TapeWalker`], and emits future-stamped card writes at
-//! `completion_ms = start_ms + walker.duration * 1000`.
+//! `plan` walks `recipe.output` top-to-bottom, accumulating state into a
+//! [`TapeWalker`]. `commit` emits the accumulated effects as
+//! future-stamped card writes at
+//! `completion_ms = start_ms + walker.duration * 1000`, releases the
+//! action's locks, and clears its `pending_actions` dedup row.
 //!
 //! State:
 //! - `vars: [i32; 8]` — variable scratch (`var.N.set` / `add` / `sub`).
@@ -24,11 +27,11 @@
 //! | `when.<pred>.<inner>` | Eval predicate against vars; recurse into inner on match. |
 //! | `<path>.destroy` | Queue destroy of resolved card. |
 //! | `<path>.create: <def_id>` | Queue create at resolved destination. |
+//! | `<path>.aspect.X.sub/add/set` | Tile-stock write via `ModifyTileStock`. |
 //!
-//! **Not yet supported:** stock modify (`hex.aspect.X.sub`), variable
-//! set with path-read RHS (`var.N.set: root.aspect.fleeting`),
-//! `random`. Recipes using these execute partially; the unsupported
-//! ops error with a clear message.
+//! **Not yet supported:** `random`. Recipes using it error with a
+//! clear message. (Stock modify and path-read RHS for `var.N.set` are
+//! both implemented.)
 //!
 //! **Lock release:** every bound card has its `slot_hold` cleared at
 //! completion. Cards in `destroy` statements additionally get
@@ -132,20 +135,22 @@ enum Effect {
         player_id: u32,
         faction: u8,
     },
-    /// Create a new card as a state-3 `StackedState::Deferred` row
-    /// anchored to `host_card_id`. Client resolves at mirror time
-    /// via `CardManager.appendAtChainLeaf` (walk host's chain,
-    /// leaf-append, fall through cascade on rejection). Emitted by
-    /// `stack.N.create: <key>` recipe outputs where the intended
-    /// position depends on chain state at write-time and a captured
-    /// position would go stale between propose and commit.
+    /// Create a new card as a deferred member (`micro_is_card` set,
+    /// `stack_state == STACK_STATE_DEFERRED`, `micro_location ==
+    /// host_card_id`). Client resolves at mirror time via
+    /// `CardManager.appendAtChainLeaf` (walk host's chain, leaf-append,
+    /// fall through cascade on rejection). Emitted by `stack.N.create:
+    /// <key>` recipe outputs where the intended position depends on chain
+    /// state at write-time and a captured position would go stale between
+    /// propose and commit.
     ///
-    /// `host_card_id` resolves at the commit-time path walk; the
-    /// follower row inherits the host's then-current `(surface,
-    /// macro_zone)`. The fallback `(q, r)` baked into `micro_zone`
-    /// reads from the host's current `micro_zone` too, giving the
-    /// client cascade a sensible loose-on-tile fallback if the host
-    /// is gone by mirror time.
+    /// `host_card_id` resolves at the commit-time path walk; the follower
+    /// row inherits the host's then-current `(surface, macro_zone)` so it
+    /// shares the host's subscription set, and the `write_at` cascade
+    /// keeps it in sync (and clears the anchor on host death). With
+    /// `micro_zone` gone there is no baked fallback `(q, r)` — the client
+    /// resolves the concrete cell from the host's chain, and if the host
+    /// is already gone at commit the row is created loose instead.
     CreateDeferred {
         def_key: String,
         host_card_id: u32,
@@ -350,8 +355,8 @@ pub fn commit(
                     new_id,
                     completion_ms,
                     crate::packed::with_surface(*macro_zone, *surface),
-                    /* micro_zone     */ 0,
-                    /* micro_location */ 0,
+                    // Loose at cell (0,0) on the target surface.
+                    cards::Micro::snap(0, 0, crate::packed::loose_kind_for_surface(*surface)),
                     *owner_id,
                     packed_def,
                     /* flags_state    */ 0,
@@ -432,45 +437,29 @@ pub fn commit(
                     })?;
                 let new_id = cards::next_card_id(ctx);
                 let host = cards::latest(ctx, *host_card_id);
-                let (surface, macro_zone, micro_zone, micro_location, owner_id) =
-                    if let Some(h) = host {
-                        let (q, r, _) = crate::packed::unpack_micro_zone(h.micro_zone);
-                        let deferred_micro_zone = crate::packed::pack_micro_zone(
-                            q,
-                            r,
-                            crate::packed::StackedState::Deferred,
-                        );
-                        (
-                            crate::packed::surface_of(h.macro_zone),
-                            h.macro_zone,
-                            deferred_micro_zone,
-                            *host_card_id,
-                            h.owner_id,
-                        )
-                    } else {
-                        // Host gone at commit — degenerate fallback. Land
-                        // loose at world-(0, 0) with no host anchor;
-                        // client cascade will pick up via the fallback
-                        // (q, r) tier on mirror.
-                        (
-                            crate::packed::WORLD_LAYER,
-                            0,
-                            crate::packed::pack_micro_zone(
-                                0,
-                                0,
-                                crate::packed::StackedState::Deferred,
-                            ),
-                            0,
-                            0,
-                        )
-                    };
+                let (full_macro, micro, owner_id) = if let Some(h) = host {
+                    // Land at the host's `(surface, macro_zone)` as a deferred
+                    // member anchored to the host. The client resolves the
+                    // concrete cell from the host's chain at mirror time; the
+                    // `write_at` cascade keeps `(surface, macro_zone)` in sync
+                    // if the host later moves, and clears the anchor on host
+                    // death (client then falls through to loose).
+                    (h.macro_zone, cards::Micro::deferred(*host_card_id), h.owner_id)
+                } else {
+                    // Host gone at commit — fail-to-loose at world (0,0) rather
+                    // than dropping the create. No deferred anchor.
+                    (
+                        crate::packed::with_surface(0, crate::packed::WORLD_LAYER),
+                        cards::Micro::snap(0, 0, crate::packed::LOOSE_HEX),
+                        0,
+                    )
+                };
                 cards::create_at(
                     ctx,
                     new_id,
                     completion_ms,
-                    crate::packed::with_surface(macro_zone, surface),
-                    micro_zone,
-                    micro_location,
+                    full_macro,
+                    micro,
                     owner_id,
                     packed_def,
                     /* flags_state */ 0,
@@ -1171,8 +1160,12 @@ fn resolve_card_target(
             Seg::Word(w) if w == "parent" => {
                 let card = cards::latest(ctx, card_id)
                     .ok_or_else(|| format!("resolve: card {card_id} not found"))?;
-                if card.micro_location == 0 {
-                    return Err(format!("resolve: card {card_id} has no parent"));
+                // Flat chains: a member's parent is its root (in
+                // `micro_location`); a loose/root card has none.
+                if !cards::micro_is_card(&card) {
+                    return Err(format!(
+                        "resolve: card {card_id} has no parent (it is a chain root)"
+                    ));
                 }
                 card_id = card.micro_location;
                 i += 1;

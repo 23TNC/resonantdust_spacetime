@@ -14,8 +14,10 @@ services:
       - ./config:/home/spacetime/.config/spacetime
       - ./data:/home/spacetime/.local/share/spacetime/data
       - ../content:/workspace/server/modules/shard/content
+      - ../content:/workspace/server/modules/players/content
       - ./server:/workspace/server
       - ../pixijs:/workspace/pixijs
+      - ../gateway:/workspace/gateway
     working_dir: /workspace/server
     command:
       - start
@@ -35,7 +37,9 @@ services:
     volumes:
       - ./server:/workspace/server
       - ../content:/workspace/server/modules/shard/content
+      - ../content:/workspace/server/modules/players/content
       - ../pixijs:/workspace/pixijs
+      - ../gateway:/workspace/gateway
     working_dir: /workspace/server
     command:
       - build
@@ -49,7 +53,9 @@ services:
     volumes:
       - ./server:/workspace/server
       - ../content:/workspace/server/modules/shard/content
+      - ../content:/workspace/server/modules/players/content
       - ../pixijs:/workspace/pixijs
+      - ../gateway:/workspace/gateway
     working_dir: /workspace/server
     entrypoint: ["/bin/bash"]
     command:

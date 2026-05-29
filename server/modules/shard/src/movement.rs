@@ -5,10 +5,9 @@ use resonantdust_content::definition_core::{
 };
 use spacetimedb::{reducer, ReducerContext, SpacetimeType};
 
-use crate::cards;
+use crate::cards::{self, Micro};
 use crate::packed::{
-    pack_definition, pack_macro_zone, pack_micro_zone, unpack_macro_zone,
-    unpack_micro_zone, StackedState,
+    micro_loose_cell, pack_definition, pack_macro_zone, unpack_macro_zone, LOOSE_HEX,
 };
 use crate::players;
 
@@ -69,14 +68,13 @@ fn tile_def_at(
     let macro_zone = pack_macro_zone(macro_q as i16, macro_r as i16);
 
     if surface == crate::packed::WORLD_LAYER {
-        let micro_zone = pack_micro_zone(local_q, local_r, crate::packed::StackedState::Free);
-        if let Some(anchor) = crate::mini_zone::anchor_covering_hex(ctx, macro_zone, micro_zone) {
+        if let Some(anchor) = crate::mini_zone::anchor_covering_hex(ctx, macro_zone, local_q, local_r) {
             // Mini_zone covers this hex. Read its tile def at the
             // corresponding `(q, r)` within the mini_zone's grid,
             // routed through the card-priority view so a promoted
             // mini_zone tile-card surfaces.
-            let (anchor_local_q, anchor_local_r, _) =
-                unpack_micro_zone(anchor.micro_zone);
+            let (anchor_local_q, anchor_local_r) =
+                micro_loose_cell(anchor.micro_location);
             let (anchor_macro_q, anchor_macro_r) = unpack_macro_zone(anchor.macro_zone);
             let dq = c.q - (anchor_macro_q as i32 * 8 + anchor_local_q as i32);
             let dr = c.r - (anchor_macro_r as i32 * 8 + anchor_local_r as i32);
@@ -190,12 +188,11 @@ fn step_cost(speed: f32, from: f32, to: f32) -> f32 {
 /// path lengths once a real load profile exists.
 const MAX_VALIDATION_STEPS: usize = 256;
 
-/// One step in a client-submitted path. Mirrors the
-/// `(surface, macro_zone, micro_zone)` triplet the soul row already
-/// carries — same packing, same `micro_zone` `state == Free`
-/// requirement (world-positioned cards are Free in the unified card
-/// model). `micro_location` isn't on the wire (world placements
-/// always use `0`).
+/// One step in a client-submitted path. Mirrors the `(surface, macro_zone,
+/// micro_location)` triplet the soul row carries. `micro_location` is the loose
+/// placement (`micro_is_card` clear) — its cell `(local_q, local_r)` is the
+/// hex; the within-cell offset is unused for movement (souls center on the
+/// hex). World-positioned cards are loose in the unified card model.
 ///
 /// Per-step `surface` is carried so the wire format stays
 /// forward-compatible with cross-surface pathing (portals, etc.).
@@ -205,7 +202,7 @@ const MAX_VALIDATION_STEPS: usize = 256;
 pub struct TilePoint {
     pub surface: u8,
     pub macro_zone: u64,
-    pub micro_zone: u8,
+    pub micro_location: u32,
 }
 
 /// Move the caller's soul along a client-computed path.
@@ -219,7 +216,7 @@ pub struct TilePoint {
 /// Validation per step:
 ///   - `surface` matches the soul's current surface (cross-surface
 ///     transitions not supported).
-///   - `micro_zone`'s state bits == `Free` (world placement).
+///   - `micro_location` is a loose placement (world cards are loose).
 ///   - Axially adjacent to the predecessor (the soul's current tile
 ///     for step 0; the previous step otherwise).
 ///   - The tile is traversable — `tile_def_at` returns a def_id and
@@ -289,7 +286,7 @@ pub fn move_soul(
 
     // Decode the soul's current tile — this is the implicit step-0
     // predecessor for the adjacency walk.
-    let (s_lq, s_lr, _) = unpack_micro_zone(soul.micro_zone);
+    let (s_lq, s_lr) = micro_loose_cell(soul.micro_location);
     let (s_mq, s_mr) = unpack_macro_zone(soul.macro_zone);
     let mut prev = Coord {
         q: s_mq as i32 * 8 + s_lq as i32,
@@ -325,12 +322,7 @@ pub fn move_soul(
                 point.surface, crate::packed::surface_of(soul.macro_zone),
             ));
         }
-        let (lq, lr, state) = unpack_micro_zone(point.micro_zone);
-        if state != StackedState::Free {
-            return Err(format!(
-                "movement: step {idx} micro_zone state must be Free (got {state:?})"
-            ));
-        }
+        let (lq, lr) = micro_loose_cell(point.micro_location);
         let (mq, mr) = unpack_macro_zone(point.macro_zone);
         let coord = Coord {
             q: mq as i32 * 8 + lq as i32,
@@ -370,8 +362,7 @@ pub fn move_soul(
         soul.card_id,
         now_ms,
         soul.macro_zone,
-        soul.micro_zone,
-        soul.micro_location,
+        Micro::of(&soul),
     );
 
     // Write loop. Per step: accumulate elapsed time via the same
@@ -388,10 +379,11 @@ pub fn move_soul(
         }
         last_time = step_time;
 
+        let (lq, lr) = micro_loose_cell(point.micro_location);
         cards::update_with_at(ctx, soul.card_id, step_time, |c| {
             c.macro_zone = crate::packed::with_surface(point.macro_zone, point.surface);
-            c.micro_zone = point.micro_zone;
-            c.micro_location = 0;
+            // Soul moves loose-on-world, centered on the hex.
+            Micro::Loose { local_q: lq, local_r: lr, x: 0, y: 0, kind: LOOSE_HEX }.apply(c);
         });
 
         from_cost = to_cost;

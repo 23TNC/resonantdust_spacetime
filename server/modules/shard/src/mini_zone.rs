@@ -39,11 +39,10 @@ use resonantdust_content::definition_core::{
 };
 use spacetimedb::{reducer, ReducerContext};
 
-use crate::action_completion;
-use crate::cards::{self, cards as _cards_table, Card};
+use crate::cards::{self, cards as _cards_table, Card, Micro};
 use crate::packed::{
-    self, pack_macro_zone, pack_zone_definition, unpack_macro_zone, unpack_micro_zone,
-    StackedState, INVENTORY_LAYER, MINI_ZONE_LAYER, WORLD_LAYER,
+    self, micro_loose_cell, pack_macro_zone, pack_zone_definition, unpack_macro_zone,
+    INVENTORY_LAYER, LOOSE_HEX, MINI_ZONE_LAYER, WORLD_LAYER,
 };
 use crate::players;
 use crate::zones::{self, zones as _zones_table};
@@ -100,13 +99,19 @@ fn hex_distance(a: (i32, i32), b: (i32, i32)) -> i32 {
     (dq.abs() + dr.abs() + (dq + dr).abs()) / 2
 }
 
-/// Convert `(macro_zone, micro_zone)` to a global hex coord
-/// `(global_q, global_r)`. Each macro_zone is an 8×8 chunk; the
-/// global axis is `macro * 8 + local`.
-fn global_hex(macro_zone: u64, micro_zone: u8) -> (i32, i32) {
+/// Convert a card's `(macro_zone, micro_location)` to a global hex coord
+/// `(global_q, global_r)`. The card must be loose (its `micro_location` holds
+/// the cell). Each macro_zone is an 8×8 chunk; the global axis is
+/// `macro * 8 + local`.
+fn global_hex(macro_zone: u64, micro_location: u32) -> (i32, i32) {
+    let (lq, lr) = micro_loose_cell(micro_location);
+    global_hex_cell(macro_zone, lq, lr)
+}
+
+/// Convert `(macro_zone, local_q, local_r)` to a global hex coord.
+fn global_hex_cell(macro_zone: u64, local_q: u8, local_r: u8) -> (i32, i32) {
     let (mq, mr) = unpack_macro_zone(macro_zone);
-    let (lq, lr, _) = unpack_micro_zone(micro_zone);
-    (mq as i32 * 8 + lq as i32, mr as i32 * 8 + lr as i32)
+    (mq as i32 * 8 + local_q as i32, mr as i32 * 8 + local_r as i32)
 }
 
 /// Find a mini_zone anchor card whose footprint covers the world
@@ -124,9 +129,10 @@ fn global_hex(macro_zone: u64, micro_zone: u8) -> (i32, i32) {
 pub fn anchor_covering_hex(
     ctx: &ReducerContext,
     world_macro_zone: u64,
-    world_micro_zone: u8,
+    world_local_q: u8,
+    world_local_r: u8,
 ) -> Option<Card> {
-    let target_global = global_hex(world_macro_zone, world_micro_zone);
+    let target_global = global_hex_cell(world_macro_zone, world_local_q, world_local_r);
     let (target_macro_q, target_macro_r) = unpack_macro_zone(world_macro_zone);
 
     for (dmq, dmr) in ADJACENT_MACRO_ZONES {
@@ -159,54 +165,13 @@ pub fn anchor_covering_hex(
             }
             // Anchor on a different macro_zone now (history-row drift) —
             // its current home isn't in our scan window; skip.
-            let anchor_global = global_hex(latest.macro_zone, latest.micro_zone);
+            let anchor_global = global_hex(latest.macro_zone, latest.micro_location);
             if hex_distance(anchor_global, target_global) <= MINI_ZONE_RADIUS {
                 return Some(latest);
             }
         }
     }
     None
-}
-
-/// Given an anchor card known to cover the target world hex (see
-/// [`anchor_covering_hex`]), look up the mini_zone Zone, compute
-/// the `(q, r)` within the mini_zone's 7×7 grid, and return the
-/// tile-def packed value + `HexLocation` for action_completion.
-///
-/// Returns `None` if the mini_zone Zone doesn't exist (would be a
-/// bug — anchor without a backing zone) or the corresponding tile
-/// byte is `0` (empty cell of the mini_zone; mini_zone occludes
-/// the world tile underneath, so no synthetic hex is produced — a
-/// recipe targeting "this hex" finds nothing).
-pub fn tile_at_anchor(
-    ctx: &ReducerContext,
-    anchor: &Card,
-    world_macro_zone: u64,
-    world_micro_zone: u8,
-) -> Option<(u16, (u8, u8), action_completion::HexLocation)> {
-    let zone = zones::latest_for(ctx, crate::packed::pack_macro_zone_full(anchor.card_id, MINI_ZONE_LAYER, 0, 0))?;
-    let target_global = global_hex(world_macro_zone, world_micro_zone);
-    let anchor_global = global_hex(anchor.macro_zone, anchor.micro_zone);
-    let dq = target_global.0 - anchor_global.0;
-    let dr = target_global.1 - anchor_global.1;
-    let mz_q = (MINI_ZONE_CENTER + dq) as u8;
-    let mz_r = (MINI_ZONE_CENTER + dr) as u8;
-    let (tile_def_id, stock0, stock1) = zone.tile_at(mz_r, mz_q).unwrap_or((0, 0, 0));
-    if tile_def_id == 0 {
-        return None;
-    }
-    // Same packed_def synthesis world zones use: shift the zone's
-    // `[card_type:u4 | 0:u4]` byte left 8 — the type bits land at
-    // u16 positions 12..15, leaving room for the u12 def_id below.
-    let packed_def = ((zone.packed_definition as u16) << 8) | tile_def_id;
-    let location = action_completion::HexLocation {
-        zone_id: zone.zone_id,
-        macro_zone: zone.macro_zone,
-        col: mz_q,
-        row: mz_r,
-        owner_id: zone.owner_id,
-    };
-    Some((packed_def, (stock0, stock1), location))
 }
 
 /// Deploy a mini_zone-anchor card from the caller's inventory onto
@@ -237,7 +202,8 @@ pub fn deploy_mini_zone(
     client_time_ms: u64,
     anchor_card_id: u32,
     target_macro_zone: u64,
-    target_micro_zone: u8,
+    target_local_q: u8,
+    target_local_r: u8,
 ) -> Result<(), String> {
     // ---- caller resolution ----------------------------------------
     let caller_player_id = players::resolve_caller(ctx)?;
@@ -305,11 +271,9 @@ pub fn deploy_mini_zone(
     }
 
     // ---- target validation ----------------------------------------
-    let (_t_q, _t_r, t_state) = unpack_micro_zone(target_micro_zone);
-    if t_state != StackedState::Free {
+    if target_local_q >= 8 || target_local_r >= 8 {
         return Err(format!(
-            "deploy_mini_zone: target micro_zone must carry state=Free \
-             (world-position encoding); got {t_state:?}"
+            "deploy_mini_zone: target cell ({target_local_q}, {target_local_r}) out of range (0..=7 each)"
         ));
     }
     // Fold WORLD_LAYER into the target key once — every lookup / compare /
@@ -343,37 +307,34 @@ pub fn deploy_mini_zone(
                 return false;
             };
             // `target_macro_zone` is folded, so the macro_zone equality covers
-            // the surface band too.
+            // the surface band too. A resident is a loose world card whose cell
+            // matches the target (stack members live at their root's cell).
             latest.macro_zone == target_macro_zone
-                && latest.micro_zone == target_micro_zone
+                && !cards::micro_is_card(&latest)
+                && micro_loose_cell(latest.micro_location) == (target_local_q, target_local_r)
                 && latest.flags_state & s.dead == 0
         });
     if occupied {
         return Err(format!(
             "deploy_mini_zone: target hex (macro_zone={target_macro_zone}, \
-             micro_zone={target_micro_zone}) already has an occupant"
+             cell=({target_local_q}, {target_local_r})) already has an occupant"
         ));
     }
 
     // ---- write the anchor onto the world hex ----------------------
     //
-    // The anchor leaves inventory and lands at the world position.
-    // State becomes Free (world placement), micro_location=0.
-    // `owner_id` is intentionally untouched — physical location
-    // (surface / macro_zone / micro_zone) and ownership are
-    // orthogonal: a card can sit on a world hex and still be
-    // soul-owned, which is exactly what we want here so the
-    // deploying player retains pickup permission (`owning_player`
-    // walks `owner_id` upward and finds them). World-owned things
-    // (trees, rocks) are world-owned by construction in world_gen,
-    // not by being on the world surface. Position-preserve /
-    // position-locked are NOT set — the user can still pick the
-    // wagon back up via `pickup_mini_zone`.
+    // The anchor leaves inventory and lands loose-on-world at the target cell
+    // (centered). `owner_id` is intentionally untouched — physical location and
+    // ownership are orthogonal: a card can sit on a world hex and still be
+    // soul-owned, which is what we want here so the deploying player retains
+    // pickup permission (`owning_player` walks `owner_id` upward and finds
+    // them). World-owned things (trees, rocks) are world-owned by construction
+    // in world_gen, not by being on the world surface. Position-preserve /
+    // position-hold are NOT set — the user can still pick the wagon back up.
     cards::update_with_at(ctx, anchor_card_id, now_ms, |c| {
         // `target_macro_zone` is folded with WORLD_LAYER — sets surface too.
         c.macro_zone = target_macro_zone;
-        c.micro_zone = target_micro_zone;
-        c.micro_location = 0;
+        Micro::snap(target_local_q, target_local_r, LOOSE_HEX).apply(c);
     });
 
     // ---- create the mini_zone Zone row ----------------------------
@@ -502,7 +463,7 @@ pub fn pickup_mini_zone(
     // Snapshot the anchor's world position so we can spill mini_zone
     // contents onto it before the anchor moves to inventory.
     let world_macro_zone = anchor.macro_zone;
-    let world_micro_zone = anchor.micro_zone;
+    let (world_lq, world_lr) = micro_loose_cell(anchor.micro_location);
 
     // ---- spill mini_zone contents to the anchor's world hex -------
     //
@@ -555,8 +516,8 @@ pub fn pickup_mini_zone(
         cards::update_with_at(ctx, id, now_ms, |c| {
             // `world_macro_zone` is the anchor's folded world key — sets surface.
             c.macro_zone = world_macro_zone;
-            c.micro_zone = world_micro_zone;
-            c.micro_location = 0;
+            // Spill loose onto the anchor's previous world cell.
+            Micro::snap(world_lq, world_lr, LOOSE_HEX).apply(c);
         });
     }
 
@@ -579,8 +540,8 @@ pub fn pickup_mini_zone(
     // ---- return the anchor to inventory ---------------------------
     cards::update_with_at(ctx, anchor_card_id, now_ms, |c| {
         c.macro_zone = crate::packed::pack_macro_zone_full(target_soul_card_id, INVENTORY_LAYER, 0, 0);
-        c.micro_zone = 0;
-        c.micro_location = 0;
+        // Loose in the inventory rect grid at cell (0,0).
+        Micro::snap(0, 0, packed::loose_kind_for_surface(INVENTORY_LAYER)).apply(c);
         // Back in the soul's inventory bucket — `owner_id` carries
         // the soul's card_id (matches the inventory address pun).
         c.owner_id = target_soul_card_id;

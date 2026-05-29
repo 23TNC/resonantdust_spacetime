@@ -8,6 +8,8 @@ use crate::sequence;
 pub struct Zone {
     #[primary_key]
     pub valid_at: u64,
+    /// Data-shard partition this row belongs to (`crate::DATA_SHARD`; `0` today).
+    pub data_shard: u16,
     #[index(btree)]
     pub zone_id: u32,
     /// Packed location key `[reserved:u32 | surface:u8 | payload:u24]`.
@@ -247,6 +249,7 @@ pub fn create_at(
         ctx,
         Zone {
             valid_at: 0,
+            data_shard: crate::DATA_SHARD,
             zone_id,
             macro_zone,
             packed_definition,
@@ -528,6 +531,42 @@ pub fn create_disk_at(
             }
             packed::set_tile_full(&mut tiles, (row * 8 + col) as usize, def_id, s0, s1);
         }
+    }
+
+    let zone_id = next_zone_id(ctx);
+    Ok(create_at(
+        ctx,
+        zone_id,
+        macro_zone,
+        pack_zone_definition(card_type),
+        owner_id,
+        tiles,
+        time_ms,
+    ))
+}
+
+/// Create a Zone whose full 8×8 grid is seeded with the `"empty"` tile
+/// definition (+ its declared stock defaults) — the dense rect-grid analogue
+/// of [`create_disk_at`]. Used for **inventory** zones: one ~153-byte Zone row
+/// replaces 64 ~40-byte empty tile cards (and tile-cards spawn on demand via
+/// `find_or_create_tile_card` only when a recipe touches a cell — exactly the
+/// world model). A rect viewport addresses all 64 cells, so there's no in-disk
+/// carve. Allocates a fresh `zone_id`, stamps the row at `time_ms`.
+pub fn create_rect_at(
+    ctx: &ReducerContext,
+    macro_zone: u64,
+    owner_id: u32,
+    time_ms: u64,
+) -> Result<Zone, String> {
+    let empty_packed = find_packed_by_key("empty")?
+        .ok_or_else(|| "create_rect_at: tile def \"empty\" not in content catalog".to_string())?;
+    let card_type = (empty_packed >> 12) as u8;
+    let def_id = empty_packed & packed::DEF_ID_MASK;
+    let (s0, s1) = stock_defaults_for(empty_packed);
+
+    let mut tiles = [0u64; packed::ZONE_TILE_U64_COUNT];
+    for idx in 0..64usize {
+        packed::set_tile_full(&mut tiles, idx, def_id, s0, s1);
     }
 
     let zone_id = next_zone_id(ctx);

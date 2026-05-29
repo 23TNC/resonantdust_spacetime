@@ -11,15 +11,23 @@
 
 use spacetimedb::{reducer, ReducerContext, SpacetimeType};
 
-use crate::cards::{self, cards as _cards_table};
+use crate::cards::{self, cards as _cards_table, Micro};
 use crate::flags::state_flags;
 use crate::packed::PLAYER_INVENTORY_LAYER;
 use crate::packed::{
-    pack_micro_zone, pack_slot_micro_zone, pack_stack_micro_zone, unpack_micro_zone,
-    StackedState, INVENTORY_LAYER, MINI_ZONE_LAYER, POCKET_DIMENSION_LAYER, STACK_DIR_DOWN,
-    STACK_DIR_HEX, STACK_DIR_UP, WORLD_LAYER,
+    INVENTORY_LAYER, LOOSE_HEX, LOOSE_RECT, MINI_ZONE_LAYER, POCKET_DIMENSION_LAYER,
+    STACK_DIR_DOWN, STACK_DIR_HEX, STACK_DIR_UP, WORLD_LAYER,
 };
 use crate::players;
+
+/// Unpack a wire `xy` u32 (`[x:i16 | y:i16]`) — the loose within-cell offset
+/// the client packs into `Placement.xy`. Clamped to the i12 range the loose
+/// `micro_location` layout stores (±2047).
+fn unpack_xy(xy: u32) -> (i16, i16) {
+    let x = (xy >> 16) as u16 as i16;
+    let y = xy as u16 as i16;
+    (x.clamp(-2048, 2047), y.clamp(-2048, 2047))
+}
 
 /// Where the placement puts the source card.
 ///
@@ -51,11 +59,6 @@ pub struct Placement {
 
 const PLACEMENT_STACK: u8 = 0;
 const PLACEMENT_LOOSE: u8 = 1;
-
-/// Depth cap for ancestor walks (cycle detection, chain-root resolve,
-/// descendant-restamp). Matches `cards::OWNER_WALK_DEPTH_CAP`'s
-/// 32-hop slack; realistic chains top out around 5.
-const PLACE_WALK_DEPTH_CAP: usize = 32;
 
 /// Place a card at a position the caller specifies. Generic
 /// successor to `equip_card` / `unequip_card`. The reducer validates
@@ -95,8 +98,8 @@ const PLACE_WALK_DEPTH_CAP: usize = 32;
 ///   source's chain root staying within the caller's reach).
 ///
 /// **Idempotency.** If the requested placement matches the source's
-/// current state (same surface / macro_zone / micro_zone /
-/// micro_location), the write still fires but is a no-op semantically
+/// current state (same surface / macro_zone / micro placement), the
+/// write still fires but is a no-op semantically
 /// — `cards::write_at`'s dirty-flag diff lands a `data_dirty: false,
 /// position_dirty: false` row that subscribers can ignore. Keeps the
 /// drag UX smooth on retries / spurious resends.
@@ -141,12 +144,12 @@ pub fn place_card(
         ));
     }
 
-    // Collect descendants up-front so the same set is validated and
-    // re-stamped. Walks via `owner_id` btree (mirrors `unequip_card`
-    // line ~360 in `utilities.rs`); for sources outside an inventory
-    // bucket (world-loose with no soul), this returns empty and the
-    // single-card move still succeeds.
-    let descendants = collect_descendants(ctx, &source, now_ms);
+    // Collect the source's stack members up-front so the same set is
+    // validated and moved. In the flat-root model "members" are every card
+    // whose `micro_location` points at the source as their root — a single
+    // `micro_location` btree lookup. A source that is itself a member (or a
+    // bare loose card) has no members and this returns empty.
+    let descendants = collect_members(ctx, card_id, now_ms);
     for d in &descendants {
         if cards::slot_hold_count(d.flags_bk) > 0 {
             return Err(format!(
@@ -169,62 +172,87 @@ pub fn place_card(
     }
 
     // Dispatch on placement kind. Returns the destination
-    // (surface, macro_zone, micro_zone, micro_location). `owner_id`
+    // (surface, macro_zone, Micro placement). `owner_id`
     // is intentionally not part of the destination tuple —
     // ownership is an independent property of a card (controls who
     // may move it), unchanged by placement. Cards that need a
     // different owner go through an explicit ownership-transfer
     // reducer (TODO; today no such reducer exists, so cards keep
     // whatever owner they were created with).
-    let (new_surface, new_macro_zone, new_micro_zone, new_micro_location) =
-        match placement.kind {
-            PLACEMENT_STACK => resolve_stack_target(
-                ctx,
-                card_id,
-                placement.parent_id,
-                placement.direction,
-                caller_player_id,
-                now_ms,
-            )?,
-            PLACEMENT_LOOSE => resolve_loose_target(
-                ctx,
-                caller_player_id,
-                placement.surface,
-                placement.macro_zone,
-                placement.q,
-                placement.r,
-                placement.xy,
-            )?,
-            other => {
-                return Err(format!(
-                    "place_card: unknown placement kind {other} (expected 0=Stack or 1=Loose)"
-                ));
-            }
-        };
+    let (new_surface, new_macro_zone, new_micro) = match placement.kind {
+        PLACEMENT_STACK => resolve_stack_target(
+            ctx,
+            card_id,
+            placement.parent_id,
+            placement.direction,
+            caller_player_id,
+            now_ms,
+        )?,
+        PLACEMENT_LOOSE => resolve_loose_target(
+            ctx,
+            caller_player_id,
+            placement.surface,
+            placement.macro_zone,
+            placement.q,
+            placement.r,
+            placement.xy,
+        )?,
+        other => {
+            return Err(format!(
+                "place_card: unknown placement kind {other} (expected 0=Stack or 1=Loose)"
+            ));
+        }
+    };
+
+    let full_macro = crate::packed::with_surface(new_macro_zone, new_surface);
 
     // Source write. `owner_id` is intentionally untouched. `surface` folds
-    // into `macro_zone` (bits 24-31) — there's no separate surface column.
+    // into `macro_zone` (bits 24-31). `new_micro` sets `micro_location` + the
+    // stacking flag bits together.
     cards::update_with_at(ctx, card_id, now_ms, |c| {
-        c.macro_zone = crate::packed::with_surface(new_macro_zone, new_surface);
-        c.micro_zone = new_micro_zone;
-        c.micro_location = new_micro_location;
+        c.macro_zone = full_macro;
+        new_micro.apply(c);
     });
 
-    // Re-stamp descendants' ambient surface + macro_zone so they
-    // travel with the chain root. `micro_zone` / `micro_location`
-    // (parent pointers within the sub-chain) and `owner_id`
-    // (independent of position) stay intact.
-    for d in &descendants {
-        cards::update_with_at(ctx, d.card_id, now_ms, |c| {
-            c.macro_zone = crate::packed::with_surface(new_macro_zone, new_surface);
-        });
+    // Move the source's members along.
+    // - **Loose move:** source stays the root; members keep pointing at it and
+    //   just travel (re-stamp `macro_zone`).
+    // - **Stack move:** source becomes a member of `parent_root`, so its former
+    //   members re-root onto `parent_root` too (flat chains have no nesting),
+    //   keeping their branch+index. Index collisions are gap-tolerant (rare;
+    //   only on combining two non-empty stacks) — the design accepts this over
+    //   renumbering. `owner_id` stays untouched throughout.
+    match new_micro {
+        Micro::Stacked { root: new_root, .. } => {
+            for m in &descendants {
+                let rerooted = match Micro::of(m) {
+                    Micro::Stacked { branch, index, .. } => Micro::Stacked {
+                        root: new_root,
+                        branch,
+                        index,
+                    },
+                    loose => loose,
+                };
+                cards::update_with_at(ctx, m.card_id, now_ms, |c| {
+                    c.macro_zone = full_macro;
+                    rerooted.apply(c);
+                });
+            }
+        }
+        Micro::Loose { .. } => {
+            for m in &descendants {
+                cards::update_with_at(ctx, m.card_id, now_ms, |c| {
+                    c.macro_zone = full_macro;
+                });
+            }
+        }
     }
 
     Ok(())
 }
 
-/// Resolve a `Stack` placement to the concrete `(surface, macro_zone,
-/// micro_zone, micro_location)` write tuple.
+/// Resolve a `Stack` placement to the concrete `(surface, macro_zone, Micro)`
+/// write tuple — the source becomes a member of the parent's chain root.
 ///
 /// Walks the parent's chain in `direction` to find the current top —
 /// the new source becomes the next slot above it. Replicates
@@ -238,7 +266,7 @@ fn resolve_stack_target(
     direction: u8,
     caller_player_id: u32,
     now_ms: u64,
-) -> Result<(u8, u64, u8, u32), String> {
+) -> Result<(u8, u64, Micro), String> {
     if parent_id == 0 {
         return Err("place_card: Stack placement with parent_id == 0".to_string());
     }
@@ -265,146 +293,98 @@ fn resolve_stack_target(
         ));
     }
 
-    // Cycle check: source must not be an ancestor of parent. Walk
-    // parent's `micro_location` chain upward and reject if `source_id`
-    // appears. Caps at `PLACE_WALK_DEPTH_CAP` against malformed chains.
-    let mut walker_id = parent_id;
-    for _ in 0..PLACE_WALK_DEPTH_CAP {
-        if walker_id == source_id {
-            return Err(format!(
-                "place_card: stacking would form a cycle (source {source_id} is an ancestor of parent {parent_id})"
-            ));
-        }
-        let Some(row) = cards::prior_at(ctx, walker_id, now_ms) else {
-            break;
-        };
-        if row.micro_location == 0 {
-            break;
-        }
-        walker_id = row.micro_location;
+    // The chain's root: parent itself if it's loose, else the root it points
+    // at. Flat chains — one hop, no walk.
+    let parent_root = chain_root_of(&parent);
+
+    // Cycle check: source must not be the root of parent's chain (you can't
+    // stack a chain onto one of its own members).
+    if parent_root == source_id {
+        return Err(format!(
+            "place_card: stacking would form a cycle (source {source_id} is the root of parent {parent_id}'s chain)"
+        ));
     }
 
-    // Ownership: the chain rooted at parent must be caller-owned. Use
-    // `owning_player`'s existing walk — terminates at the soul (which
-    // carries `is_owned_by_player`) or world (`owner_id == 0` → WORLD_PLAYER_ID).
-    // World-rooted chains (e.g. a tile-card the player is targeting)
-    // pass; per-hex permission isn't modeled at this layer.
+    // Ownership: the chain root must be caller-owned (or WORLD-owned, e.g. a
+    // tile-card the player is targeting). `owning_player` walks owner_id.
     let chain_player =
-        cards::owning_player(ctx, parent_id).unwrap_or(cards::WORLD_PLAYER_ID);
+        cards::owning_player(ctx, parent_root).unwrap_or(cards::WORLD_PLAYER_ID);
     if chain_player != cards::WORLD_PLAYER_ID && chain_player != caller_player_id {
         return Err(format!(
             "place_card: parent {parent_id}'s chain is owned by player {chain_player} (not {caller_player_id})"
         ));
     }
 
-    // Find the current top of the branch in `direction` off parent.
-    // BFS via `owner_id` btree mirrors `equip_card`'s `soul_stack`
-    // call; here we filter on direction matching the branch and
-    // walking `micro_location` back to `parent_id` or its ancestors
-    // in that branch.
-    let top_id = walk_branch_top(ctx, parent_id, direction, now_ms);
-
-    let (immediate_parent_id, new_micro_zone) = match top_id {
-        Some(top) => (top, pack_slot_micro_zone(direction)),
-        None => (
-            parent_id,
-            // First child in this branch: `OnRoot` with position=1.
-            pack_stack_micro_zone(1, direction, StackedState::OnRoot),
-        ),
-    };
+    // Append at the end of the branch (next free index). Gap-tolerant; never
+    // renumbers existing members.
+    let index = next_branch_index(ctx, parent_root, parent.macro_zone, direction, now_ms);
 
     Ok((
         crate::packed::surface_of(parent.macro_zone),
         parent.macro_zone,
-        new_micro_zone,
-        immediate_parent_id,
+        Micro::Stacked {
+            root: parent_root,
+            branch: direction,
+            index,
+        },
     ))
 }
 
-/// Walk the chain rooted at `parent_id` in `direction` and return the
-/// current top's card_id. Mirrors `recipe_eval::soul_stack`'s shape
-/// but starts from an arbitrary card and a specific direction.
-/// Returns `None` when no child exists in that branch.
-fn walk_branch_top(
-    ctx: &ReducerContext,
-    parent_id: u32,
-    direction: u8,
-    now_ms: u64,
-) -> Option<u32> {
-    use crate::packed::micro_zone_direction;
+/// The root card_id of `card`'s chain — `micro_location` if the card is a stack
+/// member, else the card itself (it's a loose/snapped root).
+fn chain_root_of(card: &cards::Card) -> u32 {
+    if cards::micro_is_card(card) {
+        card.micro_location
+    } else {
+        card.card_id
+    }
+}
+
+/// Every card that is a stack member of `root_id` (flat: `micro_location ==
+/// root_id` AND `micro_is_card`). Deduped by card_id at the latest row. Single
+/// `micro_location` btree lookup — the core flat-chain enumeration.
+fn collect_members(ctx: &ReducerContext, root_id: u32, now_ms: u64) -> Vec<cards::Card> {
     use std::collections::BTreeSet;
-
-    // We want children whose `micro_location` walks back to
-    // `parent_id` in `direction`. Iterate every card row at the
-    // parent's surface/macro_zone via the owner_id index; dedupe by
-    // card_id; pick the deepest-position child.
-    let parent = cards::prior_at(ctx, parent_id, now_ms)?;
-    let chain_owner = chain_root_id(ctx, parent_id, now_ms).unwrap_or(parent_id);
-
     let mut seen: BTreeSet<u32> = BTreeSet::new();
-    // Map immediate-parent → child for direction-matching state-Slot
-    // and direction-matching state-OnRoot.
-    let mut children_of: std::collections::BTreeMap<u32, Vec<u32>> =
-        std::collections::BTreeMap::new();
-    for row in ctx.db.cards().owner_id().filter(chain_owner) {
+    let mut out: Vec<cards::Card> = Vec::new();
+    for row in ctx.db.cards().micro_location().filter(root_id) {
         if !seen.insert(row.card_id) {
             continue;
         }
         let Some(latest) = cards::prior_at(ctx, row.card_id, now_ms) else {
             continue;
         };
-        // `macro_zone` encodes surface (bits 24-31), so this single
-        // comparison covers both the surface band and the payload.
-        if latest.macro_zone != parent.macro_zone {
+        if latest.micro_location != root_id || !cards::micro_is_card(&latest) {
             continue;
         }
-        let (_, _, state) = unpack_micro_zone(latest.micro_zone);
-        if !matches!(state, StackedState::OnRoot | StackedState::Slot) {
-            continue;
-        }
-        if micro_zone_direction(latest.micro_zone) != direction {
-            continue;
-        }
-        children_of
-            .entry(latest.micro_location)
-            .or_default()
-            .push(latest.card_id);
+        out.push(latest);
     }
-
-    // Walk: parent → child → grandchild → ... until we hit a node
-    // with no children. That node is the top of the branch.
-    let mut cur = parent_id;
-    for _ in 0..PLACE_WALK_DEPTH_CAP {
-        match children_of.get(&cur).and_then(|v| v.first().copied()) {
-            Some(next) => cur = next,
-            None => break,
-        }
-    }
-    if cur == parent_id {
-        None
-    } else {
-        Some(cur)
-    }
+    out
 }
 
-/// Walk a card's chain up via `micro_location` until reaching a Free
-/// card (the chain root). Returns the root's `card_id`, or `None`
-/// when the walk dead-ends (`micro_location = 0` on a non-Free card)
-/// or exceeds the depth cap.
-fn chain_root_id(ctx: &ReducerContext, card_id: u32, time_ms: u64) -> Option<u32> {
-    let mut cur = card_id;
-    for _ in 0..PLACE_WALK_DEPTH_CAP {
-        let row = cards::prior_at(ctx, cur, time_ms)?;
-        let (_, _, state) = unpack_micro_zone(row.micro_zone);
-        if matches!(state, StackedState::Free) {
-            return Some(cur);
+/// Next free `stack_index` in `(root_id, direction)` — `max occupied + 1`,
+/// saturating at 15; `0` when the branch is empty. Append-to-end; gap-tolerant.
+fn next_branch_index(
+    ctx: &ReducerContext,
+    root_id: u32,
+    macro_zone: u64,
+    direction: u8,
+    now_ms: u64,
+) -> u8 {
+    let mut max: Option<u8> = None;
+    for m in collect_members(ctx, root_id, now_ms) {
+        if m.macro_zone != macro_zone {
+            continue;
         }
-        if row.micro_location == 0 {
-            return None;
+        if cards::stack_branch(&m) == direction {
+            let idx = cards::stack_index(&m);
+            max = Some(max.map_or(idx, |cur| cur.max(idx)));
         }
-        cur = row.micro_location;
     }
-    None
+    match max {
+        Some(m) => ((m as u16 + 1).min(15)) as u8,
+        None => 0,
+    }
 }
 
 /// Resolve a `Loose` placement to the concrete write tuple.
@@ -418,7 +398,7 @@ fn resolve_loose_target(
     q: u8,
     r: u8,
     xy: u32,
-) -> Result<(u8, u64, u8, u32), String> {
+) -> Result<(u8, u64, Micro), String> {
     match surface {
         INVENTORY_LAYER => {
             // The owner band holds the soul's card_id; the soul must belong to caller.
@@ -428,12 +408,10 @@ fn resolve_loose_target(
                     "place_card: inventory target soul {macro_zone} is owned by player {soul_player} (not {caller_player_id})"
                 ));
             }
-            Ok((
-                INVENTORY_LAYER,
-                macro_zone,
-                pack_micro_zone(0, 0, StackedState::Free),
-                xy,
-            ))
+            // Inventory is a rect grid; the item sits loose at pixel offset
+            // (x, y) within cell (0, 0).
+            let (x, y) = unpack_xy(xy);
+            Ok((INVENTORY_LAYER, macro_zone, Micro::Loose { local_q: 0, local_r: 0, x, y, kind: LOOSE_RECT }))
         }
         PLAYER_INVENTORY_LAYER => {
             // The owner band holds the player_id — must match the caller to
@@ -443,12 +421,8 @@ fn resolve_loose_target(
                     "place_card: player-inventory target {macro_zone} is not the caller's player_id ({caller_player_id})"
                 ));
             }
-            Ok((
-                PLAYER_INVENTORY_LAYER,
-                macro_zone,
-                pack_micro_zone(0, 0, StackedState::Free),
-                xy,
-            ))
+            let (x, y) = unpack_xy(xy);
+            Ok((PLAYER_INVENTORY_LAYER, macro_zone, Micro::Loose { local_q: 0, local_r: 0, x, y, kind: LOOSE_RECT }))
         }
         s if s >= WORLD_LAYER => {
             if q >= 8 || r >= 8 {
@@ -456,19 +430,21 @@ fn resolve_loose_target(
                     "place_card: world target ({q}, {r}) out of range (0..=7 each)"
                 ));
             }
-            Ok((
-                surface,
-                macro_zone,
-                pack_micro_zone(q, r, StackedState::Free),
-                0,
-            ))
+            // Player-dropped world card lands loose-hex at the hex centre PLUS
+            // the within-cell `(x, y)` offset (in pixels, sign-extended i12
+            // when stored in `micro_location`). Zero ⇒ snapped to the cell
+            // centre — the previous forced-snap behaviour the client picks via
+            // its `forceSnap` viewport flag. Structures that should
+            // snap-and-stack onto the tile still go through recipe placement,
+            // not this drag path.
+            let (x, y) = unpack_xy(xy);
+            Ok((surface, macro_zone, Micro::Loose { local_q: q, local_r: r, x, y, kind: LOOSE_HEX }))
         }
         MINI_ZONE_LAYER | POCKET_DIMENSION_LAYER => {
-            // Mini-zone / pocket-dimension placement: `macro_zone` is
-            // the anchor card's `card_id`. The anchor must be reachable
-            // from the caller — for simplicity require caller-owned
-            // anchor (same gate as inventory). Mini-zone has internal
-            // hex coords; pocket-dimension typically uses `xy`.
+            // Mini-zone / pocket-dimension placement: `macro_zone` is the anchor
+            // card's `card_id`. Require a caller-owned anchor (same gate as
+            // inventory). Mini-zone uses hex coords (q, r); pocket-dimension is
+            // a rect interior using the xy offset.
             let anchor_player =
                 cards::owning_player(ctx, crate::packed::owner_of(macro_zone)).unwrap_or(cards::WORLD_PLAYER_ID);
             if anchor_player != caller_player_id {
@@ -476,76 +452,18 @@ fn resolve_loose_target(
                     "place_card: container anchor {macro_zone} is owned by player {anchor_player} (not {caller_player_id})"
                 ));
             }
-            let micro_zone = if surface == MINI_ZONE_LAYER {
-                pack_micro_zone(q, r, StackedState::Free)
+            let (x, y) = unpack_xy(xy);
+            let micro = if surface == MINI_ZONE_LAYER {
+                // Hex anchor: cell `(q, r)` + within-cell `(x, y)` offset.
+                Micro::Loose { local_q: q, local_r: r, x, y, kind: LOOSE_HEX }
             } else {
-                pack_micro_zone(0, 0, StackedState::Free)
+                // Pocket dimension: rect interior, no cell — pure `(x, y)`.
+                Micro::Loose { local_q: 0, local_r: 0, x, y, kind: LOOSE_RECT }
             };
-            let micro_location = if surface == MINI_ZONE_LAYER { 0 } else { xy };
-            Ok((surface, macro_zone, micro_zone, micro_location))
+            Ok((surface, macro_zone, micro))
         }
         other => Err(format!(
             "place_card: unsupported surface {other} (expected INVENTORY, PLAYER_INVENTORY, POCKET_DIMENSION, MINI_ZONE, or WORLD_LAYER+)"
         )),
     }
-}
-
-/// Collect every card whose chain-of-parents (`micro_location`) walks
-/// back through `source`. The source itself is NOT included. Used
-/// to validate sub-chain holds and to re-stamp surface / macro_zone
-/// after the move so descendants travel with the chain root.
-/// `owner_id` is preserved per descendant — placement doesn't change
-/// who owns the card.
-///
-/// Mirrors `utilities::chain_descendants`'s shape but indexed via the
-/// source's current `owner_id` (chain root). World-rooted chains
-/// (`owner_id == 0`) return empty — descendant tracking is only
-/// meaningful inside an owner-card bucket.
-fn collect_descendants(
-    ctx: &ReducerContext,
-    source: &cards::Card,
-    now_ms: u64,
-) -> Vec<cards::Card> {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    if source.owner_id == 0 {
-        return Vec::new();
-    }
-
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    let mut children_of: BTreeMap<u32, Vec<cards::Card>> = BTreeMap::new();
-    for row in ctx.db.cards().owner_id().filter(source.owner_id) {
-        if !seen.insert(row.card_id) {
-            continue;
-        }
-        let Some(latest) = cards::prior_at(ctx, row.card_id, now_ms) else {
-            continue;
-        };
-        if latest.micro_location == 0 {
-            continue;
-        }
-        children_of
-            .entry(latest.micro_location)
-            .or_default()
-            .push(latest);
-    }
-
-    let mut out: Vec<cards::Card> = Vec::new();
-    let mut frontier: Vec<u32> = vec![source.card_id];
-    for _ in 0..PLACE_WALK_DEPTH_CAP {
-        let mut next: Vec<u32> = Vec::new();
-        for parent in &frontier {
-            if let Some(children) = children_of.remove(parent) {
-                for child in children {
-                    next.push(child.card_id);
-                    out.push(child);
-                }
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next;
-    }
-    out
 }

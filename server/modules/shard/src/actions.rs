@@ -5,7 +5,7 @@
 //! ```text
 //! propose_action(
 //!   recipe_id: u16,
-//!   surface: u8, macro_zone: u64, micro_zone: u8,  // root's intended location
+//!   surface: u8, macro_zone: u64, micro_location: u32,  // root's intended loose location
 //!   root: u32,
 //!   bindings: Vec<Vec<u32>>,    // bindings[iter_id][offset] = card_id
 //! )
@@ -21,8 +21,8 @@
 //!
 //! Branch 0 is the tile branch by convention. If a recipe references
 //! branch 0 and `bindings[iter_for_branch_0][0] == 0` (the no-card
-//! sentinel), the server synthesizes from zone tile data at
-//! `(surface, macro_zone, micro_zone)`.
+//! sentinel), the server synthesizes from zone tile data at the cell decoded
+//! from `(surface, macro_zone, micro_location)`.
 //!
 //! Stages (any failure rolls the whole reducer back):
 //!
@@ -54,13 +54,10 @@ use resonantdust_content::recipe_statement::StatementValue;
 use spacetimedb::{reducer, ReducerContext};
 
 use crate::action_completion::{self, HexLocation};
-use crate::cards;
+use crate::cards::{self, Micro};
 use crate::flags::state_flags;
 use crate::pending_actions;
-use crate::packed::{
-    micro_zone_direction, pack_micro_zone, pack_slot_micro_zone, pack_stack_micro_zone,
-    unpack_micro_zone, StackedState,
-};
+use crate::packed::{loose_kind_for_surface, micro_loose_cell, unpack_micro_loose};
 use crate::players;
 // Module + the generated `zones()` accessor trait — needed for the
 // synthetic-tile lookup. Same `(self, … as _)` pattern as elsewhere.
@@ -89,13 +86,13 @@ fn derive_synthetic_hex(
     ctx: &ReducerContext,
     surface: u8,
     macro_zone: u64,
-    micro_zone: u8,
+    micro_location: u32,
     now_ms: u64,
 ) -> Option<(u16, (u8, u8), HexLocation)> {
     if surface < SYNTHETIC_HEX_MIN_SURFACE {
         return None;
     }
-    let (q, r, _state) = unpack_micro_zone(micro_zone);
+    let (q, r) = micro_loose_cell(micro_location);
     // Card-priority read: a previously promoted tile-card (which may
     // carry a mutated def — Phase 4+) wins over the Zone slot.
     let (packed_def, stock0, stock1) =
@@ -119,9 +116,9 @@ fn derive_synthetic_hex(
 
 // ----- propose_action reducer ------------------------------------------
 
-/// Verify a client-proposed recipe + bindings, and (eventually)
-/// stitch the chain, apply locks, schedule completion. See module
-/// docs for the four-stage flow.
+/// Verify a client-proposed recipe + bindings, then stitch the
+/// chain, apply locks, and run completion. See module docs for the
+/// four-stage flow.
 ///
 /// **Time discipline:** `client_time_ms` is the client's view of
 /// "now" at submission. The reducer uses [`cards::effective_now_ms`]
@@ -132,7 +129,8 @@ fn derive_synthetic_hex(
 /// this single value, so the row visibilities the client observes
 /// stay consistent with the writes the server makes.
 ///
-/// **Status:** Stage 1 verifier landed; Stages 2-4 stubbed.
+/// **Status:** all four stages live — verify, existence/liveness,
+/// chain-stitch, lock + `action_completion::plan`/`commit`.
 #[reducer]
 #[allow(clippy::too_many_arguments)]
 pub fn propose_action(
@@ -141,7 +139,7 @@ pub fn propose_action(
     recipe_id: u16,
     surface: u8,
     macro_zone: u64,
-    micro_zone: u8,
+    micro_location: u32,
     root: u32,
     bindings: Vec<Vec<u32>>,
 ) -> Result<(), String> {
@@ -151,7 +149,7 @@ pub fn propose_action(
         recipe_id,
         surface,
         macro_zone,
-        micro_zone,
+        micro_location,
         root,
         &bindings,
     );
@@ -182,7 +180,7 @@ fn propose_action_inner(
     recipe_id: u16,
     surface: u8,
     macro_zone: u64,
-    micro_zone: u8,
+    micro_location: u32,
     root: u32,
     bindings: &[Vec<u32>],
 ) -> Result<(), String> {
@@ -214,7 +212,7 @@ fn propose_action_inner(
         bindings,
         surface,
         macro_zone,
-        micro_zone,
+        micro_location,
         now_ms,
     )?;
 
@@ -225,7 +223,7 @@ fn propose_action_inner(
     // `synthetic_hex` carrier remains for the legacy verify/validate
     // path until Phases 3/7 retire it. See `docs/TILE_AS_CARD.md`.
     let substituted_bindings: Option<Vec<Vec<u32>>> = if synthetic_hex.is_some() {
-        let (q, r, _) = unpack_micro_zone(micro_zone);
+        let (q, r) = micro_loose_cell(micro_location);
         let tile_card = cards::find_or_create_tile_card(ctx, surface, macro_zone, q, r, now_ms)
             .map_err(|e| format!("promote tile: {e}"))?;
         let mut new_bindings = bindings.to_vec();
@@ -291,7 +289,7 @@ fn propose_action_inner(
         root,
         surface,
         macro_zone,
-        micro_zone,
+        micro_location,
         bindings,
         now_ms,
     )?;
@@ -329,7 +327,7 @@ fn resolve_synthetic_if_needed(
     bindings: &[Vec<u32>],
     surface: u8,
     macro_zone: u64,
-    micro_zone: u8,
+    micro_location: u32,
     now_ms: u64,
 ) -> Result<Option<(u16, (u8, u8), HexLocation)>, String> {
     for (iter_id, it) in recipe.iterators.iter().enumerate() {
@@ -341,12 +339,12 @@ fn resolve_synthetic_if_needed(
             // tiles. If the recipe uses slot.0.1+, those must be
             // real cards.
             if !binding.is_empty() && binding[0] == 0 {
-                let synth = derive_synthetic_hex(ctx, surface, macro_zone, micro_zone, now_ms)
+                let synth = derive_synthetic_hex(ctx, surface, macro_zone, micro_location, now_ms)
                     .ok_or_else(|| {
                         format!(
                             "recipe references branch 0 with synthetic sentinel \
                              (0) but no tile resolves at (surface={surface}, \
-                             macro_zone={macro_zone}, micro_zone={micro_zone})"
+                             macro_zone={macro_zone}, micro_location={micro_location})"
                         )
                     })?;
                 return Ok(Some(synth));
@@ -625,9 +623,12 @@ fn resolve_target(
             Seg::Word(w) if w == "parent" => {
                 let card = cards::prior_at(ctx, card_id, now_ms)
                     .ok_or_else(|| format!("card {card_id} not found"))?;
-                if card.micro_location == 0 {
+                // Flat chains are depth-1: a member's only "parent" is its root
+                // (held in `micro_location`). A loose/root card has no parent —
+                // its `micro_location` is packed coords, not a card_id.
+                if !cards::micro_is_card(&card) {
                     return Err(format!(
-                        "parent step: card {card_id} has no parent"
+                        "parent step: card {card_id} has no parent (it is a chain root)"
                     ));
                 }
                 expect = Expect::ParentOf(card.micro_location);
@@ -691,7 +692,7 @@ fn resolve_target(
                 if !it.parent.is_empty() {
                     let card = cards::prior_at(ctx, resolved, now_ms)
                         .ok_or_else(|| format!("card {resolved} not found"))?;
-                    let actual_dir = micro_zone_direction(card.micro_zone);
+                    let actual_dir = cards::stack_branch(&card);
                     if actual_dir != it.branch {
                         return Err(format!(
                             "branch mismatch: iterator {iterator_id} expects \
@@ -889,42 +890,45 @@ fn validate_bindings(
 
 // ----- Stage 3: chain-stitch -----------------------------------------
 
-/// Write per-card position bytes so the chain is a server-side
-/// fact, visible to all subscribers. Root lands `Free` at the
-/// proposed `(surface, macro_zone, micro_zone)`; each top-level
-/// iterator's bindings stitch into branch `iterator.branch` as a
-/// parent-pointer chain off root.
+/// Write per-card position so the chain is a server-side fact, visible to all
+/// subscribers. Root lands loose at the proposed `(surface, macro_zone,
+/// micro_location)`; each top-level iterator's bindings become flat members of
+/// `root` in branch `iterator.branch`, indexed by their offset.
 ///
-/// Card layout per branch:
-/// - `bindings[iter][0]` — `state=OnRoot, direction=branch,
-///   position=1, micro_location=root`.
-/// - `bindings[iter][i>0]` — `state=Slot, direction=branch,
-///   micro_location=bindings[iter][i-1]` (parent pointer chain).
+/// Flat-root layout per branch:
+/// - `bindings[iter][offset]` — `Micro::Stacked{ root, branch=iterator.branch,
+///   index=offset }`. No parent pointers — every member points straight at root.
 ///
-/// Nested iterators (parent != []) are left alone — their cards
-/// already live in other chains (equipment, etc.). Synthetic-tile
-/// sentinels (card_id == 0) are skipped.
+/// Nested iterators (parent != []) are left alone — their cards already live in
+/// other chains (equipment, etc.). Synthetic-tile sentinels (card_id == 0) and
+/// the root itself (if it appears in bindings) are skipped.
 fn chain_stitch(
     ctx: &ReducerContext,
     recipe: &Recipe,
     root: u32,
     surface: u8,
     macro_zone: u64,
-    micro_zone: u8,
+    micro_location: u32,
     bindings: &[Vec<u32>],
     now_ms: u64,
 ) -> Result<(), String> {
+    let full_macro = crate::packed::with_surface(macro_zone, surface);
+    let pos_need = state_flags().pos_need;
+
     if root != 0 {
-        let (q, r, _) = unpack_micro_zone(micro_zone);
-        let root_micro_zone = pack_micro_zone(q, r, StackedState::Free);
-        let pos_need = state_flags().pos_need;
+        // Root lands loose at the proposed cell (decoded from the wire
+        // micro_location), kind by surface.
+        let (q, r, x, y) = unpack_micro_loose(micro_location);
+        let root_micro = Micro::Loose {
+            local_q: q,
+            local_r: r,
+            x,
+            y,
+            kind: loose_kind_for_surface(surface),
+        };
         cards::update_with_at(ctx, root, now_ms, |c| {
-            c.macro_zone = crate::packed::with_surface(macro_zone, surface);
-            c.micro_zone = root_micro_zone;
-            // Free state uses micro_location for [x, y] pixel coords;
-            // for action-rooted cards we don't carry sub-tile coords,
-            // so 0 it.
-            c.micro_location = 0;
+            c.macro_zone = full_macro;
+            root_micro.apply(c);
             c.flags_state |= pos_need;
         });
     }
@@ -935,37 +939,17 @@ fn chain_stitch(
         }
         let binding_row = &bindings[iter_id];
         for (offset, &card_id) in binding_row.iter().enumerate() {
-            if card_id == 0 {
+            if card_id == 0 || card_id == root {
                 continue;
             }
-            // Root may appear in bindings when the client promoted it
-            // to `slot.<branch>.0` for a recipe with `anchors.root ==
-            // false` (e.g. `corpus + corpus` matching against a stack
-            // of two corpus where the bottom is the loose root).
-            // Root's position was already written above; subsequent
-            // bindings entries (offset >= 1) will chain off it via
-            // `binding_row[offset - 1] == root`, so the visual chain
-            // is still correct.
-            if card_id == root {
-                continue;
-            }
-            let direction = it.branch;
-            let (new_micro_zone, parent_id) = if offset == 0 {
-                (
-                    pack_stack_micro_zone(1, direction, StackedState::OnRoot),
-                    root,
-                )
-            } else {
-                (
-                    pack_slot_micro_zone(direction),
-                    binding_row[offset - 1],
-                )
+            let member = Micro::Stacked {
+                root,
+                branch: it.branch,
+                index: (offset as u8).min(15),
             };
-            let pos_need = state_flags().pos_need;
             cards::update_with_at(ctx, card_id, now_ms, |c| {
-                c.macro_zone = crate::packed::with_surface(macro_zone, surface);
-                c.micro_zone = new_micro_zone;
-                c.micro_location = parent_id;
+                c.macro_zone = full_macro;
+                member.apply(c);
                 c.flags_state |= pos_need;
             });
         }
