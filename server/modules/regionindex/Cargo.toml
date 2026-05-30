@@ -1,0 +1,12 @@
+[package]
+name = "resonantdust_regionindex"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Self-contained index: macro_region -> regions data_shard. No card / zone /
+# definition state to share, so no `content` path-dep + bind-mount (like chat).
+spacetimedb = { version = "=2.1.0" }

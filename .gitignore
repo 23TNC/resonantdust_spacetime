@@ -39,6 +39,12 @@ Thumbs.db
 
 # Rust build artifacts
 */target/*
+server/modules/cards/target/*
+server/modules/players/target/*
+server/modules/regions/target/*
+server/modules/shard/target/*
+server/modules/regionindex/target/*
+server/modules/chat/target/*
 **/*.rs.bk
 
 # Cargo

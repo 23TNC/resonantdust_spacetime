@@ -228,8 +228,6 @@ fn definition_state_flag_mask(packed: u16) -> u32 {
 pub struct Card {
     #[primary_key]
     pub valid_at: u64,
-    /// Data-shard partition this row belongs to (`crate::DATA_SHARD`; `0` today).
-    pub data_shard: u16,
     #[index(btree)]
     pub card_id: u32,
     /// Packed location key `[reserved:u32 | surface:u8 | payload:u24]`.
@@ -861,7 +859,6 @@ pub fn create(
 ) -> Card {
     let mut card = Card {
         valid_at: 0,
-        data_shard: crate::DATA_SHARD,
         card_id,
         macro_zone,
         micro_location: 0,
@@ -981,7 +978,6 @@ pub fn create_at(
 ) -> Card {
     let mut card = Card {
         valid_at: 0,
-        data_shard: crate::DATA_SHARD,
         card_id,
         macro_zone,
         micro_location: 0,
@@ -1004,6 +1000,10 @@ pub fn create_at(
 /// `0..FIRST_CARD_ID` are reserved for system / sentinel use — notably
 /// `macro_zone`'s owner band uses `0` as the WORLD sentinel. Mirrors
 /// `players::FIRST_PLAYER_ID`.
+///
+/// Player-soul cards are allocated normally (`next_card_id`) and identified
+/// by `owner_id == player_id` + the `is_owned_by_player` flag, NOT by a
+/// reserved id band — a player can own several (multi-character).
 pub const FIRST_CARD_ID: u32 = 1024;
 
 #[table(accessor = card_id_counter)]
@@ -1024,40 +1024,42 @@ pub struct CardIdCounter {
 /// O(N) over every version row — which became expensive as the
 /// history grew. Counter table fixes that without changing semantics.
 pub fn next_card_id(ctx: &ReducerContext) -> u32 {
-    if let Some(counter) = ctx.db.card_id_counter().id().find(0) {
-        let allocated = counter.next;
-        // Delete-and-reinsert is the established pattern in this
-        // codebase (see `cards::write_at`, `players::write_at`); avoids
-        // depending on whether `.update` is exposed on this binding
-        // version.
-        ctx.db.card_id_counter().id().delete(0);
-        ctx.db.card_id_counter().insert(CardIdCounter {
-            id: 0,
-            next: allocated.saturating_add(1),
-        });
-        allocated
-    } else {
-        // Lazy seed. One full scan, paid exactly once after each fresh
-        // deployment (or after `republish` clears data). The seed must
-        // include existing cards so we don't collide with rows the
-        // counter wasn't tracking yet.
-        let current_max = ctx
-            .db
-            .cards()
-            .iter()
-            .map(|c| c.card_id)
-            .max()
-            .unwrap_or(0);
-        // Reserve ids `0..FIRST_CARD_ID` for system / sentinel use (e.g.
-        // `macro_zone`'s owner band uses `0` for WORLD). Mirrors
-        // `players::FIRST_PLAYER_ID`.
-        let allocated = current_max.saturating_add(1).max(FIRST_CARD_ID);
-        ctx.db.card_id_counter().insert(CardIdCounter {
-            id: 0,
-            next: allocated.saturating_add(1),
-        });
-        allocated
-    }
+    use resonantdust_content::packed::{card_local_of, pack_card_id, CARD_LOCAL_MASK};
+
+    // The counter holds the next *local* id (low 20 bits). The shard id (high
+    // 12 bits = `DATA_SHARD`) is composed on the way out, so a card's id always
+    // names its own `cards` shard (`card_shard_of(id) == data_shard`) and the
+    // gateway routes by it with no index lookup.
+    let next_local = match ctx.db.card_id_counter().id().find(0) {
+        Some(counter) => {
+            // Delete-and-reinsert is the established pattern here
+            // (see `cards::write_at`); avoids depending on `.update`.
+            ctx.db.card_id_counter().id().delete(0);
+            counter.next
+        }
+        None => {
+            // Lazy seed, paid once after a fresh deployment / republish: scan
+            // the *local* part of existing card ids (all this shard's own rows)
+            // so we don't collide with untracked rows. Locals `0..FIRST_CARD_ID`
+            // stay reserved per shard (sentinels — `macro_zone` owner `0` =
+            // WORLD).
+            ctx.db
+                .cards()
+                .iter()
+                .map(|c| card_local_of(c.card_id))
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(FIRST_CARD_ID)
+        }
+    };
+    ctx.db.card_id_counter().insert(CardIdCounter {
+        id: 0,
+        // Cap at the 20-bit local ceiling — a per-shard backstop far above any
+        // real working set (~1M cards/shard).
+        next: next_local.saturating_add(1).min(CARD_LOCAL_MASK),
+    });
+    pack_card_id(crate::DATA_SHARD, next_local)
 }
 
 /// Resolve the player who ultimately owns `card_id`.

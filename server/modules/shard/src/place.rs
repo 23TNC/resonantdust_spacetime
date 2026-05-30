@@ -15,7 +15,7 @@ use crate::cards::{self, cards as _cards_table, Micro};
 use crate::flags::state_flags;
 use crate::packed::PLAYER_INVENTORY_LAYER;
 use crate::packed::{
-    INVENTORY_LAYER, LOOSE_HEX, LOOSE_RECT, MINI_ZONE_LAYER, POCKET_DIMENSION_LAYER,
+    INVENTORY_LAYER, LOOSE_RECT, MINI_ZONE_LAYER, POCKET_DIMENSION_LAYER, SNAP_HEX,
     STACK_DIR_DOWN, STACK_DIR_HEX, STACK_DIR_UP, WORLD_LAYER,
 };
 use crate::players;
@@ -430,15 +430,18 @@ fn resolve_loose_target(
                     "place_card: world target ({q}, {r}) out of range (0..=7 each)"
                 ));
             }
-            // Player-dropped world card lands loose-hex at the hex centre PLUS
-            // the within-cell `(x, y)` offset (in pixels, sign-extended i12
-            // when stored in `micro_location`). Zero ⇒ snapped to the cell
-            // centre — the previous forced-snap behaviour the client picks via
-            // its `forceSnap` viewport flag. Structures that should
-            // snap-and-stack onto the tile still go through recipe placement,
-            // not this drag path.
+            // Player-dropped world card snaps to the hex centre. `SNAP_HEX`
+            // tells the renderer to ignore the within-cell `(x, y)` offset
+            // (so the card always renders centred even if `xy` carries
+            // non-zero data) — matches the client's
+            // `looseKindForSurface(WORLD_LAYER) → SNAP_HEX` hardcode. We
+            // still pass through `(x, y)` from the request so the row's
+            // payload stays consistent with whatever the client sent, but
+            // it's effectively ignored at render time. Structures that
+            // should snap-and-stack onto the tile still go through recipe
+            // placement, not this drag path.
             let (x, y) = unpack_xy(xy);
-            Ok((surface, macro_zone, Micro::Loose { local_q: q, local_r: r, x, y, kind: LOOSE_HEX }))
+            Ok((surface, macro_zone, Micro::Loose { local_q: q, local_r: r, x, y, kind: SNAP_HEX }))
         }
         MINI_ZONE_LAYER | POCKET_DIMENSION_LAYER => {
             // Mini-zone / pocket-dimension placement: `macro_zone` is the anchor
@@ -454,8 +457,10 @@ fn resolve_loose_target(
             }
             let (x, y) = unpack_xy(xy);
             let micro = if surface == MINI_ZONE_LAYER {
-                // Hex anchor: cell `(q, r)` + within-cell `(x, y)` offset.
-                Micro::Loose { local_q: q, local_r: r, x, y, kind: LOOSE_HEX }
+                // Hex anchor: cell `(q, r)`, snapped to centre (the renderer
+                // ignores the offset under `SNAP_HEX`). Mirror of the world
+                // drop arm above + the client's `looseKindForSurface`.
+                Micro::Loose { local_q: q, local_r: r, x, y, kind: SNAP_HEX }
             } else {
                 // Pocket dimension: rect interior, no cell — pure `(x, y)`.
                 Micro::Loose { local_q: 0, local_r: 0, x, y, kind: LOOSE_RECT }

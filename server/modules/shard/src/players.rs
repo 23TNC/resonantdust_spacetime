@@ -613,9 +613,12 @@ pub fn claim_or_login(
         }
         None => {
             let new_id = next_player_id(ctx);
-            // A freshly-claimed player is auto-granted exactly one
-            // soul (see `spawn_soul_for` below) — there is no
-            // separate character-creation step.
+            // Signup creates only the player record + session. The
+            // player-soul is no longer spawned here as a side-effect:
+            // the client drives soul creation post-login via the
+            // `spawn_soul` reducer (it subscribes its owned cards and,
+            // finding none, requests one). There is no separate
+            // character-creation step yet.
             create_at(ctx, new_id, name, now_ms);
             // Seed the per-player private state row.
             ctx.db.player_profiles().insert(PlayerProfile {
@@ -624,9 +627,6 @@ pub fn claim_or_login(
                 lifecycle_count: 0,
                 earliest_lifecycle_expires_ms: 0,
             });
-            // Grant the player their (empty) player-soul. Nothing
-            // else is seeded — no account-wide inventory, no soul kit.
-            spawn_soul_for(ctx, new_id, now_ms)?;
             new_id
         }
     };
@@ -681,9 +681,76 @@ const PLAYER_SOUL_SURFACE: u8 = 0;
 /// a `player_soul`, resolved through the content catalog at signup.
 const STARTER_SOUL_KEY: &str = "player_soul";
 
+/// Count the distinct `player_soul` cards `player_id` currently owns —
+/// top-level souls whose latest version still has `owner_id == player_id`
+/// and carries the `is_owned_by_player` flag. Dedups across `valid_at`
+/// version rows via the `owner_id` btree index. This is the same set the
+/// client enumerates with `SELECT * FROM cards WHERE owner_id = player_id`
+/// (filtered by the flag), so client and server agree on the count.
+fn owned_soul_count(ctx: &ReducerContext, player_id: u32) -> u32 {
+    let mask = state_flags().is_owned_by_player;
+    let mut card_ids = BTreeSet::new();
+    for row in ctx.db.cards().owner_id().filter(player_id) {
+        card_ids.insert(row.card_id);
+    }
+    card_ids
+        .into_iter()
+        .filter(|&card_id| {
+            cards::latest(ctx, card_id)
+                .is_some_and(|c| c.owner_id == player_id && c.flags_state & mask != 0)
+        })
+        .count() as u32
+}
+
+/// Spawn the caller's `player_soul` on demand. The client drives soul
+/// creation now: post-login it subscribes its owned cards (`owner_id ==
+/// player_id`, filtered by `is_owned_by_player`) and, finding none,
+/// calls this — rather than `claim_or_login` spawning the soul as a
+/// signup side-effect.
+///
+/// **Idempotent under races.** The client passes `soul_index = 1 + (souls
+/// it currently sees)`. If the player already owns at least `soul_index`
+/// souls, the request raced an earlier spawn (or the client's local view
+/// lagged the server) — we reject so a stale-low client count can never
+/// double-spawn. With a single soul today `soul_index` is always 1, so
+/// this rejects any second spawn outright; the parameter generalizes to
+/// future multi-character signup.
+///
+/// **Authorization is the gateway's job.** This reducer trusts its
+/// `player_id` argument; a real deployment routes the call through the
+/// gateway, which has the cross-DB view to verify the caller's identity
+/// maps to `player_id` in the auth DB. Dev clients call it directly.
+/// (Mirrors the `cards` module's `spawn_soul` convention.)
+///
+/// Delegates to `spawn_soul_for`; the soul card write triggers
+/// `souls::on_card_write`, which auto-creates the matching `Soul` row.
+///
+/// `_client_time_ms` is accepted but ignored, kept for wire-format
+/// consistency with the other reducers.
+#[reducer]
+pub fn spawn_soul(
+    ctx: &ReducerContext,
+    _client_time_ms: u64,
+    player_id: u32,
+    soul_index: u32,
+) -> Result<(), String> {
+    let owned = owned_soul_count(ctx, player_id);
+    if owned >= soul_index {
+        return Err(format!(
+            "spawn_soul: player {player_id} already owns {owned} soul(s) \
+             (requested index {soul_index}) — rejected",
+        ));
+    }
+    // Stamp at `now − TIME_DRIFT_BUFFER_MS` so the rows are immediately
+    // visible to the client's buffered `serverNowMs()` view — matches
+    // the `claim_or_login` / `set_last_login` convention.
+    let time_ms = now_ms(ctx).saturating_sub(crate::cards::TIME_DRIFT_BUFFER_MS);
+    spawn_soul_for(ctx, player_id, time_ms)
+}
+
 /// Grant a player their `player_soul`: spawn it on surface 0 (never
 /// rendered — it *is* the player) and seed an empty `SoulPrivate`
-/// row. Called once from `claim_or_login`'s new-player branch.
+/// row. Called from the `spawn_soul` reducer.
 ///
 /// Deliberately minimal — the player-soul is a thin owner of other
 /// souls. It gets no starter inventory and no starter blueprints;

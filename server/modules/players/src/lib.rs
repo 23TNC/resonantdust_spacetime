@@ -1,18 +1,18 @@
 // lib.rs
-pub mod cards;
-pub mod flags;
+pub mod gate_api;
 pub mod gc;
 pub mod packed;
 pub mod players;
 pub mod sequence;
-pub mod souls;
-pub mod utilities;
 
-/// The data-shard partition id this module instance owns. Stamped onto every
-/// public row this shard writes (the `data_shard` column on `cards` /
-/// `players` / `souls`). `0` while a single shard serves everything;
-/// horizontal sharding will assign distinct ids per instance. This is the
-/// players ("hot") shard — it holds only player / card / soul state; zones and
-/// regions live in a separate positionally-referenced database, and recipe
-/// validation runs in the gateway.
+/// The data-shard partition id this auth database owns. Stamped onto
+/// the `data_shard` column of rows this module writes (`player_profiles`).
+/// `0` today.
+///
+/// This is the `players` **auth** database: it owns accounts, login, and
+/// the identity↔player_id↔(card-shard, soul_id) routing. It does NOT hold
+/// cards or souls — those live in the per-shard `cards` databases, and each
+/// `Player` row carries the `data_shard` of the card shard it's assigned to.
+/// Low-write, so a single auth DB can serve all players; the `cards` shards
+/// are what scale out.
 pub const DATA_SHARD: u16 = 0;

@@ -57,8 +57,6 @@ pub struct Soul {
     /// largest `valid_at_time` is the active state.
     #[primary_key]
     pub valid_at: u64,
-    /// Data-shard partition this row belongs to (`crate::DATA_SHARD`; `0` today).
-    pub data_shard: u16,
     #[index(btree)]
     pub card_id: u32,
     #[index(btree)]
@@ -101,8 +99,6 @@ pub struct Soul {
 pub struct SoulPrivate {
     #[primary_key]
     pub card_id: u32,
-    /// Data-shard partition this row belongs to (`crate::DATA_SHARD`; `0` today).
-    pub data_shard: u16,
     /// Bit field of discovered blueprints, ids 1..=64. Bit position
     /// is `blueprint_id - 1`, matching the 1-indexed id mapping in
     /// `content/blueprints/id.json` (so blueprint id 1 = bit 0).
@@ -446,7 +442,6 @@ pub fn on_card_write(
                     ctx,
                     Soul {
                         valid_at: 0,
-                        data_shard: crate::DATA_SHARD,
                         card_id: new_card.card_id,
                         owner_id: new_card.owner_id,
                         macro_zone: new_card.macro_zone,

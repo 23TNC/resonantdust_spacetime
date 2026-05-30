@@ -15,6 +15,8 @@ services:
       - ./data:/home/spacetime/.local/share/spacetime/data
       - ../content:/workspace/server/modules/shard/content
       - ../content:/workspace/server/modules/players/content
+      - ../content:/workspace/server/modules/cards/content
+      - ../content:/workspace/server/modules/regions/content
       - ./server:/workspace/server
       - ../pixijs:/workspace/pixijs
       - ../gateway:/workspace/gateway
@@ -38,6 +40,8 @@ services:
       - ./server:/workspace/server
       - ../content:/workspace/server/modules/shard/content
       - ../content:/workspace/server/modules/players/content
+      - ../content:/workspace/server/modules/cards/content
+      - ../content:/workspace/server/modules/regions/content
       - ../pixijs:/workspace/pixijs
       - ../gateway:/workspace/gateway
     working_dir: /workspace/server
@@ -54,6 +58,8 @@ services:
       - ./server:/workspace/server
       - ../content:/workspace/server/modules/shard/content
       - ../content:/workspace/server/modules/players/content
+      - ../content:/workspace/server/modules/cards/content
+      - ../content:/workspace/server/modules/regions/content
       - ../pixijs:/workspace/pixijs
       - ../gateway:/workspace/gateway
     working_dir: /workspace/server

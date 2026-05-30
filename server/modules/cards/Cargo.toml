@@ -1,5 +1,5 @@
 [package]
-name = "resonantdust_players"
+name = "resonantdust_cards"
 version = "0.1.0"
 edition = "2021"
 
@@ -14,11 +14,9 @@ log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Path is relative to this Cargo.toml *inside the build container*. The
-# repo's `content/` is bind-mounted to `/workspace/server/modules/players/content`
+# repo's `content/` is bind-mounted to `/workspace/server/modules/cards/content`
 # (see ../../../compose.yml), so `path = "content"` resolves correctly during
-# `bin/st build players`. On the host filesystem this directory only exists as
+# `bin/st build cards`. On the host filesystem this directory only exists as
 # the bind-mount target, so cargo run directly on the host won't resolve it —
-# that's intentional; all builds go through the Docker wrapper. The auth DB only
-# uses the content crate's `packed` bit-helpers (valid_at packing); it holds no
-# card definitions itself.
+# that's intentional; all builds go through the Docker wrapper.
 resonantdust-content = { path = "content" }

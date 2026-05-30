@@ -1,14 +1,24 @@
-use resonantdust_content::definition_core::find_packed_by_key;
 use spacetimedb::{reducer, Identity, ReducerContext, Table};
-use std::collections::BTreeSet;
 
-use crate::cards::{self, cards as _cards_table};
-use crate::flags::state_flags;
-use crate::packed::{
-    loose_kind_for_surface, pack_macro_zone, pack_valid_at, valid_at_time,
-};
+use crate::packed::{pack_valid_at, valid_at_time};
 use crate::sequence;
-use crate::souls::{soul_privates as _soul_privates_table, with_portrait, SoulPrivate};
+
+/// Client-server time-drift tolerance, mirrored from the `cards` module's
+/// `cards::TIME_DRIFT_BUFFER_MS`. The auth-DB reducers stamp player
+/// rows at `ctx.timestamp − TIME_DRIFT_BUFFER_MS` so the row is
+/// immediately visible to the client's buffered `serverNowMs()` view
+/// (the client runs its estimate this far behind the server). Kept as
+/// a local copy because the `players` and `cards` modules are separate
+/// crates with no shared runtime dependency — keep the two in sync.
+pub const TIME_DRIFT_BUFFER_MS: u64 = 2_000;
+
+/// The card shard a freshly-claimed player is assigned to. `0` while a
+/// single `cards` database serves everyone — which it can, since the
+/// auth DB is low-write and the hot card state is what actually needs
+/// sharding. When that changes, replace this constant with a real
+/// assignment policy (round-robin over live shards, least-loaded, etc.)
+/// and stamp the result onto `Player.data_shard`.
+const CARD_SHARD: u16 = 0;
 
 /// Maximum byte length of a `Player.name`. Enforced by `validate_player_name`
 /// on the input name and again after normalization in `claim_or_login`.
@@ -42,7 +52,19 @@ pub struct Player {
     /// the largest `valid_at_time`.
     #[primary_key]
     pub valid_at: u64,
-    /// Data-shard partition this row belongs to (`crate::DATA_SHARD`; `0` today).
+    /// The **card shard** this player is assigned to — the `data_shard`
+    /// partition whose `cards`-module database holds this player's cards
+    /// and souls. The client reads this at login to know which card
+    /// database to subscribe to. `0` today (single card shard); the
+    /// assignment policy that distributes players across shards lands
+    /// here when sharding actually splits.
+    ///
+    /// No soul id is stored here. After connecting to the card shard the
+    /// client finds its soul(s) directly — `cards.owner_id().filter(player_id)`
+    /// returns the player's top-level `player_soul` cards (a player can own
+    /// more than one; that's the future multi-character handle). If the
+    /// query is empty the client calls the card shard's `spawn_soul` to
+    /// mint one. These top-level player-souls are never rendered in the world.
     pub data_shard: u16,
     #[index(btree)]
     pub player_id: u32,
@@ -228,23 +250,27 @@ fn write_at(ctx: &ReducerContext, mut player: Player, time_ms: u64) -> Player {
 
 // Convenience: insert at the server's wall-clock `now`. Reducer
 // callers should prefer `create_at` and pass `effective_now_ms`.
+// Assigns the default card shard.
 pub fn create(ctx: &ReducerContext, player_id: u32, name: String) -> Player {
-    create_at(ctx, player_id, name, now_ms(ctx))
+    create_at(ctx, player_id, name, CARD_SHARD, now_ms(ctx))
 }
 
 // Insert a brand-new player at the given `time_ms`. valid_at is
 // computed from `time_ms`; any value passed in is overwritten.
+// `data_shard` is the card shard this player is assigned to — see the
+// `Player` struct docs.
 pub fn create_at(
     ctx: &ReducerContext,
     player_id: u32,
     name: String,
+    data_shard: u16,
     time_ms: u64,
 ) -> Player {
     write_at(
         ctx,
         Player {
             valid_at: 0,
-            data_shard: crate::DATA_SHARD,
+            data_shard,
             player_id,
             name,
             // Seed at 0 — anything below `now - retention_window` is
@@ -391,10 +417,15 @@ fn next_player_id(ctx: &ReducerContext) -> u32 {
     }
 }
 
-/// Delete every version row for `player_id`, plus all sessions and any cards
-/// the player owned or stashed. Routed through here so `resolve_caller`'s
-/// invariant ("session.player_id always references a live player") never
-/// breaks.
+/// Delete every version row for `player_id`, plus all sessions. Routed
+/// through here so `resolve_caller`'s invariant ("session.player_id
+/// always references a live player") never breaks.
+///
+/// **Cards/souls are NOT cascaded here** — they live in the player's
+/// assigned `cards` shard (a separate database this module can't write
+/// to). Reaping a deleted player's cards is the card shard's job: its
+/// GC sweep reaps world-/owner-dead rows, and a dedicated card-side
+/// purge reducer (gateway-driven) can hard-delete on account removal.
 pub fn delete_player(ctx: &ReducerContext, player_id: u32) {
     let session_ids: Vec<Identity> = ctx
         .db
@@ -407,42 +438,7 @@ pub fn delete_player(ctx: &ReducerContext, player_id: u32) {
         ctx.db.player_sessions().identity().delete(identity);
     }
 
-    // Cascade-delete every version row of every card this player owns
-    // — including cards owned transitively via the soul's inventory
-    // bucket. Under the post-flag-20 card-owner model, only soul cards
-    // have `owner_id == player_id` directly; inventory cards point at
-    // the soul's card_id, items in containers point at the container,
-    // etc. We resolve "ultimately owned by player_id" via the
-    // `cards::owning_player` walker, which climbs `owner_id` until it
-    // hits the soul boundary.
-    //
-    // O(N walks) over the full cards table — fine while the table is
-    // small. The earlier `Card.macro_zone == player_id` cascade is gone
-    // (macro_zone now holds the soul's card_id for inventory cards, not
-    // a player_id; the walker covers that case correctly).
-    let mut card_ids: BTreeSet<u32> = BTreeSet::new();
-    for c in ctx.db.cards().iter() {
-        if card_ids.contains(&c.card_id) {
-            continue;
-        }
-        if cards::owning_player(ctx, c.card_id) == Some(player_id) {
-            card_ids.insert(c.card_id);
-        }
-    }
-    for card_id in card_ids {
-        let valid_ats: Vec<u64> = ctx
-            .db
-            .cards()
-            .card_id()
-            .filter(card_id)
-            .map(|c| c.valid_at)
-            .collect();
-        for v in valid_ats {
-            ctx.db.cards().valid_at().delete(v);
-        }
-    }
-
-    // And every version row of the player itself.
+    // Every version row of the player itself.
     let valid_ats: Vec<u64> = ctx
         .db
         .players()
@@ -490,7 +486,7 @@ pub fn set_last_login(ctx: &ReducerContext, _client_time_ms: u64) -> Result<(), 
     // `last_login_secs` value itself uses the shifted time too, so
     // the recorded "last login" is consistent with what the client's
     // chat-window calculator expects.
-    let now_ms = now_ms(ctx).saturating_sub(crate::cards::TIME_DRIFT_BUFFER_MS);
+    let now_ms = now_ms(ctx).saturating_sub(TIME_DRIFT_BUFFER_MS);
     let now_secs = (now_ms / 1_000) as u32;
     update_with_at(ctx, player_id, now_ms, |p| {
         p.last_login_secs = now_secs;
@@ -544,7 +540,7 @@ pub fn claim_or_login(
     // `_client_time_ms` is accepted but ignored, kept for wire-format
     // consistency so the client's `ReducerManager.claimOrLogin`
     // wrapper doesn't need a special case.
-    let now_ms = now_ms(ctx).saturating_sub(crate::cards::TIME_DRIFT_BUFFER_MS);
+    let now_ms = now_ms(ctx).saturating_sub(TIME_DRIFT_BUFFER_MS);
 
     let player_id = match latest_by_name(ctx, &name) {
         Some(player) => {
@@ -566,18 +562,18 @@ pub fn claim_or_login(
         }
         None => {
             let new_id = next_player_id(ctx);
-            // A freshly-claimed player is auto-granted exactly one
-            // soul (see `spawn_soul_for` below) — there is no
-            // separate character-creation step.
-            create_at(ctx, new_id, name, now_ms);
+            // Assign the player to a card shard. No soul is created
+            // here — souls live in the assigned `cards` database, which
+            // this module can't write to. After reading `data_shard`
+            // off this row the client connects to that card shard,
+            // looks up `cards.owner_id == player_id`, and calls
+            // `spawn_soul(player_id)` there if it owns none yet.
+            create_at(ctx, new_id, name, CARD_SHARD, now_ms);
             // Seed the per-player private state row.
             ctx.db.player_profiles().insert(PlayerProfile {
                 player_id: new_id,
                 data_shard: crate::DATA_SHARD,
             });
-            // Grant the player their (empty) player-soul. Nothing
-            // else is seeded — no account-wide inventory, no soul kit.
-            spawn_soul_for(ctx, new_id, now_ms)?;
             new_id
         }
     };
@@ -619,127 +615,4 @@ pub fn claim_or_login(
 pub fn client_disconnected(ctx: &ReducerContext) {
     let sender = ctx.sender();
     ctx.db.player_sessions().identity().delete(sender);
-}
-
-/// Surface the player's `player_soul` lives on. Deliberately `0` (not
-/// the world band `64`) so the player-soul is never rendered anywhere
-/// — it *is* the player, a thin soul that owns the world-facing souls
-/// in its inventory rather than standing on the map itself.
-const PLAYER_SOUL_SURFACE: u8 = 0;
-
-/// Soul auto-granted to every new player. Hardcoded since the
-/// starter-pack content layer was removed — a fresh account is always
-/// a `player_soul`, resolved through the content catalog at signup.
-const STARTER_SOUL_KEY: &str = "player_soul";
-
-/// Grant a player their `player_soul`: spawn it on surface 0 (never
-/// rendered — it *is* the player) and seed an empty `SoulPrivate`
-/// row. Called once from `claim_or_login`'s new-player branch.
-///
-/// Deliberately minimal — the player-soul is a thin owner of other
-/// souls. It gets no starter inventory and no starter blueprints;
-/// those belong to the world-facing souls it will come to own.
-///
-/// The soul card write triggers `souls::on_card_write` branch (1),
-/// which auto-creates the matching `Soul` row — so this fn never
-/// touches the `Soul` table directly.
-///
-/// Failure propagates and rolls the whole signup transaction back.
-fn spawn_soul_for(
-    ctx: &ReducerContext,
-    player_id: u32,
-    time_ms: u64,
-) -> Result<(), String> {
-    let soul_def = find_packed_by_key(STARTER_SOUL_KEY)?.ok_or_else(|| {
-        format!(
-            "spawn_soul_for: soul def {:?} not in content catalog",
-            STARTER_SOUL_KEY,
-        )
-    })?;
-    let soul_card_id = cards::next_card_id(ctx);
-
-    // Deterministic 4-bit portrait pick — mixing the soul's card id
-    // with `time_ms` and `player_id` gives a stable per-soul value
-    // without an rng (reducers must stay deterministic).
-    let portrait_seed =
-        (time_ms as u32) ^ (time_ms >> 32) as u32 ^ player_id ^ soul_card_id;
-    let portrait_id = ((portrait_seed ^ (portrait_seed >> 4)) & 0xF) as u8;
-    let soul_flags_state =
-        with_portrait(state_flags().is_owned_by_player, portrait_id);
-
-    cards::create_at(
-        ctx,
-        soul_card_id,
-        time_ms,
-        /* macro_zone      */ crate::packed::with_surface(pack_macro_zone(0, 0), PLAYER_SOUL_SURFACE),
-        /* micro           */ cards::Micro::snap(0, 0, loose_kind_for_surface(PLAYER_SOUL_SURFACE)),
-        /* owner_id        */ player_id,
-        soul_def,
-        /* flags_state     */ soul_flags_state,
-        /* flags_bk        */ 0,
-    );
-
-    // Empty per-soul private state — no starter blueprints granted.
-    ctx.db.soul_privates().insert(SoulPrivate {
-        card_id: soul_card_id,
-        data_shard: crate::DATA_SHARD,
-        blueprints_0: 0,
-        active_blueprints: 0,
-    });
-
-    // --- DEV TEST SEED: a world-facing "human" soul + a dust in its inventory.
-    // Ownership chain: player -> player_soul -> human -> dust. The human stands
-    // on the world at hex (0, 0); its inventory (surface = INVENTORY_LAYER,
-    // owner = human card_id) holds one dust so the second (inventory) viewport
-    // has something to render. Disposable pre-release seeding — remove once
-    // real soul/inventory acquisition exists.
-    let human_def = find_packed_by_key("human")?.ok_or_else(|| {
-        "spawn_soul_for: \"human\" def not in content catalog".to_string()
-    })?;
-    let human_card_id = cards::next_card_id(ctx);
-    let human_portrait_seed =
-        (time_ms as u32) ^ (time_ms >> 32) as u32 ^ player_id ^ human_card_id;
-    let human_portrait_id =
-        ((human_portrait_seed ^ (human_portrait_seed >> 4)) & 0xF) as u8;
-    let human_flags_state =
-        with_portrait(state_flags().is_owned_by_player, human_portrait_id);
-    cards::create_at(
-        ctx,
-        human_card_id,
-        time_ms,
-        /* macro_zone      */ crate::packed::pack_macro_zone_full(0, crate::packed::WORLD_LAYER, 0, 0),
-        /* micro           */ cards::Micro::snap(0, 0, loose_kind_for_surface(crate::packed::WORLD_LAYER)),
-        /* owner_id        */ soul_card_id,
-        human_def,
-        /* flags_state     */ human_flags_state,
-        /* flags_bk        */ 0,
-    );
-    ctx.db.soul_privates().insert(SoulPrivate {
-        card_id: human_card_id,
-        data_shard: crate::DATA_SHARD,
-        blueprints_0: 0,
-        active_blueprints: 0,
-    });
-
-    // Zones/regions live in a separate (positionally-referenced) database now,
-    // so no inventory region is seeded here. The dust card below still lands at
-    // the human's inventory macro_zone; it surfaces once the corresponding zone
-    // subscription opens against the zones shard.
-    let dust_def = find_packed_by_key("dust")?.ok_or_else(|| {
-        "spawn_soul_for: \"dust\" def not in content catalog".to_string()
-    })?;
-    let dust_card_id = cards::next_card_id(ctx);
-    cards::create_at(
-        ctx,
-        dust_card_id,
-        time_ms,
-        /* macro_zone      */ crate::packed::pack_macro_zone_full(human_card_id, crate::packed::INVENTORY_LAYER, 0, 0),
-        /* micro           */ cards::Micro::snap(0, 0, loose_kind_for_surface(crate::packed::INVENTORY_LAYER)),
-        /* owner_id        */ human_card_id,
-        dust_def,
-        /* flags_state     */ 0,
-        /* flags_bk        */ 0,
-    );
-
-    Ok(())
 }
