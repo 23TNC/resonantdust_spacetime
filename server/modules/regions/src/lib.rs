@@ -1,5 +1,6 @@
 // lib.rs
 pub mod card_shards;
+pub mod cards;
 pub mod gate_api;
 pub mod gc;
 pub mod packed;

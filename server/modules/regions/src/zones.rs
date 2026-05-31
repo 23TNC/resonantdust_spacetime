@@ -578,6 +578,100 @@ pub fn create_rect_at(
     ))
 }
 
+/// Batched multi-tile write at `time_ms` — fold a set of `(row, col, def_id,
+/// stock0, stock1)` slots into **one** new Zone version, with the same prior-row
+/// read + per-cell forward-propagation discipline as [`set_tile_at`].
+///
+/// This is the GC tile-card **demotion** primitive: a zone may have many at-rest
+/// tile-cards fold back at once, and writing the zone once per tile would fan a
+/// 152-byte zone version out per 40-byte tile (anti-economical). Folding every
+/// demotable cell into a single version pays the zone's byte cost exactly once.
+///
+/// Forward-prop is tracked per cell independently: each future row inherits a
+/// cell's new value only while that cell still equals its pre-fold value, and
+/// stops at the first row where someone deliberately changed it — so two cells
+/// with different downstream histories don't clobber each other. Cells whose
+/// prior value already equals the new value are skipped (no-op). Returns the new
+/// row, or `None` if no prior zone row exists / all cells were no-ops.
+pub fn fold_tiles_at(
+    ctx: &ReducerContext,
+    zone_id: u32,
+    time_ms: u64,
+    cells: &[(u8, u8, u16, u8, u8)],
+) -> Option<Zone> {
+    // (1) Prior row: max valid_at_time ≤ time_ms.
+    let mut prior = ctx
+        .db
+        .zones()
+        .zone_id()
+        .filter(zone_id)
+        .filter(|z| valid_at_time(z.valid_at) <= time_ms)
+        .max_by_key(|z| valid_at_time(z.valid_at))?;
+
+    // Keep only in-range cells that actually change something, capturing each
+    // cell's pre-fold slot so forward-prop can detect deliberate downstream edits.
+    let mut changed: Vec<((u8, u8), (u16, u8, u8), (u16, u8, u8))> = Vec::new();
+    for &(row, col, def_id, s0, s1) in cells {
+        if row >= 8 || col >= 8 {
+            continue;
+        }
+        let old_slot = prior.tile_at(row, col).unwrap_or((0, 0, 0));
+        let new_slot = (def_id & 0x0FFF, s0 & 0x3, s1 & 0x3);
+        if old_slot == new_slot {
+            continue;
+        }
+        prior.assign_tile(row, col, def_id, s0, s1);
+        changed.push(((row, col), old_slot, new_slot));
+    }
+    if changed.is_empty() {
+        // Every cell already matches the zone — nothing to write, but a settled
+        // baseline exists, so the caller may safely retire the source rows.
+        return Some(prior);
+    }
+    let written = write_at(ctx, prior, time_ms);
+
+    // (2) Forward-propagate each changed cell independently.
+    let mut future: Vec<u64> = ctx
+        .db
+        .zones()
+        .zone_id()
+        .filter(zone_id)
+        .filter(|z| valid_at_time(z.valid_at) > time_ms)
+        .map(|z| z.valid_at)
+        .collect();
+    future.sort_unstable_by_key(|v| valid_at_time(*v));
+
+    // Per-cell "stop propagating" latch — set once a future row deliberately
+    // diverged for that cell.
+    let mut stopped = vec![false; changed.len()];
+    for v in future {
+        if stopped.iter().all(|&s| s) {
+            break;
+        }
+        let Some(mut z) = ctx.db.zones().valid_at().find(v) else {
+            continue;
+        };
+        let mut touched = false;
+        for (i, &((row, col), old_slot, (def_id, s0, s1))) in changed.iter().enumerate() {
+            if stopped[i] {
+                continue;
+            }
+            if z.tile_at(row, col).unwrap_or((0, 0, 0)) != old_slot {
+                stopped[i] = true;
+                continue;
+            }
+            z.assign_tile(row, col, def_id, s0, s1);
+            touched = true;
+        }
+        if touched {
+            ctx.db.zones().valid_at().delete(v);
+            ctx.db.zones().insert(z);
+        }
+    }
+
+    Some(written)
+}
+
 /// Surgical stock-only mutation: change `slot` (0 or 1) at
 /// `(row, col)` to `value`, preserving the tile's def_id and the
 /// other stock slot. Shares forward-prop discipline with

@@ -200,13 +200,13 @@ pub fn anchor_covering_hex(
 pub fn deploy_mini_zone(
     ctx: &ReducerContext,
     client_time_ms: u64,
+    caller_player_id: u32,
     anchor_card_id: u32,
     target_macro_zone: u64,
     target_local_q: u8,
     target_local_r: u8,
 ) -> Result<(), String> {
-    // ---- caller resolution ----------------------------------------
-    let caller_player_id = players::resolve_caller(ctx)?;
+    // ---- caller (gateway-supplied) --------------------------------
     let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
     // Magnetic block gate — no carve-out. Deploying a mini-zone is
     // an economic progression action and gated on expired-magnetic
@@ -390,9 +390,10 @@ pub fn deploy_mini_zone(
 pub fn pickup_mini_zone(
     ctx: &ReducerContext,
     client_time_ms: u64,
+    caller_player_id: u32,
     anchor_card_id: u32,
 ) -> Result<(), String> {
-    let caller_player_id = players::resolve_caller(ctx)?;
+    // Caller identity supplied by the gateway (auth is the gateway's job).
     let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
 
     let anchor = cards::prior_at(ctx, anchor_card_id, now_ms).ok_or_else(|| {

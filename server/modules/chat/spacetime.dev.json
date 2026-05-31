@@ -1,5 +1,5 @@
 {
   "module-path": ".",
   "server": "local",
-  "database": "resonantdust-dev-chat"
+  "database": "resonantdust-dev-chat-0"
 }

@@ -11,14 +11,13 @@
 
 use spacetimedb::{reducer, ReducerContext, SpacetimeType};
 
-use crate::cards::{self, cards as _cards_table, Micro};
+use crate::cards::{self, cards as _cards_table, Micro, MicroPlace};
 use crate::flags::state_flags;
 use crate::packed::PLAYER_INVENTORY_LAYER;
 use crate::packed::{
     INVENTORY_LAYER, LOOSE_RECT, MINI_ZONE_LAYER, POCKET_DIMENSION_LAYER, SNAP_HEX,
     STACK_DIR_DOWN, STACK_DIR_HEX, STACK_DIR_UP, WORLD_LAYER,
 };
-use crate::players;
 
 /// Unpack a wire `xy` u32 (`[x:i16 | y:i16]`) — the loose within-cell offset
 /// the client packs into `Placement.xy`. Clamped to the i12 range the loose
@@ -212,7 +211,7 @@ pub fn place_card(
     // stacking flag bits together.
     cards::update_with_at(ctx, card_id, now_ms, |c| {
         c.macro_zone = full_macro;
-        new_micro.apply(c);
+        new_micro.place(c);
     });
 
     // Move the source's members along.
@@ -226,7 +225,7 @@ pub fn place_card(
     match new_micro {
         Micro::Stacked { root: new_root, .. } => {
             for m in &descendants {
-                let rerooted = match Micro::of(m) {
+                let rerooted = match cards::micro_of(m) {
                     Micro::Stacked { branch, index, .. } => Micro::Stacked {
                         root: new_root,
                         branch,
@@ -236,7 +235,7 @@ pub fn place_card(
                 };
                 cards::update_with_at(ctx, m.card_id, now_ms, |c| {
                     c.macro_zone = full_macro;
-                    rerooted.apply(c);
+                    rerooted.place(c);
                 });
             }
         }

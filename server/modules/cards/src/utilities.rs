@@ -43,9 +43,17 @@ const STARTER_SOUL_KEY: &str = "player_soul";
 #[reducer]
 pub fn spawn_soul(
     ctx: &ReducerContext,
-    _client_time_ms: u64,
+    // Named `client_time_ms` (not `_client_time_ms`) because SpacetimeDB's HTTP
+    // `/call` keys args on the exact Rust param name — the gateway/client send
+    // `client_time_ms`, so an underscore here makes the call unaddressable.
+    client_time_ms: u64,
     player_id: u32,
+    // The client passes the soul index it expects to mint; accepted to match
+    // the client's call shape (it gates "only if none" client-side). Unused
+    // here — the dev seed below mints a fixed player_soul + world soul.
+    soul_index: u32,
 ) -> Result<(), String> {
+    let _ = (client_time_ms, soul_index); // spawn stamps at server-now (below)
     // Stamp at `now − TIME_DRIFT_BUFFER_MS` so the rows are immediately
     // visible to the client's buffered `serverNowMs()` view (mirrors the
     // convention the auth DB's `claim_or_login` uses for the player row).
@@ -85,18 +93,24 @@ pub fn spawn_soul(
         active_blueprints: 0,
     });
 
-    // --- DEV TEST SEED: a world-facing "human" soul + a dust in its inventory.
-    // Ownership chain: player -> player_soul -> human -> dust. The human stands
-    // on the world at hex (0, 0); its inventory (surface = INVENTORY_LAYER,
-    // owner = human card_id) holds one dust. Disposable pre-release seeding —
-    // remove once real soul/inventory acquisition exists.
+    // --- DEV TEST SEED: a world-facing "human" soul + a starter loadout in its
+    // inventory. Ownership chain: player -> player_soul -> human -> {items}. The
+    // human stands on the world at hex (0, 0); its inventory (surface =
+    // INVENTORY_LAYER, owner = human card_id) holds a dust, three corpus, and an
+    // axe. Disposable pre-release seeding — remove once real soul/inventory
+    // acquisition exists.
     let human_def = find_packed_by_key("human")?
         .ok_or_else(|| "spawn_soul: \"human\" def not in content catalog".to_string())?;
     let human_card_id = cards::next_card_id(ctx);
     let human_portrait_seed =
         (time_ms as u32) ^ (time_ms >> 32) as u32 ^ player_id ^ human_card_id;
     let human_portrait_id = ((human_portrait_seed ^ (human_portrait_seed >> 4)) & 0xF) as u8;
-    let human_flags_state = with_portrait(state_flags().is_owned_by_player, human_portrait_id);
+    // Portrait only — NO `is_owned_by_player`. The human's `owner_id` is
+    // the player_soul *card* (below), not a player_id; the flag means
+    // exactly "owner_id is a player_id", so setting it here would make
+    // owner-walks (`owning_player`) and soul counts mis-resolve the human
+    // as a directly player-owned soul.
+    let human_flags_state = with_portrait(0, human_portrait_id);
     cards::create_at(
         ctx,
         human_card_id,
@@ -116,22 +130,28 @@ pub fn spawn_soul(
         active_blueprints: 0,
     });
 
-    let dust_def = find_packed_by_key("dust")?
-        .ok_or_else(|| "spawn_soul: \"dust\" def not in content catalog".to_string())?;
-    let dust_card_id = cards::next_card_id(ctx);
-    cards::create_at(
-        ctx,
-        dust_card_id,
-        time_ms,
-        /* macro_zone      */
-        crate::packed::pack_macro_zone_full(human_card_id, crate::packed::INVENTORY_LAYER, 0, 0),
-        /* micro           */
-        cards::Micro::snap(0, 0, crate::packed::loose_kind_for_surface(crate::packed::INVENTORY_LAYER)),
-        /* owner_id        */ human_card_id,
-        dust_def,
-        /* flags_state     */ 0,
-        /* flags_bk        */ 0,
-    );
+    // Starter loadout in the human's inventory: a dust, three corpus, and an
+    // axe. All land loose at cell (0, 0) of the inventory bucket; the client
+    // lays them out across the grid (position is client-local).
+    let inv_macro =
+        crate::packed::pack_macro_zone_full(human_card_id, crate::packed::INVENTORY_LAYER, 0, 0);
+    let inv_kind = crate::packed::loose_kind_for_surface(crate::packed::INVENTORY_LAYER);
+    for key in ["dust", "corpus", "corpus", "corpus", "axe"] {
+        let def = find_packed_by_key(key)?
+            .ok_or_else(|| format!("spawn_soul: {key:?} def not in content catalog"))?;
+        let card_id = cards::next_card_id(ctx);
+        cards::create_at(
+            ctx,
+            card_id,
+            time_ms,
+            inv_macro,
+            cards::Micro::snap(0, 0, inv_kind),
+            /* owner_id    */ human_card_id,
+            def,
+            /* flags_state */ 0,
+            /* flags_bk    */ 0,
+        );
+    }
 
     Ok(())
 }

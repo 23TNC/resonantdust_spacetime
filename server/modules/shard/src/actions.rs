@@ -136,6 +136,7 @@ fn derive_synthetic_hex(
 pub fn propose_action(
     ctx: &ReducerContext,
     client_time_ms: u64,
+    caller_player_id: u32,
     recipe_id: u16,
     surface: u8,
     macro_zone: u64,
@@ -146,6 +147,7 @@ pub fn propose_action(
     let outcome = propose_action_inner(
         ctx,
         client_time_ms,
+        caller_player_id,
         recipe_id,
         surface,
         macro_zone,
@@ -177,6 +179,7 @@ pub fn propose_action(
 fn propose_action_inner(
     ctx: &ReducerContext,
     client_time_ms: u64,
+    caller_player_id: u32,
     recipe_id: u16,
     surface: u8,
     macro_zone: u64,
@@ -184,7 +187,7 @@ fn propose_action_inner(
     root: u32,
     bindings: &[Vec<u32>],
 ) -> Result<(), String> {
-    let caller_player_id = players::resolve_caller(ctx)?;
+    // Caller identity supplied by the gateway (auth is the gateway's job).
 
     let recipe_ref = recipe(recipe_id)
         .map_err(|e| format!("recipe lookup: {e}"))?

@@ -25,7 +25,6 @@ use spacetimedb::{reducer, ReducerContext};
 
 use crate::cards;
 use crate::flags::state_flags;
-use crate::players;
 use crate::souls::{is_soul_card, soul_privates as _soul_privates_table};
 
 /// Place a blueprint card at the requested location, owned by the

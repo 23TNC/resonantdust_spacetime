@@ -2,16 +2,17 @@
 //! validated recipe's effects to this `cards` shard. Authorization is the
 //! gateway's job: these trust their arguments (same posture as `spawn_soul`).
 //!
-//! Card create/move land here once the apply/plan port (W7) pins their exact
-//! positioning semantics; this first cut covers the unambiguous pieces — the
-//! dedup gate, hold acquire/release, and destroy.
+//! Covers the dedup gate, hold acquire/release, create/destroy, and the
+//! chain-stitch reposition primitives (`move_card` loose / `stack_card`
+//! member) the gateway's apply step calls to reproduce `propose_action`.
 
 use resonantdust_content::definition_core::find_packed_by_key;
-use spacetimedb::{reducer, ReducerContext};
+use spacetimedb::{reducer, ReducerContext, Table};
 
 use crate::cards;
+use crate::cards::MicroPlace;
 use crate::flags::state_flags;
-use crate::packed::{loose_kind_for_surface, with_surface};
+use crate::packed::{loose_kind_for_surface, unpack_micro_loose, with_surface};
 use crate::pending_actions;
 
 /// Hold-family selector shared with the gateway. Keep in sync with the
@@ -126,6 +127,140 @@ pub fn create_card(
         /* flags_state */ 0,
         /* flags_bk */ 0,
     );
+    Ok(())
+}
+
+/// Reposition `card_id` **loose** at the proposed cell on `surface` within
+/// `macro_zone`, stamped at `time_ms`, asserting `pos_need`. This is the
+/// chain-stitch ROOT placement — the recipe root lands loose at the address the
+/// client proposed. `micro_location` is the packed loose cell `(q, r, x, y)`.
+/// Mirrors `shard::actions::chain_stitch`'s root arm.
+#[reducer]
+pub fn move_card(
+    ctx: &ReducerContext,
+    card_id: u32,
+    time_ms: u64,
+    surface: u8,
+    macro_zone: u64,
+    micro_location: u32,
+) -> Result<(), String> {
+    let pos_need = state_flags().pos_need;
+    let full_macro = with_surface(macro_zone, surface);
+    let (q, r, x, y) = unpack_micro_loose(micro_location);
+    let micro = cards::Micro::Loose {
+        local_q: q,
+        local_r: r,
+        x,
+        y,
+        kind: loose_kind_for_surface(surface),
+    };
+    if cards::update_with_at(ctx, card_id, time_ms, |c| {
+        c.macro_zone = full_macro;
+        micro.place(c);
+        c.flags_state |= pos_need;
+    })
+    .is_none()
+    {
+        return Err(format!("move_card: card {card_id} not found"));
+    }
+    Ok(())
+}
+
+/// Reposition `card_id` as a flat **member** of `root` in `branch` at `index`,
+/// sharing `root`'s `(surface, macro_zone)`, stamped at `time_ms`, asserting
+/// `pos_need`. This is the chain-stitch MEMBER placement — top-level iterator
+/// bindings become flat members of the recipe root. Mirrors
+/// `shard::actions::chain_stitch`'s member arm.
+#[reducer]
+#[allow(clippy::too_many_arguments)]
+pub fn stack_card(
+    ctx: &ReducerContext,
+    card_id: u32,
+    time_ms: u64,
+    surface: u8,
+    macro_zone: u64,
+    root: u32,
+    branch: u8,
+    index: u8,
+) -> Result<(), String> {
+    let pos_need = state_flags().pos_need;
+    let full_macro = with_surface(macro_zone, surface);
+    let micro = cards::Micro::Stacked {
+        root,
+        branch,
+        index: index.min(15),
+    };
+    if cards::update_with_at(ctx, card_id, time_ms, |c| {
+        c.macro_zone = full_macro;
+        micro.place(c);
+        c.flags_state |= pos_need;
+    })
+    .is_none()
+    {
+        return Err(format!("stack_card: card {card_id} not found"));
+    }
+    Ok(())
+}
+
+/// Finalize a bound card at action completion: clear the position-assertion
+/// bits (`pos_need`/`pos_want`) and stamp `progress_style` (bits 5-7 of
+/// `flags_state`) so the client renders the action's progress bar on this card's
+/// completion row. This is the `flags_state` half of the monolith's per-card
+/// `action_completion::commit` write; the gate calls it for every bound card
+/// (`progress_style = 0` clears the bar, so non-actor cards don't render a stale
+/// one). Composes with `destroy_card` / `release_hold` at the same `time_ms`.
+#[reducer]
+pub fn finalize_card(
+    ctx: &ReducerContext,
+    card_id: u32,
+    time_ms: u64,
+    progress_style: u8,
+) -> Result<(), String> {
+    let s = state_flags();
+    let style_bits = ((progress_style as u32) << s.progress_style_shift) & s.progress_style_mask;
+    if cards::update_with_at(ctx, card_id, time_ms, |c| {
+        c.flags_state &= !s.pos_need;
+        c.flags_state &= !s.pos_want;
+        c.flags_state = (c.flags_state & !s.progress_style_mask) | style_bits;
+    })
+    .is_none()
+    {
+        return Err(format!("finalize_card: card {card_id} not found"));
+    }
+    Ok(())
+}
+
+/// Set a blueprint's discovery bit on `target_card_id`'s `SoulPrivate`
+/// (`<soul>.blueprint.unlock: <key>`). Idempotent — re-firing on an already-set
+/// bit is a no-op. Port of the monolith's `apply_unlock_blueprint`.
+#[reducer]
+pub fn unlock_blueprint(
+    ctx: &ReducerContext,
+    target_card_id: u32,
+    blueprint_key: String,
+) -> Result<(), String> {
+    use crate::souls::soul_privates as _soul_privates_table;
+    let bp = resonantdust_content::blueprint_core::find_blueprint(&blueprint_key)
+        .map_err(|e| format!("unlock_blueprint: catalog lookup: {e}"))?
+        .ok_or_else(|| format!("unlock_blueprint: blueprint {blueprint_key:?} not registered"))?;
+    if bp.id == 0 || bp.id > 64 {
+        return Err(format!(
+            "unlock_blueprint: blueprint id {} outside the blueprints_0 bucket (1..=64)",
+            bp.id
+        ));
+    }
+    let bit = 1u64 << (bp.id - 1);
+    let Some(mut row) = ctx.db.soul_privates().card_id().find(target_card_id) else {
+        return Err(format!(
+            "unlock_blueprint: no SoulPrivate row for target card {target_card_id}"
+        ));
+    };
+    if row.blueprints_0 & bit != 0 {
+        return Ok(());
+    }
+    row.blueprints_0 |= bit;
+    ctx.db.soul_privates().card_id().delete(target_card_id);
+    ctx.db.soul_privates().insert(row);
     Ok(())
 }
 

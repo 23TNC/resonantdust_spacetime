@@ -92,25 +92,48 @@ pub fn seed_world_region(ctx: &ReducerContext) {
     );
 }
 
-/// Seed a freshly-spawned soul's inventory region: only the `(0, 0)` zone is
-/// present (bit 0), nothing yet available. The inventory Zone itself is no
-/// longer eagerly created — the client's region gate requests it on demand when
-/// the inventory viewport opens, the same path world zones take. Idempotent.
-pub fn seed_soul_inventory_region(ctx: &ReducerContext, soul_card_id: u32, time_ms: u64) {
-    let macro_region = pack_macro_region(soul_card_id, INVENTORY_LAYER, 0, 0);
+/// Ensure a region governs `macro_zone`, creating it on first need. No-op if a
+/// region already exists for the derived `macro_region`. Otherwise write a new
+/// region with surface-keyed presence (`zone_available = 0` — nothing spawned
+/// yet); the client's region gate then promotes the region and requests the
+/// zone. This is the client-driven, self-healing path that replaces the old
+/// in-`spawn_soul` inventory-region seed (now a cross-DB call the gate relays).
+///
+/// Hard-coded per-surface presence for now (extend later for sparse world
+/// presence / container layouts):
+/// - **surface 1 (inventory)** → `0x0000000000000001` (only zone `(0, 0)`).
+/// - **surface 64 (world) + any other surface** → `0xffffffffffffffff` (every
+///   macro_zone present in this region, none generated yet).
+///
+/// `client_time_ms` stamps the row on the client's buffered timeline, same as
+/// `request_zone`.
+#[reducer]
+pub fn ensure_region(
+    ctx: &ReducerContext,
+    client_time_ms: u64,
+    macro_zone: u64,
+) -> Result<(), String> {
+    let (macro_region, _bit) = region_of_zone(macro_zone);
     if latest_for(ctx, macro_region).is_some() {
-        return;
+        return Ok(());
     }
+    let zone_presence = match surface_of(macro_zone) {
+        INVENTORY_LAYER => 0x0000_0000_0000_0001,
+        WORLD_LAYER => u64::MAX,
+        _ => u64::MAX,
+    };
+    let now = crate::time::effective_now_ms(ctx, client_time_ms)?;
     write_at(
         ctx,
         Region {
             valid_at: 0,
             macro_region,
-            zone_presence: 1, // bit 0 → the (0, 0) inventory zone
+            zone_presence,
             zone_available: 0,
         },
-        time_ms,
+        now,
     );
+    Ok(())
 }
 
 /// Set `zone_available` bit `bit` on the latest version of `macro_region`,

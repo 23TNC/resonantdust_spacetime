@@ -195,8 +195,9 @@ pub fn request_zone(
                 now,
             );
         } else {
-            // Forward-looking: no non-world region is seeded yet, so this branch
-            // is currently unreachable.
+            // Non-world (e.g. inventory) zones materialise empty — they have no
+            // procedural tile layout to seed. Cards in the zone arrive through
+            // their own `cards` subscriptions.
             zones::create_rect_at(ctx, macro_zone, owner_of(macro_zone), now)?;
         }
     }

@@ -2,9 +2,7 @@ use resonantdust_content::definition_core::decode_definition;
 use spacetimedb::{table, ReducerContext, Table};
 
 use crate::flags::{bk_flags, state_flags};
-use crate::packed::{
-    pack_micro_loose, pack_valid_at, unpack_micro_loose, valid_at_time, STACK_STATE_DEFERRED,
-};
+use crate::packed::{pack_valid_at, valid_at_time, STACK_STATE_DEFERRED};
 use crate::sequence;
 
 /// Reserved sentinel player_id meaning "the world" (no real player
@@ -266,97 +264,54 @@ pub struct Card {
     pub flags_bk: u32,
 }
 
-/// A card's micro placement — the value of `micro_location` plus the
-/// `micro_is_card` / `stack_state` / `stack_index` flag bits, written together
-/// so the discriminator and the value it gates never drift. Replaces the old
-/// `(micro_zone, micro_location)` pair at every construction site.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Micro {
-    /// Stack member of `root` (a loose/snapped card) in `branch`
-    /// (`STACK_DIR_HEX`/`UP`/`DOWN`, or `STACK_STATE_DEFERRED`) at slot `index`.
-    Stacked { root: u32, branch: u8, index: u8 },
-    /// Loose at cell `(local_q, local_r)` with within-cell offset `(x, y)` and
-    /// `kind` (`LOOSE_HEX`/`LOOSE_RECT`/`SNAP_HEX`/`SNAP_RECT`).
-    Loose {
-        local_q: u8,
-        local_r: u8,
-        x: i16,
-        y: i16,
-        kind: u8,
-    },
+/// A card's micro placement is the **shared** [`content::card_model::Micro`]
+/// model — the value of `micro_location` plus the `micro_is_card` /
+/// `stack_state` / `stack_index` flag bits, written together so the
+/// discriminator and the value it gates never drift. Re-exported here (not
+/// duplicated) so `cards` and `regions` build their `Card` tables over one
+/// model. The constructors (`Micro::snap`, `Micro::deferred`, `Micro::Stacked`,
+/// `Micro::Loose`) and decode (`Micro::of(micro_location, flags_bk)`) come from
+/// there; the [`MicroPlace`] extension below adapts the raw-field `apply` to
+/// this module's `Card` row.
+pub use resonantdust_content::card_model::Micro;
+
+/// Extension adapting the shared [`Micro::apply`] (raw `flags_bk` → `(micro_location,
+/// flags_bk)`) to write directly onto a `Card` row, preserving the `m.place(&mut c)`
+/// call shape this module used before the model moved to `content`.
+pub trait MicroPlace {
+    /// Write this placement onto `card`: sets `micro_location` and the
+    /// `micro_is_card` / `stack_state` / `stack_index` bits in `flags_bk`
+    /// (preserving every other `flags_bk` bit).
+    fn place(self, card: &mut Card);
 }
 
-impl Micro {
-    /// Loose with no within-cell offset (snapped to the cell center).
-    pub fn snap(local_q: u8, local_r: u8, kind: u8) -> Self {
-        Micro::Loose { local_q, local_r, x: 0, y: 0, kind }
+impl MicroPlace for Micro {
+    fn place(self, card: &mut Card) {
+        let (micro_location, flags_bk) = self.apply(card.flags_bk);
+        card.micro_location = micro_location;
+        card.flags_bk = flags_bk;
     }
+}
 
-    /// A deferred stack member anchored to `host` (resolved at mirror time).
-    pub fn deferred(host: u32) -> Self {
-        Micro::Stacked { root: host, branch: STACK_STATE_DEFERRED, index: 0 }
-    }
-
-    /// Write this placement onto a card row: sets `micro_location` and the
-    /// `micro_is_card` / `stack_state` / `stack_index` bits in `flags_bk`.
-    pub fn apply(self, card: &mut Card) {
-        let bk = bk_flags();
-        match self {
-            Micro::Stacked { root, branch, index } => {
-                card.micro_location = root;
-                card.flags_bk |= bk.micro_is_card;
-                card.flags_bk = (card.flags_bk & !bk.stack_state_mask)
-                    | (((branch as u32) << bk.stack_state_shift) & bk.stack_state_mask);
-                card.flags_bk = (card.flags_bk & !bk.stack_index_mask)
-                    | (((index as u32) << bk.stack_index_shift) & bk.stack_index_mask);
-            }
-            Micro::Loose { local_q, local_r, x, y, kind } => {
-                card.micro_location = pack_micro_loose(local_q, local_r, x, y);
-                card.flags_bk &= !bk.micro_is_card;
-                card.flags_bk = (card.flags_bk & !bk.stack_state_mask)
-                    | (((kind as u32) << bk.stack_state_shift) & bk.stack_state_mask);
-                card.flags_bk &= !bk.stack_index_mask;
-            }
-        }
-    }
-
-    /// Decode a card row's current micro placement.
-    pub fn of(card: &Card) -> Self {
-        let bk = bk_flags();
-        if card.flags_bk & bk.micro_is_card != 0 {
-            Micro::Stacked {
-                root: card.micro_location,
-                branch: ((card.flags_bk & bk.stack_state_mask) >> bk.stack_state_shift) as u8,
-                index: ((card.flags_bk & bk.stack_index_mask) >> bk.stack_index_shift) as u8,
-            }
-        } else {
-            let (local_q, local_r, x, y) = unpack_micro_loose(card.micro_location);
-            Micro::Loose {
-                local_q,
-                local_r,
-                x,
-                y,
-                kind: ((card.flags_bk & bk.stack_state_mask) >> bk.stack_state_shift) as u8,
-            }
-        }
-    }
+/// Decode a card row's current micro placement (the `&Card` adapter over the
+/// shared [`Micro::of`]).
+pub fn micro_of(card: &Card) -> Micro {
+    Micro::of(card.micro_location, card.flags_bk)
 }
 
 /// True when `micro_location` is a root card_id (the card is a stack member).
 pub fn micro_is_card(card: &Card) -> bool {
-    card.flags_bk & bk_flags().micro_is_card != 0
+    resonantdust_content::card_model::micro_is_card(card.flags_bk)
 }
 
 /// The `stack_state` branch/kind value (gated on [`micro_is_card`]).
 pub fn stack_branch(card: &Card) -> u8 {
-    let bk = bk_flags();
-    ((card.flags_bk & bk.stack_state_mask) >> bk.stack_state_shift) as u8
+    resonantdust_content::card_model::stack_branch(card.flags_bk)
 }
 
 /// The `stack_index` slot value (only meaningful when [`micro_is_card`]).
 pub fn stack_index(card: &Card) -> u8 {
-    let bk = bk_flags();
-    ((card.flags_bk & bk.stack_index_mask) >> bk.stack_index_shift) as u8
+    resonantdust_content::card_model::stack_index(card.flags_bk)
 }
 
 /// The root card_id a stack member points at (`0` if the card is loose).
@@ -869,7 +824,7 @@ pub fn create(
     };
     // Writes `micro_location` + the `micro_is_card`/`stack_state`/`stack_index`
     // bits onto `flags_bk` (OR'd over the caller's non-stack bits).
-    micro.apply(&mut card);
+    micro.place(&mut card);
     write(ctx, card)
 }
 
@@ -986,7 +941,7 @@ pub fn create_at(
         flags_state: flags_state | definition_state_flag_mask(packed_definition),
         flags_bk,
     };
-    micro.apply(&mut card);
+    micro.place(&mut card);
     write_at(ctx, card, time_ms)
 }
 
@@ -1024,12 +979,14 @@ pub struct CardIdCounter {
 /// O(N) over every version row — which became expensive as the
 /// history grew. Counter table fixes that without changing semantics.
 pub fn next_card_id(ctx: &ReducerContext) -> u32 {
-    use resonantdust_content::packed::{card_local_of, pack_card_id, CARD_LOCAL_MASK};
+    use resonantdust_content::packed::{
+        card_local_of, pack_card_id, CARD_DB_CARDS, CARD_LOCAL_MASK,
+    };
 
-    // The counter holds the next *local* id (low 20 bits). The shard id (high
-    // 12 bits = `DATA_SHARD`) is composed on the way out, so a card's id always
-    // names its own `cards` shard (`card_shard_of(id) == data_shard`) and the
-    // gateway routes by it with no index lookup.
+    // The counter holds the next *local* id (low 20 bits). The database selector
+    // (`CARD_DB_CARDS` = 0, the top id bit) and shard id (`DATA_SHARD`) are
+    // composed on the way out, so a card's id always names its own database +
+    // shard and the gateway routes by it with no index lookup.
     let next_local = match ctx.db.card_id_counter().id().find(0) {
         Some(counter) => {
             // Delete-and-reinsert is the established pattern here
@@ -1059,7 +1016,7 @@ pub fn next_card_id(ctx: &ReducerContext) -> u32 {
         // real working set (~1M cards/shard).
         next: next_local.saturating_add(1).min(CARD_LOCAL_MASK),
     });
-    pack_card_id(crate::DATA_SHARD, next_local)
+    pack_card_id(CARD_DB_CARDS, crate::DATA_SHARD, next_local)
 }
 
 /// Resolve the player who ultimately owns `card_id`.

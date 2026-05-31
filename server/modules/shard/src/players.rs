@@ -681,12 +681,15 @@ const PLAYER_SOUL_SURFACE: u8 = 0;
 /// a `player_soul`, resolved through the content catalog at signup.
 const STARTER_SOUL_KEY: &str = "player_soul";
 
-/// Count the distinct `player_soul` cards `player_id` currently owns —
-/// top-level souls whose latest version still has `owner_id == player_id`
-/// and carries the `is_owned_by_player` flag. Dedups across `valid_at`
-/// version rows via the `owner_id` btree index. This is the same set the
-/// client enumerates with `SELECT * FROM cards WHERE owner_id = player_id`
-/// (filtered by the flag), so client and server agree on the count.
+/// Count the distinct `player_soul` cards `player_id` directly owns —
+/// cards whose latest version has `owner_id == player_id` and carries
+/// `is_owned_by_player`. That flag means precisely "`owner_id` is a
+/// player_id" (`content/cards/flags.json`), so it is the correct resolver
+/// for the `card_id` / `player_id` numeric-namespace collision: a
+/// world-facing soul owned by the player_soul *card* (whose card_id may
+/// numerically equal the player_id) does NOT carry the flag and so is
+/// excluded. Dedups across `valid_at` versions via the `owner_id` btree
+/// index.
 fn owned_soul_count(ctx: &ReducerContext, player_id: u32) -> u32 {
     let mask = state_flags().is_owned_by_player;
     let mut card_ids = BTreeSet::new();
@@ -817,8 +820,12 @@ fn spawn_soul_for(
         (time_ms as u32) ^ (time_ms >> 32) as u32 ^ player_id ^ human_card_id;
     let human_portrait_id =
         ((human_portrait_seed ^ (human_portrait_seed >> 4)) & 0xF) as u8;
-    let human_flags_state =
-        with_portrait(state_flags().is_owned_by_player, human_portrait_id);
+    // Portrait only — NO `is_owned_by_player`. The human's `owner_id` is
+    // the player_soul *card* (below), not a player_id; the flag means
+    // exactly "owner_id is a player_id", so setting it here would make
+    // owner-walks (`owning_player`) and `owned_soul_count` mis-resolve the
+    // human as a directly player-owned soul.
+    let human_flags_state = with_portrait(0, human_portrait_id);
     cards::create_at(
         ctx,
         human_card_id,

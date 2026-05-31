@@ -1,5 +1,5 @@
 {
   "module-path": ".",
   "server": "local",
-  "database": "resonantdust-dev-regionindex"
+  "database": "resonantdust-dev-regionindex-0"
 }

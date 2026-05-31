@@ -240,10 +240,13 @@ pub struct TilePoint {
 pub fn move_soul(
     ctx: &ReducerContext,
     client_time_ms: u64,
+    caller_player_id: u32,
     soul_id: u32,
     path: Vec<TilePoint>,
 ) -> Result<(), String> {
-    let player_id = players::resolve_caller(ctx)?;
+    // Caller identity is supplied by the gateway (auth is the gateway's job);
+    // the soul-ownership check below is what gates the action.
+    let player_id = caller_player_id;
     let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
     let soul = cards::prior_at(ctx, soul_id, now_ms)
         .ok_or_else(|| format!("movement: soul card {soul_id} not found"))?;
