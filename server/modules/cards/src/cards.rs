@@ -319,6 +319,33 @@ pub fn root_of_member(card: &Card) -> u32 {
     if micro_is_card(card) { card.micro_location } else { 0 }
 }
 
+/// Count `player_id`'s live, directly-owned souls: distinct cards whose LATEST
+/// version has `owner_id == player_id`, the `is_owned_by_player` flag set, and
+/// isn't `dead`. Only **player-souls** are owned by a `player_id` directly (the
+/// world soul + loadout are owned by *cards*), so this is the player's
+/// player-soul count — used to gate the non-idempotent starter spawn so a
+/// re-login can't mint a duplicate.
+pub fn count_player_souls(ctx: &ReducerContext, player_id: u32) -> usize {
+    let s = state_flags();
+    let mut latest: std::collections::HashMap<u32, Card> = std::collections::HashMap::new();
+    for c in ctx.db.cards().owner_id().filter(player_id) {
+        let newer = latest
+            .get(&c.card_id)
+            .map_or(true, |p| valid_at_time(c.valid_at) >= valid_at_time(p.valid_at));
+        if newer {
+            latest.insert(c.card_id, c);
+        }
+    }
+    latest
+        .values()
+        .filter(|c| {
+            c.owner_id == player_id
+                && c.flags_state & s.is_owned_by_player != 0
+                && c.flags_state & s.dead == 0
+        })
+        .count()
+}
+
 /// Wall-clock now in unix milliseconds (u64). The codebase's time
 /// unit throughout: `valid_at` rows pack u48 ms, recipe-duration
 /// arithmetic operates on ms, etc. Convert from the microsecond

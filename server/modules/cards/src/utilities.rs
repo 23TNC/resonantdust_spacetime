@@ -15,6 +15,13 @@ const PLAYER_SOUL_SURFACE: u8 = 0;
 /// catalog; a fresh account is always a `player_soul`.
 const STARTER_SOUL_KEY: &str = "player_soul";
 
+/// Max player-souls a player may hold. The starter spawn is gated on this so a
+/// re-login (the client re-requests a soul whenever its subscription hasn't yet
+/// surfaced the existing one) can't mint duplicates. `1` today; bump for
+/// multi-character. The whole spawn (player_soul + world soul + loadout) is
+/// gated as a unit, since only the player_soul is owned by `player_id` directly.
+const MAX_PLAYER_SOULS: usize = 1;
+
 /// Spawn a new `player_soul` (and dev seed) owned by `player_id` in
 /// this card shard, and return its `card_id`.
 ///
@@ -25,11 +32,11 @@ const STARTER_SOUL_KEY: &str = "player_soul";
 /// `player_soul` carries `owner_id == player_id` + the
 /// `is_owned_by_player` flag, so that same query then surfaces it.
 ///
-/// **Not idempotent — each call mints a fresh soul** with its own
-/// `next_card_id`. A player may own several top-level player-souls;
-/// that's the future multi-character handle. The "only if none exist"
-/// gate lives client-side. These top-level souls are never rendered in
-/// the world.
+/// **Idempotent per player up to [`MAX_PLAYER_SOULS`]** — the spawn is gated on
+/// the player's current player-soul count, so a re-login (the client re-requests
+/// whenever its subscription hasn't yet surfaced the existing soul) is a no-op
+/// rather than minting a duplicate. Bump the cap for multi-character. These
+/// top-level souls are never rendered in the world.
 ///
 /// **Authorization is the gateway's job.** This reducer trusts its
 /// `player_id` argument; a real deployment routes the call through the
@@ -54,6 +61,17 @@ pub fn spawn_soul(
     soul_index: u32,
 ) -> Result<(), String> {
     let _ = (client_time_ms, soul_index); // spawn stamps at server-now (below)
+
+    // Idempotency gate: the client re-requests a soul on every login (it can't
+    // see the existing one until its subscription applies), so the SERVER caps
+    // creation. If the player already holds the max player-souls, this is a
+    // no-op `Ok` — the existing soul surfaces once the client's subscription
+    // catches up. Reducers are DB-serialized, so even a rapid double-call is
+    // safe: the first commits the soul, the second sees the count and skips.
+    if cards::count_player_souls(ctx, player_id) >= MAX_PLAYER_SOULS {
+        return Ok(());
+    }
+
     // Stamp at `now − TIME_DRIFT_BUFFER_MS` so the rows are immediately
     // visible to the client's buffered `serverNowMs()` view (mirrors the
     // convention the auth DB's `claim_or_login` uses for the player row).

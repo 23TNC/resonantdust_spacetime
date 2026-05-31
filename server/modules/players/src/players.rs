@@ -1,4 +1,4 @@
-use spacetimedb::{reducer, Identity, ReducerContext, Table};
+use spacetimedb::{reducer, ReducerContext, Table};
 
 use crate::packed::{pack_valid_at, valid_at_time};
 use crate::sequence;
@@ -151,23 +151,10 @@ pub fn set_faction(
     .ok_or_else(|| format!("set_faction: no player row for player_id {player_id}"))
 }
 
-/// Maps a connection's current `Identity` to the persistent `player_id`.
-///
-/// `Identity` is treated as ephemeral — a player who reconnects (or signs in
-/// fresh) generally arrives with a new `Identity`. `claim_or_login` creates
-/// or replaces the row; `client_disconnected` removes it. Regular reducers
-/// go through `resolve_caller` to map `ctx.sender()` to the stable
-/// `player_id`.
-///
-/// Private — clients have no need to subscribe.
-#[spacetimedb::table(accessor = player_sessions)]
-#[derive(Debug, Clone)]
-pub struct PlayerSession {
-    #[primary_key]
-    pub identity: Identity,
-    #[index(btree)]
-    pub player_id: u32,
-}
+// (PlayerSession / Identity-keyed sessions removed — the GATE now owns the
+// WS → player_id session map. The players reducers are gate-mediated: they take
+// an explicit `player_id` the gate supplies, mirroring how the cards reducers
+// already trust the gate's `caller_player_id`. The gate is the auth boundary.)
 
 /// Per-player private state — the stuff the local player needs but
 /// other players don't (entitlements, counters, settings). Kept off
@@ -350,19 +337,6 @@ pub fn validate_player_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ---- session resolution ----------------------------------------------
-
-/// Resolve the calling identity to a `player_id`. Returns `Err` if this
-/// connection has not yet authenticated.
-pub fn resolve_caller(ctx: &ReducerContext) -> Result<u32, String> {
-    ctx.db
-        .player_sessions()
-        .identity()
-        .find(ctx.sender())
-        .map(|s| s.player_id)
-        .ok_or_else(|| "caller has no active session".to_string())
-}
-
 // ---- player lifecycle -------------------------------------------------
 
 /// Single-row counter table holding the next player_id to allocate.
@@ -417,9 +391,7 @@ fn next_player_id(ctx: &ReducerContext) -> u32 {
     }
 }
 
-/// Delete every version row for `player_id`, plus all sessions. Routed
-/// through here so `resolve_caller`'s invariant ("session.player_id
-/// always references a live player") never breaks.
+/// Delete every version row for `player_id`.
 ///
 /// **Cards/souls are NOT cascaded here** — they live in the player's
 /// assigned `cards` shard (a separate database this module can't write
@@ -427,17 +399,6 @@ fn next_player_id(ctx: &ReducerContext) -> u32 {
 /// GC sweep reaps world-/owner-dead rows, and a dedicated card-side
 /// purge reducer (gateway-driven) can hard-delete on account removal.
 pub fn delete_player(ctx: &ReducerContext, player_id: u32) {
-    let session_ids: Vec<Identity> = ctx
-        .db
-        .player_sessions()
-        .player_id()
-        .filter(player_id)
-        .map(|s| s.identity)
-        .collect();
-    for identity in session_ids {
-        ctx.db.player_sessions().identity().delete(identity);
-    }
-
     // Every version row of the player itself.
     let valid_ats: Vec<u64> = ctx
         .db
@@ -458,8 +419,8 @@ pub fn delete_player(ctx: &ReducerContext, player_id: u32) {
 /// — see the field doc on `Player.last_login_secs`. Idempotent in the
 /// sense that repeated calls just keep bumping the timestamp.
 ///
-/// `player_id` is resolved server-side via `resolve_caller` — same
-/// auth pattern as `moveSoul` / `equipCard` / `proposeAction`.
+/// `player_id` is supplied by the gate (which owns the session) — same
+/// gate-mediated auth pattern as the cards reducers' `caller_player_id`.
 ///
 /// **Exempt from `effective_now_ms` grace check** — same rationale as
 /// `claim_or_login`. The client also calls this reducer on every
@@ -477,8 +438,15 @@ pub fn delete_player(ctx: &ReducerContext, player_id: u32) {
 /// No-op (returns `Ok`) if the player has no prior row, which can
 /// happen mid-creation; the next login will land on a real row.
 #[reducer]
-pub fn set_last_login(ctx: &ReducerContext, _client_time_ms: u64) -> Result<(), String> {
-    let player_id = resolve_caller(ctx)?;
+pub fn set_last_login(
+    ctx: &ReducerContext,
+    // Named without a leading underscore: SpacetimeDB's `/call` keys args on the
+    // exact Rust param name, so `_client_time_ms` would be unaddressable by the
+    // gate relay. Accepted but unused (the reducer stamps at server-now).
+    client_time_ms: u64,
+    player_id: u32,
+) -> Result<(), String> {
+    let _ = client_time_ms;
     // Stamp at `ctx.timestamp − TIME_DRIFT_BUFFER_MS` so the row is
     // immediately visible to the client's buffered `serverNowMs()`
     // view — matches the same convention as `claim_or_login`. See
@@ -498,8 +466,10 @@ pub fn set_last_login(ctx: &ReducerContext, _client_time_ms: u64) -> Result<(), 
 /// Trust-on-first-use registration / login.
 ///
 /// If no `Player` exists with the given (case-sensitive) name, one is
-/// created. Either way, a `PlayerSession` is established (or replaced) for
-/// the caller's current `Identity`, mapping it to that `Player.player_id`.
+/// created (with a `data_shard` + profile). Either way the player row's
+/// `last_login_secs` is bumped. The **gate** reads the resulting `player_id`
+/// off the player row (looked up by name) and records the WS → player_id
+/// session itself — this reducer no longer establishes an Identity session.
 ///
 /// **This is intentionally insecure.** Anyone can call `claim_or_login`
 /// with any name and become that player — there is no password, token, or
@@ -508,9 +478,12 @@ pub fn set_last_login(ctx: &ReducerContext, _client_time_ms: u64) -> Result<(), 
 #[reducer]
 pub fn claim_or_login(
     ctx: &ReducerContext,
-    _client_time_ms: u64,
+    // No leading underscore — `/call` keys on the exact param name, so the gate
+    // relay must be able to address it. Accepted but unused (server-now stamp).
+    client_time_ms: u64,
     name: String,
 ) -> Result<(), String> {
+    let _ = client_time_ms;
     validate_player_name(&name)?;
     // **Exempt from `effective_now_ms` grace check.** This is the
     // bootstrap reducer: the client's clock offset isn't yet
@@ -578,12 +551,9 @@ pub fn claim_or_login(
         }
     };
 
-    let sender = ctx.sender();
-    ctx.db.player_sessions().identity().delete(sender);
-    ctx.db.player_sessions().insert(PlayerSession {
-        identity: sender,
-        player_id,
-    });
+    // The gate establishes the WS → player_id session (it reads this
+    // player_id off the subscribed player row, looked up by name); the
+    // players module no longer tracks an Identity-keyed session.
 
     // Always stamp a fresh `last_login_secs` row, even on the
     // existing-player branch. Two reasons:
@@ -607,12 +577,6 @@ pub fn claim_or_login(
     Ok(())
 }
 
-/// Clean up the disconnecting connection's `PlayerSession` row.
-///
-/// SpacetimeDB calls this automatically on every client disconnect. Delete
-/// is idempotent — if the connection never logged in, this is a no-op.
-#[reducer(client_disconnected)]
-pub fn client_disconnected(ctx: &ReducerContext) {
-    let sender = ctx.sender();
-    ctx.db.player_sessions().identity().delete(sender);
-}
+// (client_disconnected removed — there's no Identity-keyed session to reap.
+// The gate owns the WS → player_id map and drops it when the client's WS closes;
+// gate sessions are ephemeral, reconstructed on reconnect from shard truth.)

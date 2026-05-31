@@ -15,7 +15,7 @@ use crate::cards::{self, cards as _cards_table, Micro, MicroPlace};
 use crate::flags::state_flags;
 use crate::packed::PLAYER_INVENTORY_LAYER;
 use crate::packed::{
-    INVENTORY_LAYER, LOOSE_RECT, MINI_ZONE_LAYER, POCKET_DIMENSION_LAYER, SNAP_HEX,
+    INVENTORY_LAYER, LOOSE_RECT, POCKET_DIMENSION_LAYER, SNAP_HEX,
     STACK_DIR_DOWN, STACK_DIR_HEX, STACK_DIR_UP, WORLD_LAYER,
 };
 
@@ -88,8 +88,7 @@ const PLACEMENT_LOOSE: u8 = 1;
 ///
 /// **`Loose` destination**:
 /// - `surface` is one of `INVENTORY_LAYER (1)`,
-///   `POCKET_DIMENSION_LAYER (32)`, `MINI_ZONE_LAYER (63)`, or
-///   `WORLD_LAYER (64)+`.
+///   `POCKET_DIMENSION_LAYER (32)`, or `WORLD_LAYER (64)+`.
 /// - Inventory: `macro_zone` is a soul `card_id` owned by the
 ///   caller.
 /// - World: any caller-owned source may be placed at any world hex
@@ -443,11 +442,11 @@ fn resolve_loose_target(
             let (x, y) = unpack_xy(xy);
             Ok((surface, macro_zone, Micro::Loose { local_q: q, local_r: r, x, y, kind: SNAP_HEX }))
         }
-        MINI_ZONE_LAYER | POCKET_DIMENSION_LAYER => {
-            // Mini-zone / pocket-dimension placement: `macro_zone` is the anchor
-            // card's `card_id`. Require a caller-owned anchor (same gate as
-            // inventory). Mini-zone uses hex coords (q, r); pocket-dimension is
-            // a rect interior using the xy offset.
+        POCKET_DIMENSION_LAYER => {
+            // Pocket-dimension placement: `macro_zone` is the anchor card's
+            // `card_id`, a rect interior using the xy offset. Require a
+            // caller-owned anchor (same gate as inventory). (The MINI_ZONE_LAYER
+            // hex-anchor arm was stripped with mini_zone functionality.)
             let anchor_player =
                 cards::owning_player(ctx, crate::packed::owner_of(macro_zone)).unwrap_or(cards::WORLD_PLAYER_ID);
             if anchor_player != caller_player_id {
@@ -456,19 +455,11 @@ fn resolve_loose_target(
                 ));
             }
             let (x, y) = unpack_xy(xy);
-            let micro = if surface == MINI_ZONE_LAYER {
-                // Hex anchor: cell `(q, r)`, snapped to centre (the renderer
-                // ignores the offset under `SNAP_HEX`). Mirror of the world
-                // drop arm above + the client's `looseKindForSurface`.
-                Micro::Loose { local_q: q, local_r: r, x, y, kind: SNAP_HEX }
-            } else {
-                // Pocket dimension: rect interior, no cell — pure `(x, y)`.
-                Micro::Loose { local_q: 0, local_r: 0, x, y, kind: LOOSE_RECT }
-            };
-            Ok((surface, macro_zone, micro))
+            // Pocket dimension: rect interior, no cell — pure `(x, y)`.
+            Ok((surface, macro_zone, Micro::Loose { local_q: 0, local_r: 0, x, y, kind: LOOSE_RECT }))
         }
         other => Err(format!(
-            "place_card: unsupported surface {other} (expected INVENTORY, PLAYER_INVENTORY, POCKET_DIMENSION, MINI_ZONE, or WORLD_LAYER+)"
+            "place_card: unsupported surface {other} (expected INVENTORY, PLAYER_INVENTORY, POCKET_DIMENSION, or WORLD_LAYER+)"
         )),
     }
 }

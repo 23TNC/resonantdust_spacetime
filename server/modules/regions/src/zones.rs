@@ -155,9 +155,8 @@ pub fn latest(ctx: &ReducerContext, zone_id: u32) -> Option<Zone> {
         .max_by_key(|z| valid_at_time(z.valid_at))
 }
 
-/// Latest row for the zone keyed by `macro_zone`. `macro_zone` now encodes
-/// the surface band in bits 24-31 (world chunks at `surface=WORLD_LAYER`,
-/// mini_zones at `surface=MINI_ZONE_LAYER` over the anchor id, etc.), so the
+/// Latest row for the zone keyed by `macro_zone`. `macro_zone` encodes the
+/// surface band in bits 24-31 (world chunks at `surface=WORLD_LAYER`), so the
 /// single packed value identifies the container exactly — no separate
 /// surface filter. Returns `None` if no Zone exists at that address.
 pub fn latest_for(ctx: &ReducerContext, macro_zone: u64) -> Option<Zone> {
@@ -483,8 +482,7 @@ pub fn set_tile_at_with_defaults(
 /// of a 7×7 sub-region of the 8×8 zone-tile grid, centered at
 /// `(row=3, col=3)`. The 6 top-left and 6 bottom-right corners of
 /// the 7×7 area fall outside the disk; row 7 and column 7 of the
-/// 8×8 storage layout are unused. Matches the mini_zone footprint
-/// (see `mini_zone.rs`).
+/// 8×8 storage layout are unused.
 const DISK_CENTER: i32 = 3;
 const DISK_RADIUS: i32 = 3;
 

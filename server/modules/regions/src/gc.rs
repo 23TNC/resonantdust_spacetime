@@ -104,10 +104,10 @@ fn sweep_tile_card_demotions(ctx: &ReducerContext, now_ms: u64) {
             .or_insert(c.valid_at);
     }
 
-    // Per-zone fold batch: cells to write + the card versions to retire on success.
+    // Per-zone fold batch: cells to write + the card_ids to fully reap on success.
     struct Batch {
         cells: Vec<(u8, u8, u16, u8, u8)>,
-        retire: Vec<u64>,
+        retire: Vec<u32>,
     }
     let mut by_zone: HashMap<u32, Batch> = HashMap::new();
 
@@ -143,15 +143,30 @@ fn sweep_tile_card_demotions(ctx: &ReducerContext, now_ms: u64) {
         });
         // Zone tiles index by (row=r, col=q).
         batch.cells.push((r, q, def_id, stock0, stock1));
-        batch.retire.push(c.valid_at);
+        batch.retire.push(c.card_id);
     }
 
     for (zone_id, batch) in by_zone {
         // One zone version reconciles every demotable tile in it. Only retire the
-        // card rows once the fold confirms a settled zone baseline took the data.
+        // tile-cards once the fold confirms a settled zone baseline took the data.
         if crate::zones::fold_tiles_at(ctx, zone_id, now_ms, &batch.cells).is_some() {
-            for v in batch.retire {
-                ctx.db.cards().valid_at().delete(v);
+            for card_id in batch.retire {
+                // Reap EVERY version of the demoted tile-card, not just the latest.
+                // Promote-up-front leaves an earlier held now-row behind the
+                // released completion row; deleting only the latest would let that
+                // stale row resurface (with the pre-action stock) and mask the
+                // freshly-folded zone via the client's card-priority read — the
+                // "tile resets on GC" bug.
+                let versions: Vec<u64> = ctx
+                    .db
+                    .cards()
+                    .card_id()
+                    .filter(card_id)
+                    .map(|c| c.valid_at)
+                    .collect();
+                for v in versions {
+                    ctx.db.cards().valid_at().delete(v);
+                }
             }
         }
     }

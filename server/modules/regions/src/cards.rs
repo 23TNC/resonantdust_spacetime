@@ -13,7 +13,9 @@
 //! demotion sweep land next (see `gc.rs`). The placement / stock bit math is the
 //! shared `content::card_model`, so this never diverges from `cards`.
 
-use resonantdust_content::card_model::{tile_stock, write_tile_stock, Micro};
+use resonantdust_content::card_model::{
+    decrement_hold, hold_count, increment_hold, tile_stock, write_tile_stock, HoldField, Micro,
+};
 use resonantdust_content::packed::{
     card_local_of, pack_card_id, pack_definition, unpack_definition, unpack_zone_definition,
     with_surface, CARD_DB_REGIONS, CARD_LOCAL_MASK, SNAP_HEX,
@@ -252,6 +254,57 @@ pub fn set_tile_stock(
 ) -> Option<Card> {
     update_with_at(ctx, card_id, time_ms, |c| {
         c.flags_bk = write_tile_stock(c.flags_bk, slot, value);
+    })
+}
+
+// ---- tile-card holds (promote-up-front, the concurrent-action guard) -----
+
+/// Acquire one reference of hold `field` on the tile-card at hex `(q, r)`,
+/// **promoting it first** (idempotent `find_or_create`). A promoted, held tile is
+/// just a card in the hex branch — the recipe's slot verb picks the `field`
+/// (`use`/`claim`→`SlotHold`, `share`/`borrow`→`SlotShare`), exactly like any
+/// bound card.
+///
+/// For an exclusive `SlotHold` this is the **concurrent-cut guard**: reducers are
+/// DB-serialized, so a second action's acquire reads this one's committed hold
+/// (same-`time_ms` rows coalesce in [`write_at`]) and is rejected here. Returns
+/// the new tile-card row.
+pub fn acquire_tile_hold(
+    ctx: &ReducerContext,
+    surface: u8,
+    macro_zone: u64,
+    q: u8,
+    r: u8,
+    field: HoldField,
+    time_ms: u64,
+) -> Result<Card, String> {
+    let tile = find_or_create_tile_card(ctx, surface, macro_zone, q, r, time_ms)?;
+    if field == HoldField::SlotHold && hold_count(tile.flags_bk, HoldField::SlotHold) > 0 {
+        return Err(format!(
+            "acquire_tile_hold: tile ({q},{r}) of zone {macro_zone} is already exclusively held"
+        ));
+    }
+    update_with_at(ctx, tile.card_id, time_ms, |c| {
+        c.flags_bk = increment_hold(c.flags_bk, field);
+    })
+    .ok_or_else(|| format!("acquire_tile_hold: tile-card {} vanished", tile.card_id))
+}
+
+/// Release one reference of hold `field` on the tile-card at hex `(q, r)`, if one
+/// exists (no-op otherwise). Mirror of [`acquire_tile_hold`]; once a tile-card is
+/// hold-free and clean, the GC demotion sweep folds it back into the zone.
+pub fn release_tile_hold(
+    ctx: &ReducerContext,
+    surface: u8,
+    macro_zone: u64,
+    q: u8,
+    r: u8,
+    field: HoldField,
+    time_ms: u64,
+) -> Option<Card> {
+    let tile = find_tile_card_at(ctx, surface, macro_zone, q, r, time_ms)?;
+    update_with_at(ctx, tile.card_id, time_ms, |c| {
+        c.flags_bk = decrement_hold(c.flags_bk, field);
     })
 }
 
