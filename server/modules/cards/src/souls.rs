@@ -1,7 +1,4 @@
-use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
-use resonantdust_content::definition_core::find_packed_by_key;
 use spacetimedb::{table, ReducerContext, Table};
 
 use crate::cards;
@@ -195,16 +192,6 @@ fn write_at(ctx: &ReducerContext, mut soul: Soul, time_ms: u64) -> Soul {
     inserted
 }
 
-#[allow(dead_code)]
-pub fn update_with<F>(ctx: &ReducerContext, card_id: u32, f: F) -> Option<Soul>
-where
-    F: FnOnce(&mut Soul),
-{
-    let mut s = latest(ctx, card_id)?;
-    f(&mut s);
-    Some(write(ctx, s))
-}
-
 pub fn update_with_at<F>(
     ctx: &ReducerContext,
     card_id: u32,
@@ -240,62 +227,30 @@ pub struct StatSlot {
     pub byte_index: u8,
 }
 
-/// Lazy `packed_definition → StatSlot` map, built on first use by
-/// resolving each tracked card key against the content registry. Keys
-/// that don't resolve are silently skipped — works around the case
-/// where the content catalog hasn't shipped a particular stat card
-/// yet (the `-i` injured variants are the obvious example today).
-fn stat_map() -> &'static BTreeMap<u16, StatSlot> {
-    static STAT_MAP: OnceLock<BTreeMap<u16, StatSlot>> = OnceLock::new();
-    STAT_MAP.get_or_init(|| {
-        // Byte indices match the documented layout: corpus=0, anima=1,
-        // sollertia=2, aether=3. Same across stats / fatigued / injured.
-        let entries: &[(&str, StatField, u8)] = &[
-            ("corpus",     StatField::Stats,    0),
-            ("anima",      StatField::Stats,    1),
-            ("sollertia",  StatField::Stats,    2),
-            ("aether",     StatField::Stats,    3),
-            ("corpus-",    StatField::Fatigued, 0),
-            ("anima-",     StatField::Fatigued, 1),
-            ("sollertia-", StatField::Fatigued, 2),
-            ("aether-",    StatField::Fatigued, 3),
-            ("corpus-i",   StatField::Injured,  0),
-            ("anima-i",    StatField::Injured,  1),
-            ("sollertia-i",StatField::Injured,  2),
-            ("aether-i",   StatField::Injured,  3),
-        ];
-        let mut m = BTreeMap::new();
-        for &(key, field, byte_index) in entries {
-            if let Ok(Some(packed)) = find_packed_by_key(key) {
-                m.insert(packed, StatSlot { field, byte_index });
-            }
+impl StatField {
+    /// Decode the wire `field` selector the gate's `set_soul_stat` passes
+    /// (`0 = stats`, `1 = fatigued`, `2 = injured`).
+    pub fn from_u8(v: u8) -> Option<StatField> {
+        match v {
+            0 => Some(StatField::Stats),
+            1 => Some(StatField::Fatigued),
+            2 => Some(StatField::Injured),
+            _ => None,
         }
-        m
-    })
+    }
 }
 
-/// Resolve the `Soul` stat slot a card contributes to, if any.
-/// Returns `None` for non-stat cards (tiles, soul cards themselves,
-/// revery, discipline, etc.).
-pub fn stat_slot_for(packed_def: u16) -> Option<StatSlot> {
-    stat_map().get(&packed_def).copied()
+/// Apply a `±delta` to one Soul stat slot — the content-agnostic byte write the
+/// gate drives via `set_soul_stat`. The stat-card → `(field, byte)` mapping (and
+/// the decision *when* a stat changed) now lives in the gate; this just mutates
+/// the bytes. `field`: 0=stats, 1=fatigued, 2=injured. Replaces the old
+/// per-card-write `stat_map` diff (which read the content registry on every
+/// write — plan `01_gate_authority_pivot`).
+pub fn apply_stat(ctx: &ReducerContext, soul_card_id: u32, field: u8, byte_index: u8, delta: i8, time_ms: u64) {
+    let Some(field) = StatField::from_u8(field) else { return };
+    apply_slot_delta(ctx, soul_card_id, StatSlot { field, byte_index }, delta, time_ms);
 }
 
-/// Quick-check helper: read the current value of one stat slot for
-/// the soul card identified by `card_id`. Returns `None` when no Soul
-/// row exists (e.g., the player has no soul yet). Useful for action
-/// preconditions like "needs at least N corpus" without callers
-/// having to know the packed-u32 layout.
-#[allow(dead_code)]
-pub fn read_slot(ctx: &ReducerContext, card_id: u32, slot: StatSlot) -> Option<u8> {
-    let soul = latest(ctx, card_id)?;
-    let field = match slot.field {
-        StatField::Stats => soul.stats,
-        StatField::Fatigued => soul.fatigued,
-        StatField::Injured => soul.injured,
-    };
-    Some(quad_get(field, slot.byte_index))
-}
 
 // ---- soul-card identity --------------------------------------------
 
@@ -456,50 +411,11 @@ pub fn on_card_write(
         }
     }
 
-    // (2) Stat-counter diff. A card "contributes" to one Soul slot
-    // when it's alive and maps to a tracked stat. Cards with the
-    // `dead` bit set don't count. Owner / definition changes show up
-    // here as a delta from one slot to another.
-    let prev_contrib = prev_latest.and_then(|c| card_contribution(ctx, c));
-    let new_contrib = card_contribution(ctx, new_card);
-    match (prev_contrib, new_contrib) {
-        (Some(p), Some(n)) if p == n => {
-            // Same owner + same slot — no stat change.
-        }
-        (Some(p), Some(n)) => {
-            apply_slot_delta(ctx, p.0, p.1, -1, time_ms);
-            apply_slot_delta(ctx, n.0, n.1, 1, time_ms);
-        }
-        (Some(p), None) => apply_slot_delta(ctx, p.0, p.1, -1, time_ms),
-        (None, Some(n)) => apply_slot_delta(ctx, n.0, n.1, 1, time_ms),
-        (None, None) => {}
-    }
-}
-
-/// What this card row contributes to a Soul's stat counters — the
-/// soul that contains it, and the stat slot. Returns `None` for
-/// dead cards, cards that don't map to a tracked slot, world-owned
-/// cards (no soul in the chain), or soul cards themselves (a soul
-/// doesn't contribute to its own stats).
-///
-/// Under the post-flag-20 card-owner model, the Soul row is keyed
-/// by `card_id`, so we resolve the soul_card_id directly via
-/// `cards::owning_soul` rather than going player → soul.
-fn card_contribution(ctx: &ReducerContext, card: &Card) -> Option<(u32, StatSlot)> {
-    let s = state_flags();
-    if card.flags_state & s.dead != 0 {
-        return None;
-    }
-    // Soul cards don't contribute to their own stats.
-    if card.flags_state & s.is_owned_by_player != 0 {
-        return None;
-    }
-    let slot = stat_slot_for(card.packed_definition)?;
-    if card.owner_id == 0 {
-        return None;
-    }
-    let soul_card_id = cards::owning_soul(ctx, card.owner_id)?;
-    Some((soul_card_id, slot))
+    // (2) Stat-counter diff: REMOVED. Mapping a card's packed_def to a stat
+    // slot needs the content registry, which no longer lives on the server.
+    // The gate now owns soul-stats — it pushes `set_soul_stat` deltas when it
+    // creates/destroys (or moves) a stat card (plan `01_gate_authority_pivot`,
+    // P3). This hook keeps only the content-free branches (1) + (3).
 }
 
 /// Apply a `±1` to one stat slot on the Soul row keyed by

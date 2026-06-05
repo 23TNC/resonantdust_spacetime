@@ -1,4 +1,3 @@
-use resonantdust_content::definition_core::find_packed_by_key;
 use spacetimedb::{reducer, ReducerContext, Table};
 
 use crate::cards;
@@ -10,10 +9,6 @@ use crate::souls::{soul_privates as _soul_privates_table, with_portrait, SoulPri
 /// — it *is* the player, a thin soul that owns the world-facing souls
 /// in its inventory rather than standing on the map itself.
 const PLAYER_SOUL_SURFACE: u8 = 0;
-
-/// Soul auto-granted to every player. Resolved through the content
-/// catalog; a fresh account is always a `player_soul`.
-const STARTER_SOUL_KEY: &str = "player_soul";
 
 /// Max player-souls a player may hold. The starter spawn is gated on this so a
 /// re-login (the client re-requests a soul whenever its subscription hasn't yet
@@ -59,8 +54,15 @@ pub fn spawn_soul(
     // the client's call shape (it gates "only if none" client-side). Unused
     // here — the dev seed below mints a fixed player_soul + world soul.
     soul_index: u32,
+    // Gate-supplied packed defs (the gate owns content now — plan
+    // `01_gate_authority_pivot`). `soul_packed` = the player_soul, `human_packed`
+    // = the dev world-soul, `loadout_packed` = the dev loadout in spawn order.
+    // The gate composes the loadout, so the list lives in one place.
+    soul_packed: u16,
+    human_packed: u16,
+    loadout_packed: Vec<u16>,
 ) -> Result<(), String> {
-    let _ = (client_time_ms, soul_index); // spawn stamps at server-now (below)
+    let _ = soul_index; // accepted to match the client's call shape; unused
 
     // Idempotency gate: the client re-requests a soul on every login (it can't
     // see the existing one until its subscription applies), so the SERVER caps
@@ -72,16 +74,22 @@ pub fn spawn_soul(
         return Ok(());
     }
 
-    // Stamp at `now − TIME_DRIFT_BUFFER_MS` so the rows are immediately
-    // visible to the client's buffered `serverNowMs()` view (mirrors the
-    // convention the auth DB's `claim_or_login` uses for the player row).
-    let time_ms = cards::now_ms(ctx).saturating_sub(cards::TIME_DRIFT_BUFFER_MS);
+    // Stamp at the client's buffered clock — `effective_now_ms` = `min(client,
+    // server)` within drift grace — so the soul lands on the client's promote
+    // timeline and surfaces on the very next tick. This mirrors `request_zone`.
+    //
+    // The old fixed `now − TIME_DRIFT_BUFFER_MS` (2s) back-stamp was shallower
+    // than the client's adaptive render buffer (`clientDelay`, 3–5s), so souls
+    // spawned ~1–3s in the client's future. Unlike the bootstrap `claim_or_login`
+    // (whose clock window is still empty), by the time the client calls
+    // `spawn_soul` the login row has already seeded its offset window, so
+    // `client_time_ms` is trustworthy here — a too-skewed value just errors and
+    // the client retries.
+    let time_ms = cards::effective_now_ms(ctx, client_time_ms)?;
 
     let soul_card_id = cards::next_card_id(ctx);
 
-    let soul_def = find_packed_by_key(STARTER_SOUL_KEY)?.ok_or_else(|| {
-        format!("spawn_soul: soul def {STARTER_SOUL_KEY:?} not in content catalog")
-    })?;
+    let soul_def = soul_packed;
 
     // Deterministic 4-bit portrait pick — mixing the soul's card id
     // with `time_ms` and `player_id` gives a stable per-soul value
@@ -117,8 +125,7 @@ pub fn spawn_soul(
     // INVENTORY_LAYER, owner = human card_id) holds a dust, three corpus, and an
     // axe. Disposable pre-release seeding — remove once real soul/inventory
     // acquisition exists.
-    let human_def = find_packed_by_key("human")?
-        .ok_or_else(|| "spawn_soul: \"human\" def not in content catalog".to_string())?;
+    let human_def = human_packed;
     let human_card_id = cards::next_card_id(ctx);
     let human_portrait_seed =
         (time_ms as u32) ^ (time_ms >> 32) as u32 ^ player_id ^ human_card_id;
@@ -154,9 +161,7 @@ pub fn spawn_soul(
     let inv_macro =
         crate::packed::pack_macro_zone_full(human_card_id, crate::packed::INVENTORY_LAYER, 0, 0);
     let inv_kind = crate::packed::loose_kind_for_surface(crate::packed::INVENTORY_LAYER);
-    for key in ["dust", "corpus", "corpus", "corpus", "axe"] {
-        let def = find_packed_by_key(key)?
-            .ok_or_else(|| format!("spawn_soul: {key:?} def not in content catalog"))?;
+    for &def in &loadout_packed {
         let card_id = cards::next_card_id(ctx);
         cards::create_at(
             ctx,
@@ -183,12 +188,9 @@ pub fn spawn_soul(
 /// downstream is derived from `soul_card_id`'s `owning_player`
 /// instead.
 ///
-/// `card_key` is the bare key from the card definition catalog (e.g.
-/// `"attack"`, `"fatigue"`) — the same identifier used in
-/// `content/cards/id.json`. It's resolved to a `packed_definition` via
-/// `resonantdust_content::definition_core::find_packed_by_key`. Pass the
-/// path-form `"type/category/key"` and you'll get a "unknown card key" error
-/// — use the bare key here.
+/// `card_key` is the bare card name from the DSL (e.g. `"attack"`,
+/// `"fatigue"`). The gate resolves it to a `packed_definition` via the Bundle
+/// (`bundle.packed_def(key)`) before this reducer is called.
 ///
 /// Card placement uses the inventory convention:
 /// - `surface = 1` (inventory surface)
@@ -206,13 +208,13 @@ pub fn add_card(
     ctx: &ReducerContext,
     client_time_ms: u64,
     soul_card_id: u32,
-    card_key: String,
+    // Gate-supplied packed def (the gate resolves the card name from its Bundle).
+    packed_definition: u16,
 ) -> Result<(), String> {
     let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
-    let packed_definition = find_packed_by_key(&card_key)?
-        .ok_or_else(|| format!("unknown card key {:?}", card_key))?;
 
-    let soul_player = cards::owning_player(ctx, soul_card_id).ok_or_else(|| {
+    // Require the soul to exist and be player-owned (not world-owned).
+    cards::owning_player(ctx, soul_card_id).ok_or_else(|| {
         format!("add_card: soul card {soul_card_id} not found or world-owned")
     })?;
 
@@ -229,12 +231,6 @@ pub fn add_card(
         /* flags_state     */ 0,
         /* flags_bk        */ 0,
     );
-
-    // OnCreate recipe matching has moved client-side: when a card is
-    // spawned, the client scans root-only recipes against it and
-    // submits a `propose_action` if any apply. The server no longer
-    // auto-triggers anything on card creation.
-    let _ = soul_player;
 
     Ok(())
 }

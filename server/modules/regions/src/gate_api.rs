@@ -5,7 +5,7 @@
 //! `release_card_shard`) live in `card_shards`; this adds the recipe tile
 //! write. (`request_zone` / terrain generation already exist in `regions`.)
 
-use resonantdust_content::card_model::{tile_stock, HoldField};
+use resonantdust_data::card_model::{tile_stock, HoldField};
 use spacetimedb::{reducer, ReducerContext};
 
 use crate::cards;
@@ -82,6 +82,29 @@ pub fn release_tile_hold(
     kind: u8,
 ) -> Result<(), String> {
     cards::release_tile_hold(ctx, surface, macro_zone, q, r, hold_field(kind)?, time_ms);
+    Ok(())
+}
+
+/// Acquire a **self-expiring lease** of tile hold `kind` at hex `(q, r)`: promote
+/// + hold at `acquire_ms` (the exclusive concurrent-cut CAS) and write the
+/// matching release at `release_ms`, in one transaction — so the tile lock
+/// self-heals at `release_ms` even if the acquiring gate crashes. The regions
+/// mirror of `cards::acquire_lease`.
+#[reducer]
+#[allow(clippy::too_many_arguments)]
+pub fn acquire_tile_lease(
+    ctx: &ReducerContext,
+    surface: u8,
+    macro_zone: u64,
+    q: u8,
+    r: u8,
+    kind: u8,
+    acquire_ms: u64,
+    release_ms: u64,
+) -> Result<(), String> {
+    let field = hold_field(kind)?;
+    cards::acquire_tile_hold(ctx, surface, macro_zone, q, r, field, acquire_ms)?;
+    cards::release_tile_hold(ctx, surface, macro_zone, q, r, field, release_ms);
     Ok(())
 }
 

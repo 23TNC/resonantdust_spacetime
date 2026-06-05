@@ -15,11 +15,15 @@ use spacetimedb::{reducer, table, ReducerContext, Table};
 
 use crate::packed::{
     owner_of, pack_macro_region, pack_valid_at, pack_zone_definition, region_of_zone, surface_of,
-    unpack_macro_zone, valid_at_time, INVENTORY_LAYER, WORLD_LAYER,
+    valid_at_time, INVENTORY_LAYER, WORLD_LAYER,
 };
 use crate::sequence;
-use crate::world_gen;
 use crate::zones;
+
+/// Tile card_type (`content/cards/types.json` → `tile: 7`) — the Zone row's
+/// `packed_definition` type. Worldgen itself moved to the gate (plan
+/// `01_gate_authority_pivot`); the gate supplies the tile bytes.
+const TILE_ZONE_TYPE: u8 = 7;
 
 #[table(accessor = regions, public)]
 pub struct Region {
@@ -174,6 +178,9 @@ pub fn request_zone(
     ctx: &ReducerContext,
     client_time_ms: u64,
     macro_zone: u64,
+    // Gate-computed packed tile bytes (DSL worldgen). Used for world-surface
+    // zones; non-world surfaces ignore it and seed their own rect/disk grid.
+    tiles: Vec<u64>,
 ) -> Result<(), String> {
     let (macro_region, bit) = region_of_zone(macro_zone);
     let mask = 1u64 << bit;
@@ -199,25 +206,25 @@ pub fn request_zone(
     let now = crate::time::effective_now_ms(ctx, client_time_ms)?;
 
     if !row_exists {
-        let surface = surface_of(macro_zone);
-        if surface == WORLD_LAYER {
-            let (zq, zr) = unpack_macro_zone(macro_zone);
-            let tiles = world_gen::generate_zone_tiles(zq, zr, world_gen::WORLD_SEED);
-            let zone_id = zones::next_zone_id(ctx);
-            zones::create_at(
-                ctx,
-                zone_id,
-                macro_zone,
-                pack_zone_definition(world_gen::TILE_ZONE_TYPE),
-                /* owner_id */ 0,
-                tiles,
-                now,
-            );
-        } else {
-            // Forward-looking: no non-world region is seeded yet, so this branch
-            // is currently unreachable.
-            zones::create_rect_at(ctx, macro_zone, owner_of(macro_zone), now)?;
+        // Tiles are computed gate-side (DSL worldgen for the world surface; an
+        // empty grid for non-world rect/inventory zones) and supplied here; the
+        // module just stores them. World zones are world-owned (0); other
+        // surfaces are owned by their container.
+        let mut arr = [0u64; crate::packed::ZONE_TILE_U64_COUNT];
+        for (i, v) in tiles.iter().take(arr.len()).enumerate() {
+            arr[i] = *v;
         }
+        let owner = if surface_of(macro_zone) == WORLD_LAYER { 0 } else { owner_of(macro_zone) };
+        let zone_id = zones::next_zone_id(ctx);
+        zones::create_at(
+            ctx,
+            zone_id,
+            macro_zone,
+            pack_zone_definition(TILE_ZONE_TYPE),
+            owner,
+            arr,
+            now,
+        );
     }
 
     set_available_bit(ctx, macro_region, bit, now);

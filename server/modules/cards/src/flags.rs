@@ -43,7 +43,7 @@
 
 use std::sync::OnceLock;
 
-use resonantdust_content::flags_core::{flag_bit, flag_field};
+use resonantdust_data::flags::{flag_bit, flag_field};
 
 /// Bit masks for every entry in `cards_state`. Each `u32` is the
 /// pre-built mask (already `1 << bit` for single bits, or
@@ -261,7 +261,6 @@ pub fn bk_flags() -> &'static BkFlags {
 /// that should fail loudly.
 fn bit_mask(field: &str, name: &str) -> u32 {
     let bit = flag_bit(field, name)
-        .unwrap_or_else(|e| panic!("flags: registry build failed: {e}"))
         .unwrap_or_else(|| panic!("flags: {field}.{name} not declared as single-bit"));
     1u32 << bit
 }
@@ -272,7 +271,6 @@ fn bit_mask(field: &str, name: &str) -> u32 {
 /// arithmetic on refcount fields).
 fn field_parts(field: &str, name: &str) -> (u32, u32, u32) {
     let f = flag_field(field, name)
-        .unwrap_or_else(|e| panic!("flags: registry build failed: {e}"))
         .unwrap_or_else(|| panic!("flags: {field}.{name} not declared as multi-bit field"));
     let value_mask: u32 = (((1u64 << f.width) - 1) & 0xFFFF_FFFF) as u32;
     let mask: u32 = value_mask << f.shift;

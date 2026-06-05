@@ -19,4 +19,4 @@ serde_json = "1.0"
 # `bin/st build regions`. On the host filesystem this directory only exists as
 # the bind-mount target, so cargo run directly on the host won't resolve it —
 # that's intentional; all builds go through the Docker wrapper.
-resonantdust-content = { path = "content" }
+resonantdust-data = { path = "../../../pixijs/src/wasm/data" }

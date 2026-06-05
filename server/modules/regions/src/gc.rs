@@ -11,8 +11,8 @@
 
 use std::collections::HashMap;
 
-use resonantdust_content::card_model::{has_active_holds, micro_is_card, state_blocks_demotion, tile_stock};
-use resonantdust_content::packed::{micro_loose_cell, unpack_definition};
+use resonantdust_data::card_model::{has_active_holds, micro_is_card, state_blocks_demotion, tile_stock};
+use crate::packed::{micro_loose_cell, unpack_definition};
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use crate::card_shards::card_shards;

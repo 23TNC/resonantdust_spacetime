@@ -1,4 +1,3 @@
-use resonantdust_content::definition_core::find_packed_by_key;
 use spacetimedb::{table, ReducerContext, Table};
 
 use crate::packed::{self, pack_valid_at, pack_zone_definition, valid_at_time};
@@ -437,46 +436,13 @@ pub fn set_tile_at(
     Some(written)
 }
 
-/// Look up the declared `stock.default` values for a packed tile
-/// def. Returns `(0, 0)` when the def is unknown or declares no
-/// stock slots. Shared by every zone-generation path so the
-/// "freshly-placed tile starts at its def's defaults" rule has one
-/// source of truth — worldgen seeds tiles this way, and
-/// `action_completion` uses it when a recipe spawns a tile via
-/// `ProductPlace::Location`.
-///
-/// `packed_def` is the full `[card_type:u4 | def_id:u12]` value.
-/// Callers with only a bare tile def_id should combine it with the
-/// tile card_type first (`pack_definition(7, def_id)` for world
-/// tiles); zones don't carry a card_type axis themselves.
-pub fn stock_defaults_for(packed_def: u16) -> (u8, u8) {
-    resonantdust_content::definition_core::decode_definition(packed_def)
-        .ok()
-        .flatten()
-        .map(|d| {
-            let s0 = d.stock.first().map(|s| s.default).unwrap_or(0);
-            let s1 = d.stock.get(1).map(|s| s.default).unwrap_or(0);
-            (s0, s1)
-        })
-        .unwrap_or((0, 0))
-}
-
-/// `set_tile_at` variant that seeds the stock bits from the def's
-/// declared defaults. Use this for fresh placements (worldgen,
-/// product spawns); use the explicit-stock [`set_tile_at`] when
-/// the caller is preserving / overriding row values (mutation
-/// passes, biome reverts that explicitly clear stocks).
-pub fn set_tile_at_with_defaults(
-    ctx: &ReducerContext,
-    zone_id: u32,
-    time_ms: u64,
-    row: u8,
-    col: u8,
-    packed_def: u16,
-) -> Option<Zone> {
-    let (s0, s1) = stock_defaults_for(packed_def);
-    set_tile_at(ctx, zone_id, time_ms, row, col, packed_def & 0x0FFF, s0, s1)
-}
+// Tile-stock defaults: in the DSL a stock slot initialises to 0 and the tile's
+// `@init` (run gate-side at worldgen) sets the climate-driven value — there is
+// no per-def `stock.default`. So a freshly-placed tile seeds `(0, 0)`; callers
+// that want non-zero stock pass explicit values to `set_tile_at` (the gate
+// supplies them for recipe-spawned tiles). The legacy `stock_defaults_for` /
+// `set_tile_at_with_defaults` (which decoded the def) are gone with the move of
+// content off the server.
 
 /// Zone disk footprint: a radius-3 hex disk (37 cells) carved out
 /// of a 7×7 sub-region of the 8×8 zone-tile grid, centered at
@@ -510,13 +476,13 @@ pub fn create_disk_at(
     ctx: &ReducerContext,
     macro_zone: u64,
     owner_id: u32,
+    empty_packed: u16,
     time_ms: u64,
 ) -> Result<Zone, String> {
-    let empty_packed = find_packed_by_key("empty")?
-        .ok_or_else(|| "create_disk_at: tile def \"empty\" not in content catalog".to_string())?;
+    // `empty_packed` is the gate-supplied `[card_type:u4 | def_id:u12]` for the
+    // "empty" tile. Stocks seed 0 (the DSL has no per-def stock defaults).
     let card_type = (empty_packed >> 12) as u8;
     let def_id = empty_packed & packed::DEF_ID_MASK;
-    let (s0, s1) = stock_defaults_for(empty_packed);
 
     let mut tiles = [0u64; packed::ZONE_TILE_U64_COUNT];
     for row in 0u8..7 {
@@ -524,7 +490,7 @@ pub fn create_disk_at(
             if !in_disk(row, col) {
                 continue;
             }
-            packed::set_tile_full(&mut tiles, (row * 8 + col) as usize, def_id, s0, s1);
+            packed::set_tile_full(&mut tiles, (row * 8 + col) as usize, def_id, 0, 0);
         }
     }
 
@@ -551,17 +517,17 @@ pub fn create_rect_at(
     ctx: &ReducerContext,
     macro_zone: u64,
     owner_id: u32,
+    empty_packed: u16,
     time_ms: u64,
 ) -> Result<Zone, String> {
-    let empty_packed = find_packed_by_key("empty")?
-        .ok_or_else(|| "create_rect_at: tile def \"empty\" not in content catalog".to_string())?;
+    // `empty_packed` is the gate-supplied `[card_type:u4 | def_id:u12]` for the
+    // "empty" tile. Stocks seed 0 (no per-def stock defaults in the DSL).
     let card_type = (empty_packed >> 12) as u8;
     let def_id = empty_packed & packed::DEF_ID_MASK;
-    let (s0, s1) = stock_defaults_for(empty_packed);
 
     let mut tiles = [0u64; packed::ZONE_TILE_U64_COUNT];
     for idx in 0..64usize {
-        packed::set_tile_full(&mut tiles, idx, def_id, s0, s1);
+        packed::set_tile_full(&mut tiles, idx, def_id, 0, 0);
     }
 
     let zone_id = next_zone_id(ctx);

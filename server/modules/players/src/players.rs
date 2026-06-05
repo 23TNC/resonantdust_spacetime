@@ -4,13 +4,30 @@ use crate::packed::{pack_valid_at, valid_at_time};
 use crate::sequence;
 
 /// Client-server time-drift tolerance, mirrored from the `cards` module's
-/// `cards::TIME_DRIFT_BUFFER_MS`. The auth-DB reducers stamp player
-/// rows at `ctx.timestamp − TIME_DRIFT_BUFFER_MS` so the row is
-/// immediately visible to the client's buffered `serverNowMs()` view
-/// (the client runs its estimate this far behind the server). Kept as
-/// a local copy because the `players` and `cards` modules are separate
+/// `cards::TIME_DRIFT_BUFFER_MS` — the steady-state forward-grace ceiling
+/// (how far ahead of server a `client_time_ms` may be before rejection). Kept
+/// as a local copy because the `players` and `cards` modules are separate
 /// crates with no shared runtime dependency — keep the two in sync.
+///
+/// NOTE: this is *not* the player-row back-stamp depth — that's
+/// `CLIENT_RENDER_BUFFER_MAX_MS` below. The two used to be the same value
+/// (2s), which is why login rows landed in the client's future once the
+/// render buffer grew past 2s.
 pub const TIME_DRIFT_BUFFER_MS: u64 = 2_000;
+
+/// Bootstrap back-stamp for the login row. The client renders behind true
+/// server time by `clientDelay` — adaptive in `[1.5s, 5s]`, init 3s (see
+/// `ReducerManager.CLIENT_DELAY_*`), which is DEEPER than
+/// `TIME_DRIFT_BUFFER_MS` (2s, the steady-state forward-grace ceiling). At
+/// login the client's clock window isn't seeded yet, so we can't stamp at its
+/// actual buffered clock (`effective_now_ms` would reject the un-synced
+/// `client_time_ms`). Instead back-stamp by the client's MAX render buffer so
+/// the row is visible on the next promote tick wherever `clientDelay` settles —
+/// stamping at only `now − 2s` left the row ~1s (up to 3s) in the client's
+/// future, which is the login lag this fixes. Login rows carry no timing
+/// semantics, so over-back-stamping is free. Mirror of the client's
+/// `CLIENT_DELAY_MAX_MS`.
+pub const CLIENT_RENDER_BUFFER_MAX_MS: u64 = 5_000;
 
 /// The card shard a freshly-claimed player is assigned to. `0` while a
 /// single `cards` database serves everyone — which it can, since the
@@ -99,12 +116,15 @@ pub struct Player {
     /// other-player-owned art would render with the wrong faction.
     ///
     /// Bit layout:
-    /// - bits 0..=1 — `faction` (u2, 4 values)
-    /// - bits 2..=31 — reserved for future per-player toggles
+    /// - bits 0..=1   — `faction` (u2) — **DEPRECATED**: faction moves to the
+    ///   soul; bits reclaimable once the faction→soul migration lands.
+    /// - bits 8..=15  — `permissions` capability byte (see `PERM_*` /
+    ///   [`PLAYER_FLAG_PERMS_SHIFT`]). Authoritative for entitlement checks.
+    /// - bits 2..=7, 16..=31 — reserved for future per-player toggles
     ///
     /// Catalog-style flag registry (mirroring `cards/flags.json`)
     /// can land once there are more fields to read by name; for
-    /// today's single field, helpers below access bits directly.
+    /// today's small set, helpers below access bits directly.
     pub flags: u32,
 }
 
@@ -149,6 +169,53 @@ pub fn set_faction(
     })
     .map(|_| ())
     .ok_or_else(|| format!("set_faction: no player row for player_id {player_id}"))
+}
+
+// ---- permissions -------------------------------------------------------
+//
+// A player's entitlements live in the `permissions` capability byte of
+// `Player.flags` (bits 8..=15). The check is flag-based and authoritative:
+// the `0..FIRST_PLAYER_ID` reserved id range is an *allocation* convention for
+// system / developer accounts (the accounts you'd grant capabilities to), not
+// the check itself. Capabilities compose — a granted set is the OR of `PERM_*`.
+
+/// Bit offset of the permissions capability byte inside [`Player::flags`].
+/// Disjoint from the (deprecated) faction subfield so both coexist through the
+/// faction→soul migration that will later reclaim bits 0..=1.
+pub const PLAYER_FLAG_PERMS_SHIFT: u32 = 8;
+/// Mask for the permissions byte (8 capability bits).
+pub const PLAYER_FLAG_PERMS_MASK: u32 = 0xFF;
+
+/// May add or modify DSL content at runtime (`add_content` / `modify_content`).
+pub const PERM_CONTENT_AUTHOR: u8 = 1 << 0;
+// reserved capability bits: 1<<1 world-admin, 1<<2 player-admin, …
+
+/// The player's granted capability set (the permissions byte of `flags`).
+pub fn player_perms(player: &Player) -> u8 {
+    ((player.flags >> PLAYER_FLAG_PERMS_SHIFT) & PLAYER_FLAG_PERMS_MASK) as u8
+}
+
+/// True iff the player holds **every** capability in `caps` (an OR of `PERM_*`).
+pub fn player_has(player: &Player, caps: u8) -> bool {
+    player_perms(player) & caps == caps
+}
+
+/// Re-pack a player's permissions byte and write a new versioned row at
+/// `time_ms`. Returns `Err` if no prior `Player` row exists. Granting is itself
+/// privileged — the caller (the gate) enforces who may invoke this; pre-release,
+/// dev/system accounts in `0..FIRST_PLAYER_ID` are provisioned out-of-band.
+pub fn set_permissions(
+    ctx: &ReducerContext,
+    player_id: u32,
+    time_ms: u64,
+    perms: u8,
+) -> Result<(), String> {
+    let slot_mask = PLAYER_FLAG_PERMS_MASK << PLAYER_FLAG_PERMS_SHIFT;
+    update_with_at(ctx, player_id, time_ms, |p| {
+        p.flags = (p.flags & !slot_mask) | ((perms as u32) << PLAYER_FLAG_PERMS_SHIFT);
+    })
+    .map(|_| ())
+    .ok_or_else(|| format!("set_permissions: no player row for player_id {player_id}"))
 }
 
 // (PlayerSession / Identity-keyed sessions removed — the GATE now owns the
@@ -447,14 +514,14 @@ pub fn set_last_login(
     player_id: u32,
 ) -> Result<(), String> {
     let _ = client_time_ms;
-    // Stamp at `ctx.timestamp − TIME_DRIFT_BUFFER_MS` so the row is
-    // immediately visible to the client's buffered `serverNowMs()`
-    // view — matches the same convention as `claim_or_login`. See
-    // the doc on that reducer for the full rationale. The
-    // `last_login_secs` value itself uses the shifted time too, so
-    // the recorded "last login" is consistent with what the client's
-    // chat-window calculator expects.
-    let now_ms = now_ms(ctx).saturating_sub(TIME_DRIFT_BUFFER_MS);
+    // Stamp at `ctx.timestamp − CLIENT_RENDER_BUFFER_MAX_MS` so the row is
+    // immediately visible to the client's buffered `serverNowMs()` view —
+    // matches the same convention (and back-stamp depth) as `claim_or_login`;
+    // see the constant's doc for why the shift tracks the client's MAX render
+    // buffer rather than `TIME_DRIFT_BUFFER_MS`. The `last_login_secs` value
+    // itself uses the shifted time too, so the recorded "last login" is
+    // consistent with what the client's chat-window calculator expects.
+    let now_ms = now_ms(ctx).saturating_sub(CLIENT_RENDER_BUFFER_MAX_MS);
     let now_secs = (now_ms / 1_000) as u32;
     update_with_at(ctx, player_id, now_ms, |p| {
         p.last_login_secs = now_secs;
@@ -493,15 +560,15 @@ pub fn claim_or_login(
     // call of every session whose host clock is off by more than 2N.
     //
     // Instead, this reducer writes the player row at
-    // `ctx.timestamp − TIME_DRIFT_BUFFER_MS` — i.e. shifted backward
-    // by the same amount the client offsets `serverNowMs()` by. This
-    // is the moment the client's `serverNowMs()` will read *once the
-    // window is seeded by this very row's delivery*. Stamping at the
-    // raw `ctx.timestamp` would put the row N ms in the client's
-    // future, forcing the player to wait N seconds before
+    // `ctx.timestamp − CLIENT_RENDER_BUFFER_MAX_MS` — shifted backward
+    // by the client's MAX render buffer (`clientDelay` ∈ [1.5s, 5s]).
+    // Stamping at the raw `ctx.timestamp` would put the row N ms in the
+    // client's future, forcing the player to wait N seconds before
     // `promote()` brings the row into `current` and `waitForPlayer`
-    // resolves. Shifting backward by N makes the row visible on the
-    // very next promote tick.
+    // resolves. Shifting back by the max buffer makes the row visible on
+    // the very next promote tick regardless of where `clientDelay`
+    // settles — the old `TIME_DRIFT_BUFFER_MS` (2s) shift was shallower
+    // than the live buffer (3–5s) and left the player waiting ~1–3s.
     //
     // The client subscribes to the player row BEFORE calling this
     // reducer (see `PlayerManager.claimOrLogin`), so the
@@ -513,7 +580,7 @@ pub fn claim_or_login(
     // `_client_time_ms` is accepted but ignored, kept for wire-format
     // consistency so the client's `ReducerManager.claimOrLogin`
     // wrapper doesn't need a special case.
-    let now_ms = now_ms(ctx).saturating_sub(TIME_DRIFT_BUFFER_MS);
+    let now_ms = now_ms(ctx).saturating_sub(CLIENT_RENDER_BUFFER_MAX_MS);
 
     let player_id = match latest_by_name(ctx, &name) {
         Some(player) => {

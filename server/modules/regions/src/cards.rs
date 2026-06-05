@@ -13,10 +13,10 @@
 //! demotion sweep land next (see `gc.rs`). The placement / stock bit math is the
 //! shared `content::card_model`, so this never diverges from `cards`.
 
-use resonantdust_content::card_model::{
+use resonantdust_data::card_model::{
     decrement_hold, hold_count, increment_hold, tile_stock, write_tile_stock, HoldField, Micro,
 };
-use resonantdust_content::packed::{
+use crate::packed::{
     card_local_of, pack_card_id, pack_definition, unpack_definition, unpack_zone_definition,
     with_surface, CARD_DB_REGIONS, CARD_LOCAL_MASK, SNAP_HEX,
 };

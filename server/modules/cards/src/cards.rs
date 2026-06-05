@@ -1,4 +1,3 @@
-use resonantdust_content::definition_core::decode_definition;
 use spacetimedb::{table, ReducerContext, Table};
 
 use crate::flags::{bk_flags, state_flags};
@@ -208,18 +207,15 @@ decl_count_pure!(
     decrement_server_count,
 );
 
-/// State-flag bit mask carried by `packed_definition`'s
-/// `CardDefinition.flags` (def-driven inheritance — today this
-/// surfaces only the `magnetic` lifecycle-pending bit), or 0 when the
-/// definition isn't registered. Called from [`create`] / [`create_at`]
-/// so any card spawned with a definition inherits its state-flag set
-/// without per-call-site bookkeeping. Def-driven `flags_bk` doesn't
-/// exist yet — no bookkeeping flag has an authoring-time meaning.
-fn definition_state_flag_mask(packed: u16) -> u32 {
-    decode_definition(packed)
-        .ok()
-        .flatten()
-        .map_or(0, |def| def.flags)
+/// Def-driven state-flag inheritance at spawn — historically the `magnetic`
+/// lifecycle-pending bit, derived from content. Under the gate-authority pivot
+/// the module is content-agnostic, and magnetic has **no live resolver** yet
+/// (the lifecycle countdown is unimplemented — see status.rd "no op yet"), so
+/// the bit is inert. Returns 0; when the gate-side lifecycle scheduler lands it
+/// will set the `magnetic` bit explicitly on the cards it installs (plan
+/// `01_gate_authority_pivot`, P3/lifecycle). TODO(gate-lifecycle).
+fn definition_state_flag_mask(_packed: u16) -> u32 {
+    0
 }
 
 #[table(accessor = cards, public)]
@@ -273,7 +269,7 @@ pub struct Card {
 /// `Micro::Loose`) and decode (`Micro::of(micro_location, flags_bk)`) come from
 /// there; the [`MicroPlace`] extension below adapts the raw-field `apply` to
 /// this module's `Card` row.
-pub use resonantdust_content::card_model::Micro;
+pub use resonantdust_data::card_model::Micro;
 
 /// Extension adapting the shared [`Micro::apply`] (raw `flags_bk` → `(micro_location,
 /// flags_bk)`) to write directly onto a `Card` row, preserving the `m.place(&mut c)`
@@ -301,17 +297,17 @@ pub fn micro_of(card: &Card) -> Micro {
 
 /// True when `micro_location` is a root card_id (the card is a stack member).
 pub fn micro_is_card(card: &Card) -> bool {
-    resonantdust_content::card_model::micro_is_card(card.flags_bk)
+    resonantdust_data::card_model::micro_is_card(card.flags_bk)
 }
 
 /// The `stack_state` branch/kind value (gated on [`micro_is_card`]).
 pub fn stack_branch(card: &Card) -> u8 {
-    resonantdust_content::card_model::stack_branch(card.flags_bk)
+    resonantdust_data::card_model::stack_branch(card.flags_bk)
 }
 
 /// The `stack_index` slot value (only meaningful when [`micro_is_card`]).
 pub fn stack_index(card: &Card) -> u8 {
-    resonantdust_content::card_model::stack_index(card.flags_bk)
+    resonantdust_data::card_model::stack_index(card.flags_bk)
 }
 
 /// The root card_id a stack member points at (`0` if the card is loose).
@@ -1006,7 +1002,7 @@ pub struct CardIdCounter {
 /// O(N) over every version row — which became expensive as the
 /// history grew. Counter table fixes that without changing semantics.
 pub fn next_card_id(ctx: &ReducerContext) -> u32 {
-    use resonantdust_content::packed::{
+    use crate::packed::{
         card_local_of, pack_card_id, CARD_DB_CARDS, CARD_LOCAL_MASK,
     };
 

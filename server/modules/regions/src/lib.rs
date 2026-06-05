@@ -7,7 +7,6 @@ pub mod packed;
 pub mod regions;
 pub mod sequence;
 pub mod time;
-pub mod world_gen;
 pub mod zones;
 
 // No `DATA_SHARD` constant: `regions`/`zones` rows no longer carry a

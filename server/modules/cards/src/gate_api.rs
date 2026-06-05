@@ -6,7 +6,6 @@
 //! chain-stitch reposition primitives (`move_card` loose / `stack_card`
 //! member) the gateway's apply step calls to reproduce `propose_action`.
 
-use resonantdust_content::definition_core::find_packed_by_key;
 use spacetimedb::{reducer, ReducerContext, Table};
 
 use crate::cards;
@@ -58,63 +57,113 @@ pub fn release_pending(
     Ok(())
 }
 
-/// Acquire one reference of hold `kind` on `card_id` at `time_ms`.
-#[reducer]
-pub fn acquire_hold(
+/// Dispatch acquire (`acquire=true`) or release of hold `kind` on `card_id` at
+/// `time_ms` to the matching refcount helper. Shared by the lease reducer and
+/// the standalone acquire/release reducers.
+fn dispatch_hold(
     ctx: &ReducerContext,
     card_id: u32,
     time_ms: u64,
     kind: u8,
+    acquire: bool,
 ) -> Result<(), String> {
-    match kind {
-        hold_kind::TOUCH => cards::acquire_touch(ctx, card_id, time_ms),
-        hold_kind::SLOT_HOLD => cards::acquire_slot_hold(ctx, card_id, time_ms),
-        hold_kind::SLOT_SHARE => cards::acquire_slot_share(ctx, card_id, time_ms),
-        hold_kind::POSITION_HOLD => cards::acquire_position_hold(ctx, card_id, time_ms),
-        hold_kind::DROP_HOLD => cards::acquire_drop_hold(ctx, card_id, time_ms),
-        hold_kind::SERVER => cards::acquire_server(ctx, card_id, time_ms),
-        other => return Err(format!("acquire_hold: unknown hold kind {other}")),
+    match (kind, acquire) {
+        (hold_kind::TOUCH, true) => cards::acquire_touch(ctx, card_id, time_ms),
+        (hold_kind::TOUCH, false) => cards::release_touch(ctx, card_id, time_ms),
+        (hold_kind::SLOT_HOLD, true) => cards::acquire_slot_hold(ctx, card_id, time_ms),
+        (hold_kind::SLOT_HOLD, false) => cards::release_slot_hold(ctx, card_id, time_ms),
+        (hold_kind::SLOT_SHARE, true) => cards::acquire_slot_share(ctx, card_id, time_ms),
+        (hold_kind::SLOT_SHARE, false) => cards::release_slot_share(ctx, card_id, time_ms),
+        (hold_kind::POSITION_HOLD, true) => cards::acquire_position_hold(ctx, card_id, time_ms),
+        (hold_kind::POSITION_HOLD, false) => cards::release_position_hold(ctx, card_id, time_ms),
+        (hold_kind::DROP_HOLD, true) => cards::acquire_drop_hold(ctx, card_id, time_ms),
+        (hold_kind::DROP_HOLD, false) => cards::release_drop_hold(ctx, card_id, time_ms),
+        (hold_kind::SERVER, true) => cards::acquire_server(ctx, card_id, time_ms),
+        (hold_kind::SERVER, false) => cards::release_server(ctx, card_id, time_ms),
+        (other, _) => return Err(format!("hold: unknown kind {other}")),
     }
     Ok(())
+}
+
+/// Acquire one reference of hold `kind` on `card_id` at `time_ms`.
+#[reducer]
+pub fn acquire_hold(ctx: &ReducerContext, card_id: u32, time_ms: u64, kind: u8) -> Result<(), String> {
+    dispatch_hold(ctx, card_id, time_ms, kind, true)
 }
 
 /// Release one reference of hold `kind` on `card_id` at `time_ms`.
 #[reducer]
-pub fn release_hold(
+pub fn release_hold(ctx: &ReducerContext, card_id: u32, time_ms: u64, kind: u8) -> Result<(), String> {
+    dispatch_hold(ctx, card_id, time_ms, kind, false)
+}
+
+/// Acquire a **self-expiring lease** of slot hold `kind` on `card_id`: take the
+/// hold at `acquire_ms` and write its matching release at `release_ms`, in one
+/// transaction. The multi-gate concurrency guard — an atomic reader/writer
+/// check-and-set on the row current at `acquire_ms`:
+///   - `SLOT_HOLD` (exclusive `use`/`claim`): reject if any exclusive **or**
+///     shared hold is live.
+///   - `SLOT_SHARE` (`share`/`borrow`): reject only if exclusively held.
+/// Whichever gate's reducer commits first wins; the loser is rejected and backs
+/// out (its other leases self-expire). Because the release is written here, the
+/// lock self-heals at `release_ms` even if the acquiring gate crashes.
+#[reducer]
+pub fn acquire_lease(
     ctx: &ReducerContext,
     card_id: u32,
-    time_ms: u64,
     kind: u8,
+    acquire_ms: u64,
+    release_ms: u64,
 ) -> Result<(), String> {
+    let bk = cards::prior_at(ctx, card_id, acquire_ms).map(|c| c.flags_bk).unwrap_or(0);
+    let exclusive = cards::slot_hold_count(bk);
+    let shared = cards::slot_share_count(bk);
     match kind {
-        hold_kind::TOUCH => cards::release_touch(ctx, card_id, time_ms),
-        hold_kind::SLOT_HOLD => cards::release_slot_hold(ctx, card_id, time_ms),
-        hold_kind::SLOT_SHARE => cards::release_slot_share(ctx, card_id, time_ms),
-        hold_kind::POSITION_HOLD => cards::release_position_hold(ctx, card_id, time_ms),
-        hold_kind::DROP_HOLD => cards::release_drop_hold(ctx, card_id, time_ms),
-        hold_kind::SERVER => cards::release_server(ctx, card_id, time_ms),
-        other => return Err(format!("release_hold: unknown hold kind {other}")),
+        hold_kind::SLOT_HOLD if exclusive > 0 || shared > 0 => {
+            return Err(format!("acquire_lease: card {card_id} unavailable (exclusive={exclusive}, shared={shared})"));
+        }
+        hold_kind::SLOT_SHARE if exclusive > 0 => {
+            return Err(format!("acquire_lease: card {card_id} exclusively held"));
+        }
+        _ => {}
     }
+    dispatch_hold(ctx, card_id, acquire_ms, kind, true)?;
+    dispatch_hold(ctx, card_id, release_ms, kind, false)?;
     Ok(())
 }
 
-/// Create a card of `def_key`, loose at cell (0,0) on `surface` within
-/// `macro_zone`, owned by `owner_id`, stamped at `time_ms`. The id is
-/// allocated here (`next_card_id`, embedding this shard). Mirrors the legacy
-/// `action_completion::commit` `Effect::Create` path; the gateway calls it for
-/// a recipe's create outputs (now- or completion-stamped).
+/// Apply a `±delta` to one of a soul's stat counters — the gate-owned
+/// soul-stats path. The gate maps a created/destroyed/moved stat card to its
+/// `(field, byte_index)` (content lives gate-side now) and pushes the delta
+/// here; the module just mutates the bytes. `field`: 0=stats, 1=fatigued,
+/// 2=injured. Replaces the old per-card-write `on_card_write` stat diff.
+#[reducer]
+pub fn set_soul_stat(
+    ctx: &ReducerContext,
+    soul_card_id: u32,
+    field: u8,
+    byte_index: u8,
+    delta: i8,
+    time_ms: u64,
+) -> Result<(), String> {
+    crate::souls::apply_stat(ctx, soul_card_id, field, byte_index, delta, time_ms);
+    Ok(())
+}
+
+/// Create a card with the gate-computed `packed_def` (`[type:u4 | def_id:u12]`),
+/// loose at cell (0,0) on `surface` within `macro_zone`, owned by `owner_id`,
+/// stamped at `time_ms`. The id is allocated here (`next_card_id`, embedding this
+/// shard). Content-agnostic — the gate resolves the def name to `packed_def` from
+/// its Bundle (plan `01_gate_authority_pivot`); the module just stores it.
 #[reducer]
 pub fn create_card(
     ctx: &ReducerContext,
     time_ms: u64,
-    def_key: String,
+    packed_def: u16,
     surface: u8,
     macro_zone: u64,
     owner_id: u32,
 ) -> Result<(), String> {
-    let packed_def = find_packed_by_key(&def_key)
-        .map_err(|e| format!("create_card: find_packed_by_key({def_key:?}): {e}"))?
-        .ok_or_else(|| format!("create_card: def {def_key:?} not registered in cards/id.json"))?;
     let new_id = cards::next_card_id(ctx);
     cards::create_at(
         ctx,
@@ -237,19 +286,17 @@ pub fn finalize_card(
 pub fn unlock_blueprint(
     ctx: &ReducerContext,
     target_card_id: u32,
-    blueprint_key: String,
+    blueprint_id: u16,
 ) -> Result<(), String> {
     use crate::souls::soul_privates as _soul_privates_table;
-    let bp = resonantdust_content::blueprint_core::find_blueprint(&blueprint_key)
-        .map_err(|e| format!("unlock_blueprint: catalog lookup: {e}"))?
-        .ok_or_else(|| format!("unlock_blueprint: blueprint {blueprint_key:?} not registered"))?;
-    if bp.id == 0 || bp.id > 64 {
+    // The gate resolves the recipe's `$blueprint::<key>` ref to a Bundle id;
+    // the module just sets the bit. `blueprints_0` covers ids 1..=64.
+    if blueprint_id == 0 || blueprint_id > 64 {
         return Err(format!(
-            "unlock_blueprint: blueprint id {} outside the blueprints_0 bucket (1..=64)",
-            bp.id
+            "unlock_blueprint: blueprint id {blueprint_id} outside the blueprints_0 bucket (1..=64)"
         ));
     }
-    let bit = 1u64 << (bp.id - 1);
+    let bit = 1u64 << (blueprint_id - 1);
     let Some(mut row) = ctx.db.soul_privates().card_id().find(target_card_id) else {
         return Err(format!(
             "unlock_blueprint: no SoulPrivate row for target card {target_card_id}"
