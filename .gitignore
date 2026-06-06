@@ -72,3 +72,6 @@ Thumbs.db
 
 # npm
 pixijs/node_modules/*
+
+# redeploy hash stamps
+/.build-state/
