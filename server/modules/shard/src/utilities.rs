@@ -2,7 +2,7 @@ use spacetimedb::{reducer, ReducerContext, Table};
 
 use crate::cards;
 use crate::flags::state_flags;
-use crate::souls::{soul_privates as _soul_privates_table, with_portrait, SoulPrivate};
+use crate::souls::{soul_privates as _soul_privates_table, SoulPrivate};
 
 /// Surface the player's `player_soul` lives on. Deliberately `0` (not
 /// the world band `64`) so the player-soul is never rendered anywhere
@@ -91,12 +91,10 @@ pub fn spawn_soul(
 
     let soul_def = soul_packed;
 
-    // Deterministic 4-bit portrait pick — mixing the soul's card id
-    // with `time_ms` and `player_id` gives a stable per-soul value
-    // without an rng (reducers must stay deterministic).
-    let portrait_seed = (time_ms as u32) ^ (time_ms >> 32) as u32 ^ player_id ^ soul_card_id;
-    let portrait_id = ((portrait_seed ^ (portrait_seed >> 4)) & 0xF) as u8;
-    let soul_flags_state = with_portrait(state_flags().is_owned_by_player, portrait_id);
+    // Player-soul carries `player_owned` — its `owner_id` is the player_id, the
+    // terminus of the owner walk. (Per-soul portrait was dropped from the flag
+    // word; see souls.rs TODO(portrait-relocate).)
+    let soul_flags = state_flags().player_owned;
 
     cards::create_at(
         ctx,
@@ -108,8 +106,8 @@ pub fn spawn_soul(
         cards::Micro::snap(0, 0, crate::packed::loose_kind_for_surface(PLAYER_SOUL_SURFACE)),
         /* owner_id        */ player_id,
         soul_def,
-        /* flags_state     */ soul_flags_state,
-        /* flags_bk        */ 0,
+        /* flags           */ soul_flags,
+        /* stock           */ 0,
     );
 
     // Empty per-soul private state — no starter blueprints granted.
@@ -127,15 +125,10 @@ pub fn spawn_soul(
     // acquisition exists.
     let human_def = human_packed;
     let human_card_id = cards::next_card_id(ctx);
-    let human_portrait_seed =
-        (time_ms as u32) ^ (time_ms >> 32) as u32 ^ player_id ^ human_card_id;
-    let human_portrait_id = ((human_portrait_seed ^ (human_portrait_seed >> 4)) & 0xF) as u8;
-    // Portrait only — NO `is_owned_by_player`. The human's `owner_id` is
-    // the player_soul *card* (below), not a player_id; the flag means
-    // exactly "owner_id is a player_id", so setting it here would make
-    // owner-walks (`owning_player`) and soul counts mis-resolve the human
-    // as a directly player-owned soul.
-    let human_flags_state = with_portrait(0, human_portrait_id);
+    // NO `player_owned`: the human's `owner_id` is the player_soul *card*, not a
+    // player_id; the flag means "owner_id is a player_id", so setting it here
+    // would make owner-walks / soul counts mis-resolve the human as a directly
+    // player-owned soul.
     cards::create_at(
         ctx,
         human_card_id,
@@ -146,8 +139,8 @@ pub fn spawn_soul(
         cards::Micro::snap(0, 0, crate::packed::loose_kind_for_surface(crate::packed::WORLD_LAYER)),
         /* owner_id        */ soul_card_id,
         human_def,
-        /* flags_state     */ human_flags_state,
-        /* flags_bk        */ 0,
+        /* flags           */ 0,
+        /* stock           */ 0,
     );
     ctx.db.soul_privates().insert(SoulPrivate {
         card_id: human_card_id,
@@ -171,8 +164,8 @@ pub fn spawn_soul(
             cards::Micro::snap(0, 0, inv_kind),
             /* owner_id    */ human_card_id,
             def,
-            /* flags_state */ 0,
-            /* flags_bk    */ 0,
+            /* flags       */ 0,
+            /* stock       */ 0,
         );
     }
 
@@ -228,8 +221,8 @@ pub fn add_card(
         /* micro           */ cards::Micro::snap(0, 0, crate::packed::LOOSE_RECT),
         /* owner_id        */ soul_card_id,
         packed_definition,
-        /* flags_state     */ 0,
-        /* flags_bk        */ 0,
+        /* flags           */ 0,
+        /* stock           */ 0,
     );
 
     Ok(())

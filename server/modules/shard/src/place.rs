@@ -116,7 +116,7 @@ pub fn place_card(
         .ok_or_else(|| format!("place_card: card {card_id} not found"))?;
 
     let s = state_flags();
-    if source.flags_state & s.dead != 0 {
+    if source.flags & s.dead != 0 {
         return Err(format!("place_card: card {card_id} is dead"));
     }
 
@@ -127,17 +127,17 @@ pub fn place_card(
         ));
     }
 
-    if cards::slot_hold_count(source.flags_bk) > 0 {
+    if cards::slot_claim_count(source.flags) > 0 {
         return Err(format!(
             "place_card: card {card_id} is exclusively held by an in-flight action"
         ));
     }
-    if cards::slot_share_count(source.flags_bk) > 0 {
+    if cards::slot_borrow_count(source.flags) > 0 {
         return Err(format!(
             "place_card: card {card_id} is shared-held by an in-flight action (borrow/share)"
         ));
     }
-    if cards::position_hold_count(source.flags_bk) > 0 {
+    if cards::position_hold_count(source.flags) > 0 {
         return Err(format!(
             "place_card: card {card_id} is position-held by an in-flight action"
         ));
@@ -150,19 +150,19 @@ pub fn place_card(
     // bare loose card) has no members and this returns empty.
     let descendants = collect_members(ctx, card_id, now_ms);
     for d in &descendants {
-        if cards::slot_hold_count(d.flags_bk) > 0 {
+        if cards::slot_claim_count(d.flags) > 0 {
             return Err(format!(
                 "place_card: descendant card {} is exclusively held by an in-flight action",
                 d.card_id
             ));
         }
-        if cards::slot_share_count(d.flags_bk) > 0 {
+        if cards::slot_borrow_count(d.flags) > 0 {
             return Err(format!(
                 "place_card: descendant card {} is shared-held by an in-flight action",
                 d.card_id
             ));
         }
-        if cards::position_hold_count(d.flags_bk) > 0 {
+        if cards::position_hold_count(d.flags) > 0 {
             return Err(format!(
                 "place_card: descendant card {} is position-held by an in-flight action",
                 d.card_id
@@ -283,10 +283,10 @@ fn resolve_stack_target(
     let parent = cards::prior_at(ctx, parent_id, now_ms)
         .ok_or_else(|| format!("place_card: parent card {parent_id} not found"))?;
     let s = state_flags();
-    if parent.flags_state & s.dead != 0 {
+    if parent.flags & s.dead != 0 {
         return Err(format!("place_card: parent card {parent_id} is dead"));
     }
-    if cards::drop_hold_count(parent.flags_bk) > 0 {
+    if cards::drop_hold_count(parent.flags) > 0 {
         return Err(format!(
             "place_card: parent card {parent_id} blocks stacking (drop_hold_count > 0)"
         ));

@@ -42,9 +42,9 @@ pub fn move_soul(
             soul.owner_id
         ));
     }
-    if cards::slot_hold_count(soul.flags_bk) > 0
-        || cards::slot_share_count(soul.flags_bk) > 0
-        || cards::position_hold_count(soul.flags_bk) > 0
+    if cards::slot_claim_count(soul.flags) > 0
+        || cards::slot_borrow_count(soul.flags) > 0
+        || cards::position_hold_count(soul.flags) > 0
     {
         return Err(format!(
             "movement: soul card {soul_id} is held by an in-flight action"

@@ -7,22 +7,10 @@ use crate::flags::state_flags;
 use crate::packed::{pack_valid_at, valid_at_time};
 use crate::sequence;
 
-/// Read the soul portrait index (0..=15) out of a `Card.flags_state`
-/// value. Meaningful only on soul cards; non-soul callers should
-/// ignore the result.
-pub fn portrait_id(flags_state: u32) -> u8 {
-    let s = state_flags();
-    ((flags_state & s.portrait_id_mask) >> s.portrait_id_shift) as u8
-}
-
-/// Stamp the soul portrait index into a `Card.flags_state` value,
-/// clearing any prior value first. `id` is masked to 4 bits, so
-/// callers don't have to range-check; passing `id >= 16` silently
-/// truncates to the low nibble.
-pub fn with_portrait(flags_state: u32, id: u8) -> u32 {
-    let s = state_flags();
-    (flags_state & !s.portrait_id_mask) | (((id as u32) & 0xF) << s.portrait_id_shift)
-}
+// NOTE: per-soul portrait selection was dropped from the card flag word in the
+// flags/stock schema split (portrait_id no longer fits the propagating `flags`
+// u32). It needs to be relocated to soul data (a SoulPrivate field or derived
+// from def_id) before soul portraits render again. TODO(portrait-relocate).
 
 /// Soul row — one per soul card, public so clients can subscribe.
 ///
@@ -150,20 +138,12 @@ pub fn quad_set(v: u32, byte_index: u8, byte: u8) -> u32 {
 
 // ---- CRUD ----------------------------------------------------------
 
-fn now_ms(ctx: &ReducerContext) -> u64 {
-    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000) as u64
-}
-
 pub fn latest(ctx: &ReducerContext, card_id: u32) -> Option<Soul> {
     ctx.db
         .souls()
         .card_id()
         .filter(card_id)
         .max_by_key(|s| valid_at_time(s.valid_at))
-}
-
-fn write(ctx: &ReducerContext, soul: Soul) -> Soul {
-    write_at(ctx, soul, now_ms(ctx))
 }
 
 fn write_at(ctx: &ReducerContext, mut soul: Soul, time_ms: u64) -> Soul {
@@ -283,7 +263,7 @@ fn blueprint_contribution(ctx: &ReducerContext, card: &Card) -> Option<u32> {
         return None;
     }
     let s = state_flags();
-    if card.flags_state & s.dead != 0 {
+    if card.flags & s.dead != 0 {
         return None;
     }
     if card.owner_id == 0 {
@@ -539,20 +519,5 @@ mod tests {
         assert_eq!(quad_get(v2, 1), 99);
         assert_eq!(quad_get(v2, 0), 10);
         assert_eq!(quad_get(v2, 2), 30);
-    }
-
-    #[test]
-    fn portrait_round_trip_and_isolation() {
-        // Each portrait id reads back through the high-nibble.
-        for id in 0u8..16 {
-            assert_eq!(portrait_id(with_portrait(0, id)), id);
-        }
-        // Overlay onto an existing flag word leaves the lower bits alone.
-        let base: u32 = (1 << 12) | (1 << 20) | 0b111 << 8;
-        let v = with_portrait(base, 0xA);
-        assert_eq!(portrait_id(v), 0xA);
-        assert_eq!(v & !FLAG_PORTRAIT_MASK, base);
-        // Out-of-range ids truncate to the low nibble (consistent with `quad_set`).
-        assert_eq!(portrait_id(with_portrait(0, 0xFF)), 0xF);
     }
 }

@@ -75,7 +75,7 @@ pub fn request_blueprint(
     let soul = cards::prior_at(ctx, soul_card_id, now_ms)
         .ok_or_else(|| format!("request_blueprint: soul card {soul_card_id} not found"))?;
     let s = state_flags();
-    if soul.flags_state & s.dead != 0 {
+    if soul.flags & s.dead != 0 {
         return Err(format!(
             "request_blueprint: soul card {soul_card_id} is dead"
         ));
@@ -85,17 +85,17 @@ pub fn request_blueprint(
             "request_blueprint: card {soul_card_id} is not a soul-type card"
         ));
     }
-    if cards::slot_hold_count(soul.flags_bk) > 0 {
+    if cards::slot_claim_count(soul.flags) > 0 {
         return Err(format!(
             "request_blueprint: soul {soul_card_id} is exclusively held by an in-flight action"
         ));
     }
-    if cards::slot_share_count(soul.flags_bk) > 0 {
+    if cards::slot_borrow_count(soul.flags) > 0 {
         return Err(format!(
             "request_blueprint: soul {soul_card_id} is shared-held by an in-flight action"
         ));
     }
-    if cards::position_hold_count(soul.flags_bk) > 0 {
+    if cards::position_hold_count(soul.flags) > 0 {
         return Err(format!(
             "request_blueprint: soul {soul_card_id} is position-held by an in-flight action"
         ));
@@ -190,8 +190,8 @@ pub fn request_blueprint(
         micro,
         /* owner_id */ soul_card_id,
         blueprint_packed_def,
-        /* flags_state */ 0,
-        /* flags_bk */ 0,
+        /* flags */ 0,
+        /* stock */ 0,
     );
 
     Ok(())

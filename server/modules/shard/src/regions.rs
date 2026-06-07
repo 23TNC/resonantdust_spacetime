@@ -126,7 +126,7 @@ pub fn ensure_region(
         WORLD_LAYER => u64::MAX,
         _ => u64::MAX,
     };
-    let now = crate::time::effective_now_ms(ctx, client_time_ms)?;
+    let now = crate::cards::effective_now_ms(ctx, client_time_ms)?;
     write_at(
         ctx,
         Region {
@@ -203,7 +203,7 @@ pub fn request_zone(
 
     // About to write — resolve the client-aligned timestamp (rejects on
     // excessive drift) and stamp every new row in this reducer from it.
-    let now = crate::time::effective_now_ms(ctx, client_time_ms)?;
+    let now = crate::cards::effective_now_ms(ctx, client_time_ms)?;
 
     if !row_exists {
         // Tiles are computed gate-side (DSL worldgen for the world surface; an
