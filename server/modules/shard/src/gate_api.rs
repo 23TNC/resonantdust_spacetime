@@ -10,7 +10,7 @@ use spacetimedb::{reducer, ReducerContext, Table};
 
 use crate::cards;
 use crate::flags::state_flags;
-use crate::packed::{loose_kind_for_surface, with_surface};
+use crate::packed::with_surface;
 use crate::pending_actions;
 
 /// Hold-family selector shared with the gateway. Keep in sync with the
@@ -36,7 +36,7 @@ pub fn claim_pending(
     completion_ms: u64,
 ) -> Result<(), String> {
     let key = pending_actions::dedup_key(recipe_id, root, &bindings);
-    if pending_actions::is_in_flight(ctx, key) {
+    if pending_actions::is_in_flight(ctx, key, cards::now_ms(ctx)) {
         return Err(format!("action already in flight (dedup_key {key:#018x})"));
     }
     pending_actions::install(ctx, key, completion_ms);
@@ -196,12 +196,25 @@ pub fn apply_action(
     create_surfaces: Vec<u8>,
     create_macro_zones: Vec<u64>,
     create_owners: Vec<u32>,
+    // Per-created-card initial stock u32 (gate-computed `@define` defaults).
+    create_stocks: Vec<u32>,
     unlock_targets: Vec<u32>,
     unlock_blueprints: Vec<u16>,
     stat_souls: Vec<u32>,
     stat_fields: Vec<u8>,
     stat_bytes: Vec<u8>,
     stat_deltas: Vec<i8>,
+    // Per-card `stock` u32 writes (gate-computed absolute values).
+    stock_card_ids: Vec<u32>,
+    stock_values: Vec<u32>,
+    // Stack-splice repositions: members of a destroyed root, re-rooted so none is
+    // left pointing at a dead root. Parallel arrays; `stack_state` is the u8
+    // `[stack_id:u4|index:u4]` (0 = loose). Applied @completion (coalesces with a
+    // member's own hold-release/finalize row).
+    reroot_ids: Vec<u32>,
+    reroot_macro_zones: Vec<u64>,
+    reroot_micro_locations: Vec<u32>,
+    reroot_stack_states: Vec<u8>,
 ) -> Result<(), String> {
     // 1. CAS pre-check across every bound card — reject before any write (the
     //    rollback-on-Err makes the ordering immaterial, but pre-checking keeps
@@ -230,11 +243,11 @@ pub fn apply_action(
             new_id,
             completion_ms,
             with_surface(create_macro_zones[i], create_surfaces[i]),
-            cards::Micro::snap(0, 0, loose_kind_for_surface(create_surfaces[i])),
+            cards::Micro::snap(0, 0),
             create_owners[i],
             create_defs[i],
             /* flags */ 0,
-            /* stock */ 0,
+            create_stocks.get(i).copied().unwrap_or(0),
         );
     }
     for i in 0..unlock_targets.len() {
@@ -249,6 +262,25 @@ pub fn apply_action(
             stat_deltas[i],
             completion_ms,
         );
+    }
+    // Per-card stock writes (absolute, gate-computed). Future-stamped @completion
+    // so the new stock lands on the client's timeline like every other effect.
+    for i in 0..stock_card_ids.len() {
+        let id = stock_card_ids[i];
+        let value = stock_values[i];
+        cards::update_with_at(ctx, id, completion_ms, |c| c.stock = value)
+            .ok_or_else(|| format!("apply_action: stock card {id} not found"))?;
+    }
+    // Stack-splice repositions @completion (after destroys, so the orphaned
+    // members re-root as the destroyed root's row goes dead in the same commit).
+    // Best-effort: a member that vanished concurrently is simply skipped.
+    for i in 0..reroot_ids.len() {
+        use crate::cards::MicroPlace;
+        let micro = cards::Micro::of(reroot_micro_locations[i], reroot_stack_states[i] as u32);
+        cards::update_with_at(ctx, reroot_ids[i], completion_ms, |c| {
+            c.macro_zone = reroot_macro_zones[i];
+            micro.place(c);
+        });
     }
     Ok(())
 }

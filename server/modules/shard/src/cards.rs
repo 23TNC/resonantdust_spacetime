@@ -4,8 +4,7 @@ use crate::flags::bk_flags;
 use crate::packed::{pack_valid_at, valid_at_time, STACK_STATE_DEFERRED};
 use crate::sequence;
 use resonantdust_codec::card_model::{
-    decrement_hold, hold_count, increment_hold, is_dead, placement_mask, player_owned, state_mask,
-    HoldField,
+    decrement_hold, hold_count, increment_hold, is_dead, placement_mask, state_mask, HoldField,
 };
 
 /// Reserved sentinel player_id meaning "the world" (no real player
@@ -148,9 +147,12 @@ pub struct Card {
     /// forward. Bit layout: `resonantdust_codec::flags`'s `flags_bk` section
     /// ([`crate::flags::bk_flags`]).
     pub flags_bk: u8,
-    /// Tile-card per-row stock slots (two u2 values), via
-    /// `card_model::stock` / `write_stock`. Zero for non-tile cards.
-    pub stock: u8,
+    /// Per-card variable data — a full `u32`, packed however the card def wants
+    /// (16 u2s, 4 u8s, a u8 progress counter, …). Only the bottom u4
+    /// (`card_model::STOCK_ZONE_SAVE_MASK`) can be persisted back to a zone tile
+    /// slot; the upper 28 bits are card-only (transient unless the card persists).
+    /// Initialized from the def's stock default on spawn. Zero by default.
+    pub stock: u32,
 }
 
 /// A card's micro placement is the **shared** [`content::card_model::Micro`]
@@ -226,7 +228,11 @@ pub fn count_player_souls(ctx: &ReducerContext, player_id: u32) -> usize {
     }
     latest
         .values()
-        .filter(|c| c.owner_id == player_id && player_owned(c.flags) && !is_dead(c.flags))
+        .filter(|c| {
+            c.owner_id == player_id
+                && crate::packed::is_player_soul(c.packed_definition)
+                && !is_dead(c.flags)
+        })
         .count()
 }
 
@@ -350,14 +356,19 @@ pub fn effective_now_ms(ctx: &ReducerContext, client_time_ms: u64) -> Result<u64
         ));
     }
     // Client too far in the future → reject. Forward grace is static
-    // (anti-cheat, not lag absorption).
+    // (anti-cheat, not lag absorption). The client runs behind (clientDelay),
+    // so any meaningful "ahead" is skew — surfaced, not clamped.
     let ahead = client_time_ms.saturating_sub(server);
     if ahead > TIME_DRIFT_BUFFER_MS {
         return Err(format!(
             "time_drift:client_ahead_by={ahead} (server={server}, client={client_time_ms})"
         ));
     }
-    Ok(client_time_ms.min(server))
+    // Stamp at the client's (behind) time — no `min(client, server)` clamp.
+    // Clamping a within-grace forward overshoot to server-time would land
+    // completion rows off the client's timeline; reject-beyond-grace is the
+    // only future handling.
+    Ok(client_time_ms)
 }
 
 /// Row that's current at `time_ms` — max `valid_at_time` among
@@ -714,8 +725,8 @@ fn propagate_flag_diff_forward(
 // `flags` is the propagating word — pass the state bits only; placement
 // (`stack`/`index`) is supplied via `micro` and written by `micro.place`.
 // `stock` is the tile-card stock byte (0 for non-tile cards). Bookkeeping
-// (`flags_bk`) starts at 0 and is managed by `write_at`. Callers spawning a
-// player-soul pass `state_flags().player_owned`; most pass `(0, 0)`.
+// (`flags_bk`) starts at 0 and is managed by `write_at`. Most callers pass
+// `flags = 0` (a player_soul is identified by its definition, not a flag).
 #[allow(clippy::too_many_arguments)]
 pub fn create(
     ctx: &ReducerContext,
@@ -725,7 +736,7 @@ pub fn create(
     owner_id: u32,
     packed_definition: u16,
     flags: u32,
-    stock: u8,
+    stock: u32,
 ) -> Card {
     let mut card = Card {
         valid_at: 0,
@@ -794,7 +805,7 @@ pub fn create_at(
     owner_id: u32,
     packed_definition: u16,
     flags: u32,
-    stock: u8,
+    stock: u32,
 ) -> Card {
     let mut card = Card {
         valid_at: 0,
@@ -941,7 +952,7 @@ pub fn owning_player(ctx: &ReducerContext, card_id: u32) -> Option<u32> {
     let mut cur = card_id;
     for _ in 0..OWNER_WALK_DEPTH_CAP {
         let row = latest(ctx, cur)?;
-        if player_owned(row.flags) {
+        if crate::packed::is_player_soul(row.packed_definition) {
             return Some(row.owner_id);
         }
         if row.owner_id == 0 {
@@ -967,7 +978,7 @@ pub fn owning_soul_at(
     let mut cur = card_id;
     for _ in 0..OWNER_WALK_DEPTH_CAP {
         let row = prior_at(ctx, cur, time_ms)?;
-        if player_owned(row.flags) {
+        if crate::packed::is_player_soul(row.packed_definition) {
             return Some(cur);
         }
         if row.owner_id == 0 {
@@ -994,7 +1005,7 @@ pub fn owning_soul(ctx: &ReducerContext, card_id: u32) -> Option<u32> {
     let mut cur = card_id;
     for _ in 0..OWNER_WALK_DEPTH_CAP {
         let row = latest(ctx, cur)?;
-        if player_owned(row.flags) {
+        if crate::packed::is_player_soul(row.packed_definition) {
             return Some(cur);
         }
         if row.owner_id == 0 {
@@ -1022,7 +1033,7 @@ pub fn inventory_container_for(ctx: &ReducerContext, card_id: u32) -> u32 {
     let Some(row) = latest(ctx, card_id) else {
         return 0;
     };
-    if player_owned(row.flags) {
+    if crate::packed::is_player_soul(row.packed_definition) {
         card_id
     } else {
         row.owner_id
@@ -1042,7 +1053,7 @@ pub fn inventory_container_for_at(
     let Some(row) = prior_at(ctx, card_id, time_ms) else {
         return 0;
     };
-    if player_owned(row.flags) {
+    if crate::packed::is_player_soul(row.packed_definition) {
         card_id
     } else {
         row.owner_id
@@ -1076,7 +1087,7 @@ pub fn would_cycle(ctx: &ReducerContext, card_id: u32, new_owner_card_id: u32) -
         let Some(row) = latest(ctx, cur) else {
             return false;
         };
-        if player_owned(row.flags) {
+        if crate::packed::is_player_soul(row.packed_definition) {
             return false;
         }
         if row.owner_id == 0 {

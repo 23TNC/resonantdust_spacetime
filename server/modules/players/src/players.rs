@@ -309,6 +309,25 @@ pub fn create(ctx: &ReducerContext, player_id: u32, name: String) -> Player {
     create_at(ctx, player_id, name, CARD_SHARD, now_ms(ctx))
 }
 
+/// Provision a brand-new player account: allocate the next id, write the
+/// `Player` row (assigned to [`CARD_SHARD`]) + its private `PlayerProfile` at
+/// `time_ms`, and return the new `player_id`. The single source of new-player
+/// creation — shared by [`claim_or_login`]'s new-player branch and the
+/// [`create_player`] reducer (registration without login). Does NOT validate the
+/// name or check for collisions; callers do that first.
+pub fn provision_player(ctx: &ReducerContext, name: String, time_ms: u64) -> u32 {
+    let new_id = next_player_id(ctx);
+    // No soul is created here — souls live in the assigned `cards` database, which
+    // this module can't write to. The client (or harness) calls `spawn_soul`
+    // there after reading `data_shard` off this row.
+    create_at(ctx, new_id, name, CARD_SHARD, time_ms);
+    ctx.db.player_profiles().insert(PlayerProfile {
+        player_id: new_id,
+        data_shard: crate::DATA_SHARD,
+    });
+    new_id
+}
+
 // Insert a brand-new player at the given `time_ms`. valid_at is
 // computed from `time_ms`; any value passed in is overwritten.
 // `data_shard` is the card shard this player is assigned to — see the
@@ -601,20 +620,10 @@ pub fn claim_or_login(
             player.player_id
         }
         None => {
-            let new_id = next_player_id(ctx);
-            // Assign the player to a card shard. No soul is created
-            // here — souls live in the assigned `cards` database, which
-            // this module can't write to. After reading `data_shard`
-            // off this row the client connects to that card shard,
-            // looks up `cards.owner_id == player_id`, and calls
-            // `spawn_soul(player_id)` there if it owns none yet.
-            create_at(ctx, new_id, name, CARD_SHARD, now_ms);
-            // Seed the per-player private state row.
-            ctx.db.player_profiles().insert(PlayerProfile {
-                player_id: new_id,
-                data_shard: crate::DATA_SHARD,
-            });
-            new_id
+            // Shared new-player provisioning (id + Player row + profile). The
+            // client connects to the assigned card shard and calls `spawn_soul`
+            // there to mint the player_soul if it owns none yet.
+            provision_player(ctx, name, now_ms)
         }
     };
 
@@ -641,6 +650,35 @@ pub fn claim_or_login(
         p.last_login_secs = (now_ms / 1_000) as u32;
     });
 
+    Ok(())
+}
+
+/// Create a player account **without logging in** — registration / programmatic
+/// provisioning (the future "players create their users" path, and how the test
+/// harness seeds extra players to craft initial conditions). Shares
+/// [`provision_player`] with [`claim_or_login`]; the only difference is this
+/// always *creates* (erroring on a taken name) and never establishes a session
+/// or bumps `last_login_secs`. The player_soul is minted separately via
+/// `spawn_soul` on the card shard, same as the login path.
+///
+/// **Intentionally insecure**, like `claim_or_login`: no auth. Exempt from the
+/// `effective_now_ms` grace check (bootstrap-class; stamps at
+/// `now − CLIENT_RENDER_BUFFER_MAX_MS` so the row promotes on the next tick).
+#[reducer]
+pub fn create_player(
+    ctx: &ReducerContext,
+    // No leading underscore — `/call` keys on the exact param name. Unused
+    // (server-now stamp), kept for wire-format consistency.
+    client_time_ms: u64,
+    name: String,
+) -> Result<(), String> {
+    let _ = client_time_ms;
+    validate_player_name(&name)?;
+    if latest_by_name(ctx, &name).is_some() {
+        return Err(format!("create_player: a player named {name:?} already exists"));
+    }
+    let now_ms = now_ms(ctx).saturating_sub(CLIENT_RENDER_BUFFER_MAX_MS);
+    provision_player(ctx, name, now_ms);
     Ok(())
 }
 

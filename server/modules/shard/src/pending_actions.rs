@@ -35,13 +35,23 @@ pub fn dedup_key(recipe_id: u16, root: u32, bindings: &[Vec<u32>]) -> u64 {
     h.finish()
 }
 
-/// Insert a registry row. Caller must have checked [`is_in_flight`] first —
-/// inserting a duplicate PK panics (SpacetimeDB convention).
+/// Install (or refresh) the registry row for `dedup_key`, stamping its new
+/// `completion_ms`. Caller must have checked [`is_in_flight`] first. A leftover
+/// row from a COMPLETED prior action (same tuple, `completion_ms` already
+/// passed — not yet swept) is overwritten rather than panicking on the duplicate
+/// PK: this is the re-fire of a self-advancing recipe, a fresh in-flight window.
 pub fn install(ctx: &ReducerContext, dedup_key: u64, completion_ms: u64) {
-    ctx.db.pending_actions().insert(PendingAction {
-        dedup_key,
-        completion_ms,
-    });
+    if ctx.db.pending_actions().dedup_key().find(dedup_key).is_some() {
+        ctx.db.pending_actions().dedup_key().update(PendingAction {
+            dedup_key,
+            completion_ms,
+        });
+    } else {
+        ctx.db.pending_actions().insert(PendingAction {
+            dedup_key,
+            completion_ms,
+        });
+    }
 }
 
 /// Remove the registry row for `dedup_key` (no-op if missing).
@@ -51,9 +61,19 @@ pub fn release(ctx: &ReducerContext, dedup_key: u64) {
     }
 }
 
-/// True if a registry row exists for `dedup_key`.
-pub fn is_in_flight(ctx: &ReducerContext, dedup_key: u64) -> bool {
-    ctx.db.pending_actions().dedup_key().find(dedup_key).is_some()
+/// True if a registry row for `dedup_key` is still in flight at `now_ms` — i.e.
+/// its action's completion effects haven't landed yet (`now_ms < completion_ms`).
+/// A row whose `completion_ms` has already passed is a COMPLETED action, not an
+/// in-flight one: a fresh proposal of the same `(recipe, root, bindings)` tuple
+/// is then a legitimate *next* fire (e.g. a recipe that re-matches its own root
+/// after advancing the card's stock), not a duplicate submission. The dedup only
+/// guards the open window; `sweep_stale` reaps the leftover row later.
+pub fn is_in_flight(ctx: &ReducerContext, dedup_key: u64, now_ms: u64) -> bool {
+    ctx.db
+        .pending_actions()
+        .dedup_key()
+        .find(dedup_key)
+        .is_some_and(|r| now_ms < r.completion_ms)
 }
 
 /// Grace beyond `completion_ms` after which a row is presumed orphaned.

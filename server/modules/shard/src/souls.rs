@@ -234,12 +234,8 @@ pub fn apply_stat(ctx: &ReducerContext, soul_card_id: u32, field: u8, byte_index
 
 // ---- soul-card identity --------------------------------------------
 
-/// Card-type id for `soul` cards. Mirrors `cards/types.json` —
-/// promote to a content-side helper if more modules need it.
-const SOUL_CARD_TYPE: u8 = 6;
-
 pub fn is_soul_card(packed_def: u16) -> bool {
-    ((packed_def >> 12) & 0xF) as u8 == SOUL_CARD_TYPE
+    ((packed_def >> 12) & 0xF) as u8 == resonantdust_codec::packed::SOUL_CARD_TYPE
 }
 
 /// Card-type id for `blueprint` cards. Mirrors `cards/types.json`

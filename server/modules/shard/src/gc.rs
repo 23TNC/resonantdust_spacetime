@@ -49,7 +49,7 @@ use std::collections::HashMap;
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use resonantdust_codec::card_model::{
-    has_active_holds, micro_is_card, state_blocks_demotion, stock,
+    has_active_holds, micro_is_card, state_blocks_demotion, stock, STOCK_ZONE_SAVE_MASK,
 };
 
 use crate::card_shards::card_shards;
@@ -301,6 +301,14 @@ fn sweep_tile_card_demotions(ctx: &ReducerContext, now_ms: u64) {
             continue; // stacked under a card — in use, root not local.
         }
         if state_blocks_demotion(c.flags) || has_active_holds(c.flags) {
+            continue;
+        }
+        // Demote-guard: a zone tile only persists the bottom u4
+        // (`STOCK_ZONE_SAVE_MASK`). If any of the upper 28 stock bits are set, the
+        // card carries transient state (e.g. in-progress build) the zone can't
+        // express — keep the card alive until it returns to 0. Content-free: the
+        // shard never needs the def's defaults, just "non-savable bits are clear".
+        if c.stock & !STOCK_ZONE_SAVE_MASK != 0 {
             continue;
         }
         let Some(zone) = crate::zones::latest_for(ctx, c.macro_zone) else {

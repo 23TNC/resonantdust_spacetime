@@ -25,9 +25,7 @@ use spacetimedb::ReducerContext;
 
 use crate::cards::cards;
 use crate::cards::{create_at, next_card_id, prior_at, update_with_at, Card, Micro};
-use crate::packed::{
-    pack_definition, unpack_definition, unpack_zone_definition, with_surface, SNAP_HEX,
-};
+use crate::packed::{pack_definition, unpack_definition, unpack_zone_definition, with_surface};
 use crate::zones;
 
 /// `card_type` of the tile-as-card family (zone-tile cards). Mirrors the
@@ -100,7 +98,7 @@ pub fn find_or_create_tile_card(
         card_id,
         time_ms,
         full_macro,
-        Micro::snap(q, r, SNAP_HEX),
+        Micro::snap(q, r),
         zone.owner_id,
         packed_def,
         /* flags */ 0,

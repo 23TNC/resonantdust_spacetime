@@ -175,13 +175,7 @@ pub fn request_blueprint(
     let card_id = cards::next_card_id(ctx);
     // The blueprint lands loose at the requested cell/offset on `surface`.
     let (lq, lr, x, y) = crate::packed::unpack_micro_loose(micro_location);
-    let micro = cards::Micro::Loose {
-        local_q: lq,
-        local_r: lr,
-        x,
-        y,
-        kind: crate::packed::loose_kind_for_surface(surface),
-    };
+    let micro = cards::Micro::Loose { local_q: lq, local_r: lr, x, y };
     cards::create_at(
         ctx,
         card_id,

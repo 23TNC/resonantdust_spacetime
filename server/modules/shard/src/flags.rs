@@ -26,8 +26,6 @@ pub struct StateFlags {
     pub pos_need: u32,
     /// Server *prefers* the row's position (mirror splice stacks-on-conflict).
     pub pos_want: u32,
-    /// The owner chain names a player here (`owner_id` is a `player_id`).
-    pub player_owned: u32,
     pub surface_locked: u32,
     /// Card was materialized from zone tile data (a tile-card).
     pub zone_born: u32,
@@ -55,7 +53,6 @@ pub fn state_flags() -> &'static StateFlags {
         dead: bit_mask("flags", "dead"),
         pos_need: bit_mask("flags", "pos_need"),
         pos_want: bit_mask("flags", "pos_want"),
-        player_owned: bit_mask("flags", "player_owned"),
         surface_locked: bit_mask("flags", "surface_locked"),
         zone_born: bit_mask("flags", "zone_born"),
     })
