@@ -17,7 +17,7 @@ serde_json = "1.0"
 # module needs the bit codec, not the parser/vm/loader. The legacy
 # `resonantdust-content` crate is no longer linked (blueprints moved into the DSL
 # Bundle, resolved gate-side).
-resonantdust-codec = { path = "../../../pixijs/src/shared/codec" }
+resonantdust-codec = { path = "../../../shared/codec" }
 # Stack-movement model (sans-IO `plan_place` over a `StackStore`), shared with the
 # client so the shard reducer and the client's predicted move can't drift.
-resonantdust-state = { path = "../../../pixijs/src/shared/state" }
+resonantdust-state = { path = "../../../shared/state" }

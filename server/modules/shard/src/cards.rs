@@ -389,6 +389,53 @@ pub fn prior_at(ctx: &ReducerContext, card_id: u32, time_ms: u64) -> Option<Card
         .max_by_key(|c| valid_at_time(c.valid_at))
 }
 
+/// The first unoccupied snap cell in `macro_zone` (row-major over the 8×8 zone)
+/// at `time_ms` — for placing a new snapped card ONE-PER-TILE (every surface is a
+/// uniform hex grid; snapped cards carry a zero offset). Occupants are the live
+/// loose cards currently in the zone. Falls back to `(0, 0)` if the zone is full
+/// (degenerate, but keeps placement total).
+/// Cube/hex distance between axial tile coords. Mirrors `regions::hex_dist`.
+fn hex_dist(aq: i32, ar: i32, bq: i32, br: i32) -> i32 {
+    let dq = aq - bq;
+    let dr = ar - br;
+    (dq.abs() + dr.abs() + (dq + dr).abs()) / 2
+}
+
+pub fn first_free_cell(ctx: &ReducerContext, macro_zone: u64, distance: u16, time_ms: u64) -> (u8, u8) {
+    use crate::packed::{world_tile, ZONE_SIZE};
+    let (zq, zr) = crate::packed::unpack_macro_zone(macro_zone);
+    let d = distance as i32;
+    let mut occupied = std::collections::BTreeSet::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for row in ctx.db.cards().macro_zone().filter(macro_zone) {
+        if !seen.insert(row.card_id) {
+            continue;
+        }
+        let Some(card) = prior_at(ctx, row.card_id, time_ms) else {
+            continue;
+        };
+        if is_dead(card.flags) {
+            continue;
+        }
+        if let Micro::Loose { local_q, local_r, .. } = Micro::of(card.micro_location, card.flags) {
+            occupied.insert((local_q, local_r));
+        }
+    }
+    for r in 0..ZONE_SIZE {
+        for q in 0..ZONE_SIZE {
+            // Skip cells outside the region's disk — those tiles don't exist
+            // (the gate never spawns them). `distance = u16::MAX` ⇒ unbounded.
+            if hex_dist(world_tile(zq, q as u8), world_tile(zr, r as u8), 0, 0) > d {
+                continue;
+            }
+            if !occupied.contains(&(q as u8, r as u8)) {
+                return (q as u8, r as u8);
+            }
+        }
+    }
+    (0, 0)
+}
+
 /// Delete every row for `card_id` whose `valid_at_time` matches
 /// exactly `time_ms`. Used by `write_at` to purge a stale row at the
 /// same time before re-stamping, so in-reducer accumulation patterns

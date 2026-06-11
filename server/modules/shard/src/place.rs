@@ -65,6 +65,9 @@ pub fn place_card(
         to_stack_placement(placement)?,
         caller_player_id,
         now_ms,
+        // The shard is content-agnostic (no bundle): a Stack placement only ever
+        // stacks non-tile card rows, which carry the regular-card default bits.
+        &|_| resonantdust_codec::stacking::DEFAULT_BITS,
     )?;
     // Apply the plan. `surface` is folded into `macro_zone` already (the plan's
     // `macro_zone` is the full key); `micro.place` writes `micro_location` + the

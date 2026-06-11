@@ -25,7 +25,7 @@ pub struct Zone {
     /// here.
     #[index(btree)]
     pub owner_id: u32,
-    // 64 tiles × u16 slot = 1024 bits = 16 u64. Each slot packs
+    // 49 tiles × u16 slot = 784 bits → 13 u64. Each slot packs
     // `[def_id:u12 | stock0:u2 | stock1:u2]`. Use the helpers below
     // (`tile_at`, `tile_stock`, `assign_tile`, `assign_tile_stock`)
     // rather than touching the u64 fields directly. See
@@ -33,33 +33,33 @@ pub struct Zone {
     pub t0: u64,  pub t1: u64,  pub t2: u64,  pub t3: u64,
     pub t4: u64,  pub t5: u64,  pub t6: u64,  pub t7: u64,
     pub t8: u64,  pub t9: u64,  pub t10: u64, pub t11: u64,
-    pub t12: u64, pub t13: u64, pub t14: u64, pub t15: u64,
+    pub t12: u64,
 }
 
 impl Zone {
-    /// Collect the 16 u64 tile fields into the fixed-size array the
+    /// Collect the 13 u64 tile fields into the fixed-size array the
     /// `packed::tile_*` helpers operate on.
     pub fn tiles(&self) -> [u64; packed::ZONE_TILE_U64_COUNT] {
         [
             self.t0,  self.t1,  self.t2,  self.t3,
             self.t4,  self.t5,  self.t6,  self.t7,
             self.t8,  self.t9,  self.t10, self.t11,
-            self.t12, self.t13, self.t14, self.t15,
+            self.t12,
         ]
     }
 
-    /// Write the 16-u64 tile array back into the struct fields.
+    /// Write the 13-u64 tile array back into the struct fields.
     pub fn set_tiles(&mut self, tiles: &[u64; packed::ZONE_TILE_U64_COUNT]) {
         self.t0  = tiles[0];  self.t1  = tiles[1];  self.t2  = tiles[2];  self.t3  = tiles[3];
         self.t4  = tiles[4];  self.t5  = tiles[5];  self.t6  = tiles[6];  self.t7  = tiles[7];
         self.t8  = tiles[8];  self.t9  = tiles[9];  self.t10 = tiles[10]; self.t11 = tiles[11];
-        self.t12 = tiles[12]; self.t13 = tiles[13]; self.t14 = tiles[14]; self.t15 = tiles[15];
+        self.t12 = tiles[12];
     }
 
-    /// Decode one row (0..=7) — returns `(def_id, stock0, stock1)`
+    /// Decode one row (0..=6) — returns `(def_id, stock0, stock1)`
     /// per column. `None` for out-of-range row.
-    pub fn tile_row(&self, row: u8) -> Option<[(u16, u8, u8); 8]> {
-        if row >= 8 { return None; }
+    pub fn tile_row(&self, row: u8) -> Option<[(u16, u8, u8); packed::ZONE_STORAGE_STRIDE]> {
+        if row >= 7 { return None; }
         Some(packed::tile_row(&self.tiles(), row as usize))
     }
 
@@ -67,24 +67,24 @@ impl Zone {
     /// `(def_id, stock0, stock1)`; `None` if either coord out of
     /// range.
     pub fn tile_at(&self, row: u8, col: u8) -> Option<(u16, u8, u8)> {
-        if row >= 8 || col >= 8 { return None; }
-        Some(packed::tile_full(&self.tiles(), (row * 8 + col) as usize))
+        if row >= 7 || col >= 7 { return None; }
+        Some(packed::tile_full(&self.tiles(), packed::tile_slot(col, row)))
     }
 
     /// Read just the def_id at `(row, col)`. Convenience for
     /// callers that don't need stock.
     pub fn tile_def_id_at(&self, row: u8, col: u8) -> Option<u16> {
-        if row >= 8 || col >= 8 { return None; }
-        Some(packed::tile_def_id(&self.tiles(), (row * 8 + col) as usize))
+        if row >= 7 || col >= 7 { return None; }
+        Some(packed::tile_def_id(&self.tiles(), packed::tile_slot(col, row)))
     }
 
     /// Read one stock slot (0 or 1) at `(row, col)`. Returns
     /// `None` for out-of-range coords or slot index.
     pub fn tile_stock_at(&self, row: u8, col: u8, slot: usize) -> Option<u8> {
-        if row >= 8 || col >= 8 || slot >= packed::ZONE_TILE_STOCK_SLOTS {
+        if row >= 7 || col >= 7 || slot >= packed::ZONE_TILE_STOCK_SLOTS {
             return None;
         }
-        Some(packed::tile_stock(&self.tiles(), (row * 8 + col) as usize, slot))
+        Some(packed::tile_stock(&self.tiles(), packed::tile_slot(col, row), slot))
     }
 
     /// Write a single tile by `(row, col)`: def_id + both stock
@@ -97,11 +97,11 @@ impl Zone {
         stock0: u8,
         stock1: u8,
     ) -> bool {
-        if row >= 8 || col >= 8 { return false; }
+        if row >= 7 || col >= 7 { return false; }
         let mut packed = self.tiles();
         packed::set_tile_full(
             &mut packed,
-            (row * 8 + col) as usize,
+            packed::tile_slot(col, row),
             def_id,
             stock0,
             stock1,
@@ -113,9 +113,9 @@ impl Zone {
     /// Write a single tile's def_id at `(row, col)` while
     /// preserving its stock slots.
     pub fn assign_tile_def(&mut self, row: u8, col: u8, def_id: u16) -> bool {
-        if row >= 8 || col >= 8 { return false; }
+        if row >= 7 || col >= 7 { return false; }
         let mut packed = self.tiles();
-        let idx = (row * 8 + col) as usize;
+        let idx = packed::tile_slot(col, row);
         let (_, s0, s1) = packed::tile_full(&packed, idx);
         packed::set_tile_full(&mut packed, idx, def_id, s0, s1);
         self.set_tiles(&packed);
@@ -131,11 +131,11 @@ impl Zone {
         slot: usize,
         value: u8,
     ) -> bool {
-        if row >= 8 || col >= 8 || slot >= packed::ZONE_TILE_STOCK_SLOTS {
+        if row >= 7 || col >= 7 || slot >= packed::ZONE_TILE_STOCK_SLOTS {
             return false;
         }
         let mut packed = self.tiles();
-        packed::set_tile_stock(&mut packed, (row * 8 + col) as usize, slot, value);
+        packed::set_tile_stock(&mut packed, packed::tile_slot(col, row), slot, value);
         self.set_tiles(&packed);
         true
     }
@@ -252,7 +252,7 @@ pub fn create_at(
             t0:  tiles[0],  t1:  tiles[1],  t2:  tiles[2],  t3:  tiles[3],
             t4:  tiles[4],  t5:  tiles[5],  t6:  tiles[6],  t7:  tiles[7],
             t8:  tiles[8],  t9:  tiles[9],  t10: tiles[10], t11: tiles[11],
-            t12: tiles[12], t13: tiles[13], t14: tiles[14], t15: tiles[15],
+            t12: tiles[12],
         },
         time_ms,
     )
@@ -304,15 +304,15 @@ pub fn set_owner_id(ctx: &ReducerContext, zone_id: u32, owner_id: u32) -> Option
     update_with(ctx, zone_id, |z| z.owner_id = owner_id)
 }
 
-// Replace all 8 tiles in row `row` (0..8). Each entry is
+// Replace all 7 tiles in row `row` (0..7). Each entry is
 // `(def_id, stock0, stock1)`.
 pub fn set_tile_row(
     ctx: &ReducerContext,
     zone_id: u32,
     row: u8,
-    tiles: [(u16, u8, u8); 8],
+    tiles: [(u16, u8, u8); packed::ZONE_STORAGE_STRIDE],
 ) -> Option<Zone> {
-    if row >= 8 {
+    if row >= 7 {
         return None;
     }
     update_with(ctx, zone_id, |z| {
@@ -322,7 +322,7 @@ pub fn set_tile_row(
     })
 }
 
-// Replace all 64 tiles at once.
+// Replace all 49 tiles at once.
 pub fn set_tile_rows(ctx: &ReducerContext, zone_id: u32, tiles: [u64; packed::ZONE_TILE_U64_COUNT]) -> Option<Zone> {
     update_with(ctx, zone_id, |z| {
         z.set_tiles(&tiles);
@@ -385,7 +385,7 @@ pub fn set_tile_at(
     stock0: u8,
     stock1: u8,
 ) -> Option<Zone> {
-    if row >= 8 || col >= 8 {
+    if row >= 7 || col >= 7 {
         return None;
     }
 
@@ -490,7 +490,7 @@ pub fn create_disk_at(
             if !in_disk(row, col) {
                 continue;
             }
-            packed::set_tile_full(&mut tiles, (row * 8 + col) as usize, def_id, 0, 0);
+            packed::set_tile_full(&mut tiles, packed::tile_slot(col, row), def_id, 0, 0);
         }
     }
 
@@ -576,7 +576,7 @@ pub fn fold_tiles_at(
     // cell's pre-fold slot so forward-prop can detect deliberate downstream edits.
     let mut changed: Vec<((u8, u8), (u16, u8, u8), (u16, u8, u8))> = Vec::new();
     for &(row, col, def_id, s0, s1) in cells {
-        if row >= 8 || col >= 8 {
+        if row >= 7 || col >= 7 {
             continue;
         }
         let old_slot = prior.tile_at(row, col).unwrap_or((0, 0, 0));
@@ -651,7 +651,7 @@ pub fn set_tile_stock_at(
     slot: usize,
     value: u8,
 ) -> Option<Zone> {
-    if row >= 8 || col >= 8 || slot >= packed::ZONE_TILE_STOCK_SLOTS {
+    if row >= 7 || col >= 7 || slot >= packed::ZONE_TILE_STOCK_SLOTS {
         return None;
     }
     let prior = ctx

@@ -15,7 +15,7 @@ use spacetimedb::{reducer, table, ReducerContext, Table};
 
 use crate::packed::{
     owner_of, pack_macro_region, pack_valid_at, pack_zone_definition, region_of_zone, surface_of,
-    valid_at_time, INVENTORY_LAYER, WORLD_LAYER,
+    valid_at_time, WORLD_LAYER,
 };
 use crate::sequence;
 use crate::zones;
@@ -41,6 +41,45 @@ pub struct Region {
     /// Bit `i` set = the zone at slot `i` HAS been spawned (a `zones` row
     /// exists). Set by `request_zone` after a successful spawn.
     pub zone_available: u64,
+    /// Disk radius (in tiles) of this region's owner-origin. The single bound
+    /// for the whole region: `zone_presence` carries exactly the zones whose
+    /// tiles fall within `distance` of the origin tile `(0,0)`, and
+    /// `request_zone` masks each spawned zone's tiles to that same disk. World
+    /// regions use `u16::MAX` (effectively unbounded); a container uses
+    /// `inventory − 1` (gate-supplied at `ensure_region`).
+    pub distance: u16,
+}
+
+/// Cube/hex distance between two axial tile coords:
+/// `(|dq| + |dr| + |dq+dr|) / 2`. Mirrors `zones::in_disk`.
+fn hex_dist(aq: i32, ar: i32, bq: i32, br: i32) -> i32 {
+    let dq = aq - bq;
+    let dr = ar - br;
+    (dq.abs() + dr.abs() + (dq + dr).abs()) / 2
+}
+
+/// `zone_presence` for a region: bit set for every one of the region's 49 zone
+/// slots that has at least one tile within `distance` of the owner-origin tile
+/// `(0,0)`. Pure geometry off `distance` — the same disk `request_zone` masks
+/// tiles to. `u16::MAX` distance lights every bit (world behaviour).
+fn presence_for_disk(macro_region: u64, distance: u16) -> u64 {
+    use crate::packed::{world_tile, REGION_SIZE, ZONE_SIZE};
+    let (region_q, region_r) = crate::packed::unpack_macro_zone(macro_region);
+    let d = distance as i32;
+    let mut bits = 0u64;
+    let slots = (REGION_SIZE * REGION_SIZE) as u8; // 7×7 = 49
+    for bit in 0u8..slots {
+        let (zq, zr) = crate::packed::zone_of_region_slot(region_q, region_r, bit);
+        'cells: for lr in 0..ZONE_SIZE {
+            for lc in 0..ZONE_SIZE {
+                if hex_dist(world_tile(zq, lc as u8), world_tile(zr, lr as u8), 0, 0) <= d {
+                    bits |= 1u64 << bit;
+                    break 'cells;
+                }
+            }
+        }
+    }
+    bits
 }
 
 fn now_ms(ctx: &ReducerContext) -> u64 {
@@ -91,6 +130,7 @@ pub fn seed_world_region(ctx: &ReducerContext) {
             macro_region,
             zone_presence: u64::MAX,
             zone_available: 0,
+            distance: u16::MAX,
         },
         now_ms(ctx),
     );
@@ -103,29 +143,23 @@ pub fn seed_world_region(ctx: &ReducerContext) {
 /// zone. This is the client-driven, self-healing path that replaces the old
 /// in-`spawn_soul` inventory-region seed (now a cross-DB call the gate relays).
 ///
-/// Hard-coded per-surface presence for now (extend later for sparse world
-/// presence / container layouts):
-/// - **surface 1 (inventory)** → `0x0000000000000001` (only zone `(0, 0)`).
-/// - **surface 64 (world) + any other surface** → `0xffffffffffffffff` (every
-///   macro_zone present in this region, none generated yet).
-///
-/// `client_time_ms` stamps the row on the client's buffered timeline, same as
-/// `request_zone`.
+/// Presence is the disk of radius `distance` (tiles) around the owner-origin
+/// tile `(0,0)` — see [`presence_for_disk`]. Uniform across surfaces: the gate
+/// supplies `distance` (`inventory − 1` for a container, `u16::MAX` for the
+/// world, which lights every bit). `client_time_ms` stamps the row on the
+/// client's buffered timeline, same as `request_zone`.
 #[reducer]
 pub fn ensure_region(
     ctx: &ReducerContext,
     client_time_ms: u64,
     macro_zone: u64,
+    distance: u16,
 ) -> Result<(), String> {
     let (macro_region, _bit) = region_of_zone(macro_zone);
     if latest_for(ctx, macro_region).is_some() {
         return Ok(());
     }
-    let zone_presence = match surface_of(macro_zone) {
-        INVENTORY_LAYER => 0x0000_0000_0000_0001,
-        WORLD_LAYER => u64::MAX,
-        _ => u64::MAX,
-    };
+    let zone_presence = presence_for_disk(macro_region, distance);
     let now = crate::cards::effective_now_ms(ctx, client_time_ms)?;
     write_at(
         ctx,
@@ -134,6 +168,7 @@ pub fn ensure_region(
             macro_region,
             zone_presence,
             zone_available: 0,
+            distance,
         },
         now,
     );
@@ -213,6 +248,20 @@ pub fn request_zone(
         let mut arr = [0u64; crate::packed::ZONE_TILE_U64_COUNT];
         for (i, v) in tiles.iter().take(arr.len()).enumerate() {
             arr[i] = *v;
+        }
+        // Clip the gate-supplied content to this region's disk: zero any cell
+        // whose global tile coord is farther than `distance` from the origin
+        // `(0,0)`. World regions (`distance = u16::MAX`) clip nothing. Iterate the
+        // LOGICAL 7×7 cells (the gate emits only those); col/row 7 stay empty.
+        use crate::packed::{tile_slot, world_tile, ZONE_SIZE};
+        let (zq, zr) = crate::packed::unpack_macro_zone(macro_zone);
+        let d = region.distance as i32;
+        for lr in 0..ZONE_SIZE {
+            for lc in 0..ZONE_SIZE {
+                if hex_dist(world_tile(zq, lc as u8), world_tile(zr, lr as u8), 0, 0) > d {
+                    crate::packed::set_tile_full(&mut arr, tile_slot(lc as u8, lr as u8), 0, 0, 0);
+                }
+            }
         }
         let owner = if surface_of(macro_zone) == WORLD_LAYER { 0 } else { owner_of(macro_zone) };
         let zone_id = zones::next_zone_id(ctx);

@@ -16,7 +16,6 @@ services:
       - ../content:/workspace/server/modules/shard/content
       - ../content:/workspace/server/modules/players/content
       - ./server:/workspace/server
-      - ../pixijs:/workspace/pixijs
       - ../gateway:/workspace/gateway
     working_dir: /workspace/server
     command:
@@ -38,23 +37,24 @@ services:
       - ./server:/workspace/server
       - ../content:/workspace/server/modules/shard/content
       - ../content:/workspace/server/modules/players/content
-      - ../pixijs:/workspace/pixijs
+      - ../shared:/workspace/shared
       - ../gateway:/workspace/gateway
     working_dir: /workspace/server
     command:
       - build
 
-  # Per-module TypeScript bindings codegen. `bin/st build` invokes
-  # `generate-bindings.sh <module>`, which fans out the spacetime
-  # generate call per module path. Output lands under
-  # `pixijs/src/server/spacetime/bindings/<module>/`.
+  # Per-module Rust bindings codegen for the gateway. `bin/st build` invokes
+  # `generate-bindings.sh <module>`, which fans out the spacetime generate
+  # call per module path. Output lands under `gateway/src/bindings/<module>/`.
+  # (TS bindings were dropped — the live `view` client carries its own minimal
+  # row types; only the legacy pixijs client consumed generated TS.)
   bindings:
     image: clockworklabs/spacetime:latest
     volumes:
       - ./server:/workspace/server
       - ../content:/workspace/server/modules/shard/content
       - ../content:/workspace/server/modules/players/content
-      - ../pixijs:/workspace/pixijs
+      - ../shared:/workspace/shared
       - ../gateway:/workspace/gateway
     working_dir: /workspace/server
     entrypoint: ["/bin/bash"]

@@ -21,4 +21,4 @@ serde_json = "1.0"
 # that's intentional; all builds go through the Docker wrapper. The auth DB only
 # uses the content crate's `packed` bit-helpers (valid_at packing); it holds no
 # card definitions itself.
-resonantdust-codec = { path = "../../../pixijs/src/shared/codec" }
+resonantdust-codec = { path = "../../../shared/codec" }

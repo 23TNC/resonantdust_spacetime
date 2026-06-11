@@ -196,6 +196,9 @@ pub fn apply_action(
     create_surfaces: Vec<u8>,
     create_macro_zones: Vec<u64>,
     create_owners: Vec<u32>,
+    // Per-created-card destination container disk radius (tiles), so placement
+    // only picks cells that exist in the region disk. `u16::MAX` = unbounded.
+    create_distances: Vec<u16>,
     // Per-created-card initial stock u32 (gate-computed `@define` defaults).
     create_stocks: Vec<u32>,
     unlock_targets: Vec<u32>,
@@ -238,12 +241,22 @@ pub fn apply_action(
     }
     for i in 0..create_defs.len() {
         let new_id = cards::next_card_id(ctx);
+        // Place each product on the first UNOCCUPIED cell of its target zone —
+        // one card per tile — not a hardcoded (0,0) where every recipe output
+        // would pile into one overlapping stack. Resolved @completion so the
+        // scan sees both pre-existing live cards AND the prior products minted
+        // earlier in this same batch (each create is visible to the next read
+        // in-transaction). Same one-per-tile rule as `create_card`; this path
+        // mints loose cards (stacked outputs are placed elsewhere).
+        let zone = with_surface(create_macro_zones[i], create_surfaces[i]);
+        let dist = create_distances.get(i).copied().unwrap_or(u16::MAX);
+        let (fq, fr) = cards::first_free_cell(ctx, zone, dist, completion_ms);
         cards::create_at(
             ctx,
             new_id,
             completion_ms,
-            with_surface(create_macro_zones[i], create_surfaces[i]),
-            cards::Micro::snap(0, 0),
+            zone,
+            cards::Micro::snap(fq, fr),
             create_owners[i],
             create_defs[i],
             /* flags */ 0,

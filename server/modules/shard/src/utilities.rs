@@ -49,20 +49,25 @@ pub fn create_card(
     macro_zone: u64,
     q: u8,
     r: u8,
+    // Gate-supplied disk radius (tiles) of the owner's container, so the default
+    // placement only picks cells that EXIST in the region disk (`u16::MAX` for an
+    // unbounded surface). Ignored when `macro_zone != 0` (explicit cell).
+    distance: u16,
 ) -> Result<(), String> {
     let now_ms = cards::effective_now_ms(ctx, client_time_ms)?;
 
     // Default placement: inventory cards in their owner's bucket; everything else
-    // in its surface band's (0,0) cell. An explicit `macro_zone` override wins.
+    // in its surface band's zone. Snap to the first UNOCCUPIED tile (one card per
+    // tile — every surface is a uniform hex grid), so a loadout spawned into one
+    // inventory spreads across cells instead of stacking on (0,0). An explicit
+    // `macro_zone` override (the caller already chose the cell) wins.
     let (macro_zone, micro) = if macro_zone != 0 {
         (macro_zone, cards::Micro::snap(q, r))
-    } else if surface == crate::packed::INVENTORY_LAYER {
-        (
-            crate::packed::pack_macro_zone_full(owner_id, crate::packed::INVENTORY_LAYER, 0, 0),
-            cards::Micro::snap(0, 0),
-        )
     } else {
-        (crate::packed::pack_macro_zone_full(0, surface, 0, 0), cards::Micro::snap(0, 0))
+        let owner = if surface == crate::packed::INVENTORY_LAYER { owner_id } else { 0 };
+        let zone = crate::packed::pack_macro_zone_full(owner, surface, 0, 0);
+        let (fq, fr) = cards::first_free_cell(ctx, zone, distance, now_ms);
+        (zone, cards::Micro::snap(fq, fr))
     };
 
     let card_id = cards::next_card_id(ctx);
