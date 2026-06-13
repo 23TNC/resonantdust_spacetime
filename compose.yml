@@ -4,7 +4,10 @@ networks:
 
 services:
   start:
-    image: clockworklabs/spacetime:latest
+    # Pinned to v2.3.0 to match the modules/gate/client wire+ABI. `latest`
+    # currently resolves to 2.5.0, which spins at 99% CPU on `start` and never
+    # initializes — do not float this tag.
+    image: clockworklabs/spacetime:v2.3.0
     networks:
       - resonantdust
     ports:
@@ -13,10 +16,16 @@ services:
       - ./keys:/etc/spacetimedb
       - ./config:/home/spacetime/.config/spacetime
       - ./data:/home/spacetime/.local/share/spacetime/data
-      - ../content:/workspace/server/modules/shard/content
-      - ../content:/workspace/server/modules/players/content
       - ./server:/workspace/server
-      - ../gateway:/workspace/gateway
+      # `spacetime publish` (st publish/republish/delete) compiles the module
+      # INSIDE this container, so it needs the shared workspace mounted — modules
+      # path-ref ../../../shared/{codec,state}. (Missing here broke all publishing
+      # after the shared lift-out.) No `../content` mount: no module path-deps the
+      # content crate anymore (the packed/valid_at helpers moved to shared/codec;
+      # content/DSL is a gate-runtime concern now). No `../gateway` mount either:
+      # modules don't depend on the gateway — only the `bindings` service writes
+      # there.
+      - ../shared:/workspace/shared
     working_dir: /workspace/server
     command:
       - start
@@ -27,33 +36,28 @@ services:
       - /etc/spacetimedb/id_ecdsa.pub
 
   # Per-module wasm build. `bin/st build [<module>]` invokes this with
-  # `--workdir /workspace/server/modules/<module>` so `cargo build`
-  # targets the right crate. The `../content` mount is shard-specific —
-  # chat has no `resonantdust-content` path-dep today, so it simply
-  # ignores the mount target's absence.
+  # `--workdir /workspace/server/modules/<module>` so `cargo build` targets the
+  # right crate. Only the shared workspace is mounted — modules path-ref
+  # ../../../shared/{codec,state} and nothing else from the repo.
   build:
-    image: clockworklabs/spacetime:latest
+    image: clockworklabs/spacetime:v2.3.0
     volumes:
       - ./server:/workspace/server
-      - ../content:/workspace/server/modules/shard/content
-      - ../content:/workspace/server/modules/players/content
       - ../shared:/workspace/shared
-      - ../gateway:/workspace/gateway
     working_dir: /workspace/server
     command:
       - build
 
   # Per-module Rust bindings codegen for the gateway. `bin/st build` invokes
   # `generate-bindings.sh <module>`, which fans out the spacetime generate
-  # call per module path. Output lands under `gateway/src/bindings/<module>/`.
+  # call per module path. Output lands under `gateway/src/bindings/<module>/`,
+  # so this is the one service that bind-mounts `../gateway`.
   # (TS bindings were dropped — the live `view` client carries its own minimal
   # row types; only the legacy pixijs client consumed generated TS.)
   bindings:
-    image: clockworklabs/spacetime:latest
+    image: clockworklabs/spacetime:v2.3.0
     volumes:
       - ./server:/workspace/server
-      - ../content:/workspace/server/modules/shard/content
-      - ../content:/workspace/server/modules/players/content
       - ../shared:/workspace/shared
       - ../gateway:/workspace/gateway
     working_dir: /workspace/server

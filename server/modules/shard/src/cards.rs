@@ -276,17 +276,19 @@ pub fn latest(ctx: &ReducerContext, card_id: u32) -> Option<Card> {
 ///    through (since `ctx.timestamp` includes the inbound `δ_out`
 ///    that the client couldn't yet have observed). Anything further
 ///    back is rejected as `time_drift:client_behind`.
-///  - **Server forward-grace:** the server accepts `client_time_ms` up
-///    to `TIME_DRIFT_BUFFER_MS` ahead of its own clock. Beyond that the
-///    server rejects as `time_drift:client_ahead`. Inside the window
-///    the server uses `min(client, server)` for game logic, so any
-///    forward overshoot just degrades to using server-time directly.
+///  - **Server forward-grace:** NONE. The client runs ≥1.5s behind true
+///    server time (`client_delay`), so a `client_time_ms` ahead of the
+///    server's clock is never legitimate jitter — it's genuine skew, and
+///    accepting it would stamp the row in the server's future where a
+///    correctly-clocked observer can't see it yet (the bug that left
+///    neighbour regions un-materialized). So ANY ahead is rejected as
+///    `time_drift:client_ahead`; the client re-seats its clock and
+///    re-requests (it never clamps — a future stamp is a real signal).
 ///
-/// 2000ms covers ~3% server-clock drag (observed in WSL2 / Docker
-/// throttling) over recipes up to ~67 seconds. If longer-duration
-/// content surfaces or the drift baseline worsens, this constant is
-/// the single knob.
-pub const TIME_DRIFT_BUFFER_MS: u64 = 2_000;
+/// Set to 0: there is no forward window. (Back-grace is the separate
+/// `BACKWARD_GRACE_MS` + `MAX_RTT_MS`.) This is the single forward knob —
+/// it must stay 0 unless the client's behind-clock invariant changes.
+pub const TIME_DRIFT_BUFFER_MS: u64 = 0;
 
 /// Maximum round-trip network latency the time-discipline contract
 /// tolerates. Used by [`effective_now_ms`] as additional back-grace

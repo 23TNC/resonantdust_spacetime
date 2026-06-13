@@ -30,10 +30,12 @@ pub struct GcSchedule {
     pub scheduled_at: ScheduleAt,
 }
 
-/// Module init — runs once on fresh publish. Seeds the recurring GC
-/// schedule. Idempotent: skips if a row already exists.
+/// Module init — runs once on fresh publish. Seeds the server-side system
+/// accounts (the developer dev account at a reserved id with content-author) and
+/// the recurring GC schedule. Idempotent: each seed skips if it already exists.
 #[reducer(init)]
 pub fn init(ctx: &ReducerContext) {
+    crate::players::seed_system_players(ctx);
     if ctx.db.gc_schedule().iter().next().is_some() {
         return;
     }

@@ -48,6 +48,15 @@ pub const MAX_PLAYER_NAME_LEN: usize = 64;
 /// start at `FIRST_PLAYER_ID` and go up.
 pub const FIRST_PLAYER_ID: u32 = 1024;
 
+/// The in-app developer account. It logs in by this name (matching the client's
+/// `DEVELOPER_NAME`) but lives at a RESERVED id ([`DEVELOPER_ID`], `< FIRST_PLAYER_ID`)
+/// rather than a normal `1024+` player id, and is provisioned with `content-author`
+/// pre-granted so the editor can author content with no out-of-band grant. It's
+/// the one reserved-range name a human may claim.
+pub const DEVELOPER_NAME: &str = "Developer";
+/// Reserved id for the [`DEVELOPER_NAME`] account.
+pub const DEVELOPER_ID: u32 = 512;
+
 /// Public player identity row. Other clients mirror this table for
 /// name lookups; keep it narrow so per-player private state
 /// (entitlements, settings) lives in `PlayerProfile` instead.
@@ -326,6 +335,41 @@ pub fn provision_player(ctx: &ReducerContext, name: String, time_ms: u64) -> u32
         data_shard: crate::DATA_SHARD,
     });
     new_id
+}
+
+/// Provision the [`DEVELOPER_NAME`] account at its reserved [`DEVELOPER_ID`] with
+/// the `content-author` capability pre-granted. Unlike [`provision_player`] it
+/// uses a FIXED reserved id (not `next_player_id`) and starts authorized, so the
+/// in-app editor authors content with no out-of-band grant. Returns `DEVELOPER_ID`.
+pub fn provision_developer(ctx: &ReducerContext, time_ms: u64) -> u32 {
+    let flags = (PERM_CONTENT_AUTHOR as u32) << PLAYER_FLAG_PERMS_SHIFT;
+    write_at(
+        ctx,
+        Player {
+            valid_at: 0,
+            data_shard: CARD_SHARD,
+            player_id: DEVELOPER_ID,
+            name: DEVELOPER_NAME.to_string(),
+            last_login_secs: 0,
+            flags,
+        },
+        time_ms,
+    );
+    ctx.db.player_profiles().insert(PlayerProfile {
+        player_id: DEVELOPER_ID,
+        data_shard: crate::DATA_SHARD,
+    });
+    DEVELOPER_ID
+}
+
+/// Seed the server-side system accounts. Called from the module `#[init]` reducer
+/// (runs once on a fresh publish), so reserved-range accounts exist before any
+/// human logs in. Idempotent — skips any that already exist. Today: the developer
+/// dev account at [`DEVELOPER_ID`] with content-author.
+pub fn seed_system_players(ctx: &ReducerContext) {
+    if latest(ctx, DEVELOPER_ID).is_none() {
+        provision_developer(ctx, now_ms(ctx));
+    }
 }
 
 // Insert a brand-new player at the given `time_ms`. valid_at is
@@ -611,7 +655,10 @@ pub fn claim_or_login(
             // ops. `next_player_id` already starts above the reserve,
             // so this branch is the only entry point that could resolve
             // to a reserved id (via name lookup of a server-seeded row).
-            if player.player_id < FIRST_PLAYER_ID {
+            // The developer dev account is the one reserved-range name a human may
+            // claim (a fixed id + pre-granted content-author); every other reserved
+            // account stays server-internal.
+            if player.player_id < FIRST_PLAYER_ID && name != DEVELOPER_NAME {
                 return Err(format!(
                     "player name {:?} is reserved",
                     name
@@ -622,8 +669,13 @@ pub fn claim_or_login(
         None => {
             // Shared new-player provisioning (id + Player row + profile). The
             // client connects to the assigned card shard and calls `spawn_soul`
-            // there to mint the player_soul if it owns none yet.
-            provision_player(ctx, name, now_ms)
+            // there to mint the player_soul if it owns none yet. The developer is
+            // provisioned at its reserved id with content-author instead.
+            if name == DEVELOPER_NAME {
+                provision_developer(ctx, now_ms)
+            } else {
+                provision_player(ctx, name, now_ms)
+            }
         }
     };
 

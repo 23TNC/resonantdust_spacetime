@@ -1,0 +1,44 @@
+# Remote deploy compose for a Lightsail (or any remote-daemon) spacetimedb host.
+#
+# Differs from compose.yml deliberately: NO source mounts and NO build/bindings
+# services. The instance is too small to compile the shard workspace in-container
+# (~2GB RAM), so modules are built locally and published as prebuilt wasm over
+# the wire (SSH tunnel to :3000). This server only needs to *run* — its keys,
+# CLI config, and DB data live in named volumes managed by the remote daemon, so
+# there are no host paths that would (mis)resolve on the remote filesystem.
+#
+# Usage (from the laptop, driving the remote daemon):
+#   ST_DOCKER_CONTEXT=lightsail ST_COMPOSE=spacetime/deploy.yml bin/st up
+#   ST_DOCKER_CONTEXT=lightsail ST_COMPOSE=spacetime/deploy.yml bin/st logs -f
+# One-time prep (network + fresh JWT keys) is documented alongside the standup.
+networks:
+  resonantdust:
+    external: true
+
+volumes:
+  spacetime-keys:
+  spacetime-config:
+  spacetime-data:
+
+services:
+  start:
+    # Pinned to match the local dev server (2.3.0). `latest` currently resolves
+    # to 2.5.0, whose `start` spins at 99% CPU here and never initializes — and
+    # would mismatch the wire/ABI the modules, gate, and client are built for.
+    image: clockworklabs/spacetime:v2.3.0
+    restart: unless-stopped
+    networks:
+      - resonantdust
+    ports:
+      - "3000:3000"
+    volumes:
+      - spacetime-keys:/etc/spacetimedb
+      - spacetime-config:/home/spacetime/.config/spacetime
+      - spacetime-data:/home/spacetime/.local/share/spacetime/data
+    command:
+      - start
+      - --listen-addr=0.0.0.0:3000
+      - --jwt-priv-key-path
+      - /etc/spacetimedb/id_ecdsa
+      - --jwt-pub-key-path
+      - /etc/spacetimedb/id_ecdsa.pub
