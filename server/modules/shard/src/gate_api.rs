@@ -10,7 +10,7 @@ use spacetimedb::{reducer, ReducerContext, Table};
 
 use crate::cards;
 use crate::flags::state_flags;
-use crate::packed::with_surface;
+use crate::packed::{is_tag, with_surface};
 use crate::pending_actions;
 
 /// Hold-family selector shared with the gateway. Keep in sync with the
@@ -199,8 +199,13 @@ pub fn apply_action(
     // Per-created-card destination container disk radius (tiles), so placement
     // only picks cells that exist in the region disk. `u16::MAX` = unbounded.
     create_distances: Vec<u16>,
-    // Per-created-card initial stock u32 (gate-computed `@define` defaults).
+    // Per-created-card initial stock u32 (gate-computed `@define` defaults with
+    // any same-plan handle stock-writes folded in).
     create_stocks: Vec<u32>,
+    // Per-created-card transient tag (0 = none): this card's handle, registered
+    // `tag -> minted id` so a later sibling that nests in it (owner_id == tag)
+    // resolves to the real id. Creates arrive parent-before-child.
+    create_tags: Vec<u8>,
     unlock_targets: Vec<u32>,
     unlock_blueprints: Vec<u16>,
     stat_souls: Vec<u32>,
@@ -239,8 +244,32 @@ pub fn apply_action(
         cards::update_with_at(ctx, id, completion_ms, |c| c.flags |= dead)
             .ok_or_else(|| format!("apply_action: destroy card {id} not found"))?;
     }
+    // Maps a created card's transient tag to its minted id, so a sibling that
+    // nests in it (owner_id carrying the tag) resolves to the real owner. Built
+    // as the loop runs; creates arrive parent-before-child, so a referenced
+    // tag is always registered before the child that uses it.
+    let mut tag_to_id: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
     for i in 0..create_defs.len() {
         let new_id = cards::next_card_id(ctx);
+        if let Some(&tag) = create_tags.get(i) {
+            if tag != 0 {
+                tag_to_id.insert(tag as u32, new_id);
+            }
+        }
+        // Owner may be a transient tag (a card minted earlier in this batch). A
+        // tag owner resolves to its id and the inventory zone is rebuilt from the
+        // real owner (the gate could only pack the tag); placement is unbounded
+        // into that fresh, empty inventory. A real owner + zone pass through.
+        let raw_owner = create_owners[i];
+        let (owner, raw_zone, dist) = if is_tag(raw_owner) {
+            let resolved = *tag_to_id
+                .get(&raw_owner)
+                .ok_or_else(|| format!("apply_action: create owner tag {raw_owner} unresolved (ordering?)"))?;
+            let zone = ((resolved as u64) << 32) | (create_macro_zones[i] & 0xFFFF_FFFF);
+            (resolved, zone, u16::MAX)
+        } else {
+            (raw_owner, create_macro_zones[i], create_distances.get(i).copied().unwrap_or(u16::MAX))
+        };
         // Place each product on the first UNOCCUPIED cell of its target zone —
         // one card per tile — not a hardcoded (0,0) where every recipe output
         // would pile into one overlapping stack. Resolved @completion so the
@@ -248,8 +277,7 @@ pub fn apply_action(
         // earlier in this same batch (each create is visible to the next read
         // in-transaction). Same one-per-tile rule as `create_card`; this path
         // mints loose cards (stacked outputs are placed elsewhere).
-        let zone = with_surface(create_macro_zones[i], create_surfaces[i]);
-        let dist = create_distances.get(i).copied().unwrap_or(u16::MAX);
+        let zone = with_surface(raw_zone, create_surfaces[i]);
         let (fq, fr) = cards::first_free_cell(ctx, zone, dist, completion_ms);
         cards::create_at(
             ctx,
@@ -257,7 +285,7 @@ pub fn apply_action(
             completion_ms,
             zone,
             cards::Micro::snap(fq, fr),
-            create_owners[i],
+            owner,
             create_defs[i],
             /* flags */ 0,
             create_stocks.get(i).copied().unwrap_or(0),
