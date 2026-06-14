@@ -125,7 +125,7 @@ pub fn gc_sweep(ctx: &ReducerContext, _row: GcSchedule) -> Result<(), String> {
     sweep_cards(ctx, now_ms);
     sweep_souls(ctx);
     // Region-DB tables. Prior-version reaps; no-op where empty (a card DB).
-    sweep_regions(ctx);
+    // `regions` is current-value (one row per macro_region) — nothing to reap.
     sweep_zones(ctx);
     sweep_card_shards(ctx);
 
@@ -353,31 +353,6 @@ fn sweep_tile_card_demotions(ctx: &ReducerContext, now_ms: u64) {
                 }
             }
         }
-    }
-}
-
-/// `regions` sweep — prior-version reap, keyed on `macro_region`.
-fn sweep_regions(ctx: &ReducerContext) {
-    let mut latest_by_id: HashMap<u64, u64> = HashMap::new();
-    for r in ctx.db.regions().iter() {
-        latest_by_id
-            .entry(r.macro_region)
-            .and_modify(|m| {
-                if r.valid_at > *m {
-                    *m = r.valid_at;
-                }
-            })
-            .or_insert(r.valid_at);
-    }
-
-    let mut to_delete: Vec<u64> = Vec::new();
-    for r in ctx.db.regions().iter() {
-        if latest_by_id.get(&r.macro_region) != Some(&r.valid_at) {
-            to_delete.push(r.valid_at);
-        }
-    }
-    for v in to_delete {
-        ctx.db.regions().valid_at().delete(v);
     }
 }
 

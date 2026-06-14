@@ -1,10 +1,20 @@
 //! Regions — coarse spawn-gating over the zone grid.
 //!
-//! A `Region` governs a `REGION_SIZE × REGION_SIZE` (8×8 = 64) block of zones.
+//! A `Region` governs a `REGION_SIZE × REGION_SIZE` (7×7 = 49) block of zones.
 //! It carries two 64-bit fields over its constituent zones: `zone_presence`
 //! (this zone *may* be spawned) and `zone_available` (this zone *has* been
 //! spawned). The `request_zone` reducer is the on-demand spawn gateway: it
 //! spawns a zone only if its region permits it and it isn't already spawned.
+//!
+//! **Current-value, not version-history.** Unlike `zones`/`cards` (which version
+//! on the client's buffered clock so rows appear on the client timeline), a region
+//! is a single mutable row keyed by `macro_region`. `zone_available` is a plain
+//! monotonic bit-accumulator: set bit `i` when zone `i`'s row is created, clear it
+//! if that zone is ever removed; to stop a zone regenerating, clear its
+//! `zone_presence` bit. No `valid_at`, no forward-propagation, no GC. A zone whose
+//! row is future-stamped can read `available` before it "exists" on the client
+//! clock — that's fine: the client just won't re-request a zone that's already
+//! coming.
 //!
 //! This replaces the old eager radius-2 disk seed (`utilities::bootstrap` →
 //! `world_gen::generate_forest_terrain`). The world starts empty-but-spawnable:
@@ -14,10 +24,8 @@
 use spacetimedb::{reducer, table, ReducerContext, Table};
 
 use crate::packed::{
-    owner_of, pack_macro_region, pack_valid_at, pack_zone_definition, region_of_zone, surface_of,
-    valid_at_time, WORLD_LAYER,
+    owner_of, pack_macro_region, pack_zone_definition, region_of_zone, surface_of, WORLD_LAYER,
 };
-use crate::sequence;
 use crate::zones;
 
 /// Tile card_type (`content/cards/types.json` → `tile: 7`) — the Zone row's
@@ -27,13 +35,11 @@ const TILE_ZONE_TYPE: u8 = 7;
 
 #[table(accessor = regions, public)]
 pub struct Region {
-    #[primary_key]
-    pub valid_at: u64,
     /// Packed region key — same layout as `macro_zone`
     /// (`[card_id:u32 | surface:u8 | region_q:i12 | region_r:i12]`) but in
-    /// region units (1 region = 8 zones). Immutable identity (regions never
-    /// move), so there's no separate `region_id`; history versions share it.
-    #[index(btree)]
+    /// region units (1 region = 7 zones). Immutable identity (regions never
+    /// move) AND the primary key: one current-value row per region.
+    #[primary_key]
     pub macro_region: u64,
     /// Bit `i` set = the zone at this region's slot `i` MAY be spawned. Slot
     /// `i` ↔ zone `(region_q*8 + i%8, region_r*8 + i/8)` (see `region_of_zone`).
@@ -82,37 +88,9 @@ fn presence_for_disk(macro_region: u64, distance: u16) -> u64 {
     bits
 }
 
-fn now_ms(ctx: &ReducerContext) -> u64 {
-    (ctx.timestamp.to_micros_since_unix_epoch() / 1_000) as u64
-}
-
-/// Latest version row for `macro_region` (largest `valid_at` time), or `None`.
-pub fn latest_for(ctx: &ReducerContext, macro_region: u64) -> Option<Region> {
-    ctx.db
-        .regions()
-        .macro_region()
-        .filter(macro_region)
-        .max_by_key(|r| valid_at_time(r.valid_at))
-}
-
-/// Write a region version row stamped at `time_ms`. Mirrors `zones::write_at`:
-/// "last write at this (macro_region, time_ms) wins" — same-ms rows for this
-/// region are deleted first so they don't accumulate under the sequence PK.
-fn write_at(ctx: &ReducerContext, mut region: Region, time_ms: u64) -> Region {
-    let macro_region = region.macro_region;
-    let stale: Vec<u64> = ctx
-        .db
-        .regions()
-        .macro_region()
-        .filter(macro_region)
-        .filter(|r| valid_at_time(r.valid_at) == time_ms)
-        .map(|r| r.valid_at)
-        .collect();
-    for v in stale {
-        ctx.db.regions().valid_at().delete(v);
-    }
-    region.valid_at = pack_valid_at(time_ms, sequence::next_sequence(ctx));
-    ctx.db.regions().insert(region)
+/// The current row for `macro_region`, or `None` if no region governs it yet.
+pub fn get_region(ctx: &ReducerContext, macro_region: u64) -> Option<Region> {
+    ctx.db.regions().macro_region().find(macro_region)
 }
 
 /// Seed the world's origin region — `(0, 0)` on `WORLD_LAYER`, owner `0` — with
@@ -120,34 +98,31 @@ fn write_at(ctx: &ReducerContext, mut region: Region, time_ms: u64) -> Region {
 /// (`zone_available = 0`). Idempotent: no-op if the row already exists.
 pub fn seed_world_region(ctx: &ReducerContext) {
     let macro_region = pack_macro_region(0, WORLD_LAYER, 0, 0);
-    if latest_for(ctx, macro_region).is_some() {
+    if get_region(ctx, macro_region).is_some() {
         return;
     }
-    write_at(
-        ctx,
-        Region {
-            valid_at: 0,
-            macro_region,
-            zone_presence: u64::MAX,
-            zone_available: 0,
-            distance: u16::MAX,
-        },
-        now_ms(ctx),
-    );
+    ctx.db.regions().insert(Region {
+        macro_region,
+        zone_presence: u64::MAX,
+        zone_available: 0,
+        distance: u16::MAX,
+    });
 }
 
 /// Ensure a region governs `macro_zone`, creating it on first need. No-op if a
-/// region already exists for the derived `macro_region`. Otherwise write a new
-/// region with surface-keyed presence (`zone_available = 0` — nothing spawned
-/// yet); the client's region gate then promotes the region and requests the
-/// zone. This is the client-driven, self-healing path that replaces the old
-/// in-`spawn_soul` inventory-region seed (now a cross-DB call the gate relays).
+/// region already exists for the derived `macro_region`. Otherwise insert one with
+/// surface-keyed presence (`zone_available = 0` — nothing spawned yet); the
+/// client's region gate then requests the zones it wants. This is the
+/// client-driven path that replaces the old in-`spawn_soul` inventory-region seed
+/// (now a cross-DB call the gate relays).
 ///
-/// Presence is the disk of radius `distance` (tiles) around the owner-origin
-/// tile `(0,0)` — see [`presence_for_disk`]. Uniform across surfaces: the gate
-/// supplies `distance` (`inventory − 1` for a container, `u16::MAX` for the
-/// world, which lights every bit). `client_time_ms` stamps the row on the
-/// client's buffered timeline, same as `request_zone`.
+/// Presence is the disk of radius `distance` (tiles) around the owner-origin tile
+/// `(0,0)` — see [`presence_for_disk`]. Uniform across surfaces: the gate supplies
+/// `distance` (`inventory − 1` for a container, `u16::MAX` for the world, which
+/// lights every bit). `client_time_ms` is unused now that the region is
+/// current-value, but its NAME is part of the reducer's arg schema — the gate
+/// sends args by name, so renaming it (even to `_client_time_ms`) breaks the call
+/// with "unknown reducer argument". It stays `client_time_ms`.
 #[reducer]
 pub fn ensure_region(
     ctx: &ReducerContext,
@@ -155,39 +130,53 @@ pub fn ensure_region(
     macro_zone: u64,
     distance: u16,
 ) -> Result<(), String> {
+    let _ = client_time_ms; // unused: region is current-value, not timeline-stamped
     let (macro_region, _bit) = region_of_zone(macro_zone);
-    if latest_for(ctx, macro_region).is_some() {
+    if get_region(ctx, macro_region).is_some() {
         return Ok(());
     }
-    let zone_presence = presence_for_disk(macro_region, distance);
-    let now = crate::cards::effective_now_ms(ctx, client_time_ms)?;
-    write_at(
-        ctx,
-        Region {
-            valid_at: 0,
-            macro_region,
-            zone_presence,
-            zone_available: 0,
-            distance,
-        },
-        now,
-    );
+    ctx.db.regions().insert(Region {
+        macro_region,
+        zone_presence: presence_for_disk(macro_region, distance),
+        zone_available: 0,
+        distance,
+    });
     Ok(())
 }
 
-/// Set `zone_available` bit `bit` on the latest version of `macro_region`,
-/// writing a new version row stamped at `time_ms`. No-op if the region is gone
-/// or the bit is already set.
-fn set_available_bit(ctx: &ReducerContext, macro_region: u64, bit: u8, time_ms: u64) {
-    let Some(mut region) = latest_for(ctx, macro_region) else {
+/// Set `zone_available` bit `bit` for `macro_region`, effective from `time_ms`
+/// ONWARD. No-op if no region governs the zone at/before `time_ms`.
+///
+/// Set `zone_available` bit `bit` for `macro_region` — call when a zone's row is
+/// created. Current-value: read the one region row, OR the bit, update in place.
+/// No-op if no region governs the zone or the bit is already set.
+fn set_available_bit(ctx: &ReducerContext, macro_region: u64, bit: u8) {
+    let mask = 1u64 << bit;
+    let Some(mut region) = get_region(ctx, macro_region) else {
         return;
     };
-    let mask = 1u64 << bit;
     if region.zone_available & mask != 0 {
         return;
     }
     region.zone_available |= mask;
-    write_at(ctx, region, time_ms);
+    ctx.db.regions().macro_region().update(region);
+}
+
+/// Clear `zone_available` bit `bit` — the symmetric counterpart to
+/// [`set_available_bit`], for when a zone's row is removed. (To stop the zone from
+/// regenerating, also clear its `zone_presence` bit.) Unused until a zone-removal
+/// path exists; kept so the create/remove pair stays visible and symmetric.
+#[allow(dead_code)]
+fn clear_available_bit(ctx: &ReducerContext, macro_region: u64, bit: u8) {
+    let mask = 1u64 << bit;
+    let Some(mut region) = get_region(ctx, macro_region) else {
+        return;
+    };
+    if region.zone_available & mask == 0 {
+        return;
+    }
+    region.zone_available &= !mask;
+    ctx.db.regions().macro_region().update(region);
 }
 
 /// Request that the zone at `macro_zone` be spawned. Region-gated and
@@ -220,7 +209,7 @@ pub fn request_zone(
     let (macro_region, bit) = region_of_zone(macro_zone);
     let mask = 1u64 << bit;
 
-    let Some(region) = latest_for(ctx, macro_region) else {
+    let Some(region) = get_region(ctx, macro_region) else {
         return Ok(()); // no region governs this zone
     };
 
@@ -236,8 +225,9 @@ pub fn request_zone(
         return Ok(());
     }
 
-    // About to write — resolve the client-aligned timestamp (rejects on
-    // excessive drift) and stamp every new row in this reducer from it.
+    // About to write the zone row — resolve the client-aligned timestamp (rejects
+    // on excessive drift). Only the ZONE row is timeline-stamped; the region's
+    // `available` bit is current-value (set below, untimed).
     let now = crate::cards::effective_now_ms(ctx, client_time_ms)?;
 
     if !row_exists {
@@ -276,6 +266,6 @@ pub fn request_zone(
         );
     }
 
-    set_available_bit(ctx, macro_region, bit, now);
+    set_available_bit(ctx, macro_region, bit);
     Ok(())
 }
