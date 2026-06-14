@@ -16,7 +16,7 @@ databases (SpacetimeDB modules can't write cross-DB — the gate bridges).
 ## One binary, two databases
 The same wasm is published to BOTH database families, and a card's `card_id`
 encodes which one it belongs to (top bit = `card_db`, via
-[`content/src/packed.rs`](../../../../content/src/packed.rs) `pack_card_id` /
+[`shared/codec/src/packed.rs`](../../../../shared/codec/src/packed.rs) `pack_card_id` /
 `card_db_of`) so the gate routes reads/writes with no lookup:
 
 - **cards DB** (`resonantdust-<env>-cards-N`) — owner cards + souls (`cards`,
@@ -32,13 +32,15 @@ gate / `bin/st` does this). **Region-only tables are simply empty on a cards DB
 and vice-versa** — the GC sweep runs the union of both and no-ops where empty.
 
 ## Build & iterate
-- **Always** use `bin/st build shard` (or `bin/st build` for every module). The
-  wrapper runs [`content/gen-ids.py`](../../../../content/gen-ids.py), then `cargo
-  build --release --target wasm32-unknown-unknown` in the build container with
-  workdir `/workspace/server/modules/shard`, then regenerates TS + gateway
-  bindings into [`pixijs/.../bindings/shard/`](../../../../pixijs/src/server/spacetime/bindings/shard/)
-  and `gateway/src/bindings/shard/`. Don't reach for `cargo`, host `spacetime`,
-  or ad-hoc `docker compose run`.
+- **Always** use `bin/st build shard` (or `bin/st build` for every module). It
+  runs `cargo build --release --target wasm32-unknown-unknown` in the build
+  container (workdir `/workspace/server/modules/shard`), then regenerates the
+  gateway bindings into `gateway/src/bindings/shard/`. (The old
+  `content/gen-ids.py` step is gone — def ids are content-derived in the loader,
+  not pre-generated. The client is Rust now: it links `codec` directly, so there
+  are no TS shard bindings to regenerate.) Don't reach for `cargo`, host
+  `spacetime`, or ad-hoc `docker compose run`. `rustfmt` is absent in the image —
+  the "could not format" warning is cosmetic, files are still written.
 - **No DB is named `shard`.** `bin/st re cards` and `bin/st re regions` both
   publish *this* module to their respective DBs (see `bin/st` `DB_SOURCE`); the
   regions one also seeds `ShardIdentity`. `bin/redeploy` fans one `shard` source
@@ -54,7 +56,7 @@ and vice-versa** — the GC sweep runs the union of both and no-ops where empty.
 | [src/cards.rs](src/cards.rs) | The `cards` public table + the **canonical bitemporal write primitives**: `latest` / `prior_at` / `delete_at`, `create(_at)` / `update_with(_at)` / `write_at`. **`write_at` is the single write entry point** — every write fires `souls::on_card_write`, forward-propagates `flags_state` (`propagate_flag_diff_forward`), and cascades to deferred followers (`cascade_to_state_3_followers`). The `acquire_<name>` / `release_<name>` / `propagate_<name>_forward` refcount triplets (`position_hold` / `slot_share` / `drop_hold` / `slot_hold` / `touch` / `server`) via `decl_count_ctx!`. `next_card_id` (private `card_id_counter`) + the private `ShardIdentity` table and `identity` / `set_identity`. Owner-walk helpers `owning_player` / `owning_soul`. **Owns the time-discipline contract:** `TIME_DRIFT_BUFFER_MS` / `BACKWARD_GRACE_MS`, `WORLD_PLAYER_ID`, `now_ms`, `effective_now_ms`. |
 | [src/tiles.rs](src/tiles.rs) | Tile-card helpers over the canonical `cards` primitives: `find_or_create_tile_card` (promote a zone tile → `card_type = 7` card), `find_tile_card_at`, `set_tile_stock`, `acquire_tile_hold` / `release_tile_hold` (the exclusive-cut CAS is in `acquire_tile_hold`), `tile_full_view`. Replaced the old `regions` module's drifted partial copy of the write primitives — tile-cards now get forward-prop for free. |
 | [src/zones.rs](src/zones.rs) | `zones` public table (history-style). `latest_for(macro_zone)`, `next_zone_id`. Tile slots `[def_id:u12 \| stock0:u2 \| stock1:u2]` in `t0..t15`. Setters `set_tile_at`, `set_tile_stock_at`, and `fold_tiles_at` (batched per-zone fold used by GC demotion, with per-cell forward-prop). |
-| [src/regions.rs](src/regions.rs) | `regions` public table + the spawn-gating reducers `ensure_region` (client-driven, self-healing region declaration) and `request_zone` (region-gated on-demand zone spawn). **Worldgen moved to the gate** — the gate supplies the tile bytes; this module just gates and stores. |
+| [src/regions.rs](src/regions.rs) | `regions` table + the spawn-gating reducers `ensure_region` (client-driven region declaration) and `request_zone` (region-gated on-demand zone spawn). **`regions` is CURRENT-VALUE** — one mutable row per `macro_region` keyed by `macro_region` (NOT version-history; no `valid_at`). `zone_available` is a plain monotonic bit-accumulator: `set_available_bit` `\|=` on zone create, `clear_available_bit` `&=` on removal; clear `zone_presence` to stop regen. **Worldgen moved to the gate** — it supplies the tile bytes; this module just gates and stores. |
 | [src/card_shards.rs](src/card_shards.rs) | `card_shards` public versioned subscription index — per-`data_shard` refcount of cards in this region shard, so a client subscribing to a region DB learns which cards shards to also subscribe to. Gateway-maintained (`acquire_card_shard` / `release_card_shard`), derived from the validated recipe. |
 | [src/souls.rs](src/souls.rs) | `souls` public follower table (one row per soul card; mirrors position + packs corpus/anima/sollertia/aether counters into `stats`/`fatigued`/`injured`) + public `soul_privates` (`blueprints_0` discovery bitfield, `active_blueprints`). **`on_card_write` is the single sync point** — `cards::write_at` calls it to mirror soul position, apply faculty-card stat deltas, and maintain blueprint state. `apply_stat` is the gate-driven soul-stat delta path. |
 | [src/blueprints.rs](src/blueprints.rs) | `request_blueprint` — soul-scope blueprint placement (discovery bit on `SoulPrivate.blueprints_0`, cap from the soul def, placed card owned by the soul). |
@@ -62,11 +64,11 @@ and vice-versa** — the GC sweep runs the union of both and no-ops where empty.
 | [src/movement.rs](src/movement.rs) | `move_soul(client_time_ms, soul_id, path)` — client submits a precomputed path; server validates per-step adjacency/traversability/length and writes future-stamped soul rows. Tile lookups route through the tile-card-priority view. |
 | [src/utilities.rs](src/utilities.rs) | `spawn_soul` (mint a player-soul card + its loadout) and `add_card(client_time_ms, soul_card_id, card_key)` (inventory spawn for the caller's soul). |
 | [src/gate_api.rs](src/gate_api.rs) | **The gate's write surface — the coarse apply path.** `claim_pending` / `release_pending` (dedup), `apply_action` (cards DB) and `apply_action_tile` (region DB) — one coarse reducer per DB, see *Action pipeline*. `set_shard_identity` (deploy seed). Plus the shared `dispatch_hold` / `hold_field` helpers + the `stock_op` codes. |
-| [src/gc.rs](src/gc.rs) | Single recurring `gc_schedule` row + `gc_sweep` (every 10 min, seeded by `init`, which also seeds the world origin region). Runs the **union** of sweeps: card retention (prior-version reap + dead-row policy), souls, tile-card **demotion** (`sweep_tile_card_demotions` — folds at-rest tile-cards back into the zone, back-dated; see below), regions/zones/card_shards prior-version reaps. Each no-ops where its tables are empty. |
-| [src/flags.rs](src/flags.rs) | Canonical flag field-routing: `state_flags()` / `bk_flags()` lazily load every `cards_state` / `cards_bk` mask+shift+max from the content registry ([`content/cards/flags.json`](../../../../content/cards/flags.json)) into `OnceLock`. **Read flag values through these, never hardcoded shifts.** |
+| [src/gc.rs](src/gc.rs) | Single recurring `gc_schedule` row + `gc_sweep` (every 10 min, seeded by `init`, which also seeds the world origin region). Runs the **union** of sweeps: card retention (prior-version reap + dead-row policy), souls, tile-card **demotion** (`sweep_tile_card_demotions` — folds at-rest tile-cards back into the zone, back-dated; see below), zones/card_shards prior-version reaps. (`regions` is current-value — no version reap.) Each no-ops where its tables are empty. |
+| [src/flags.rs](src/flags.rs) | Canonical flag field-routing: `state_flags()` / `bk_flags()` lazily load every `cards_state` / `cards_bk` mask+shift+max from the shared **`resonantdust_codec::flags`** registry (the runtime source — the old `flags.json` is gone) into `OnceLock`. **Read flag values through these, never hardcoded shifts.** |
 | [src/pending_actions.rs](src/pending_actions.rs) | Private `pending_actions` dedup registry keyed on `hash(recipe_id, root, bindings)`. `install` / `is_in_flight` (via `claim_pending`); self-expires, orphan-reaped by GC. |
 | [src/sequence.rs](src/sequence.rs) | Private `sequence_counter` + `next_sequence()` u16. **Load-bearing for `valid_at`** — every history write asks for a fresh sequence to disambiguate same-ms PKs. |
-| [src/packed.rs](src/packed.rs) | Thin `pub use resonantdust_data::packed::*;` re-export. Source of truth + tests live in the shared crate. |
+| [src/packed.rs](src/packed.rs) | Thin `pub use resonantdust_codec::packed::*;` re-export. Source of truth + tests live in the shared `codec` crate. |
 
 ## Action pipeline (gate-validated, coarse-applied)
 There is **no `propose_action` reducer in this module** — the gate intercepts it,
@@ -98,8 +100,9 @@ There is no server-side action table — the action's state is the rows it stamp
 plus the private `pending_actions` dedup row (orphan-reaped by GC).
 
 ## The `valid_at` pattern
-`cards`, `zones`, `regions`, `souls`, `card_shards` (and `players` in its module)
-share one primary-key shape:
+`cards`, `zones`, `souls`, `card_shards` (and `players` in its module) share one
+primary-key shape. (`regions` is the exception — it's current-value, keyed by
+`macro_region`, no `valid_at`; see the `regions.rs` row above.)
 
 ```
 valid_at: u64 = (time_ms: u48 << 16) | sequence: u16
@@ -125,15 +128,16 @@ valid_at: u64 = (time_ms: u48 << 16) | sequence: u16
   flash — tile snaps to the stale pre-card zone, then to the new baseline a
   buffer-length later).
 
-Client mirror: [pixijs/src/server/data/ValidAtTable.ts](../../../../pixijs/src/server/data/ValidAtTable.ts).
+Client mirror: the Rust client core's bitemporal stores (`client/core/src/world.rs`
+`Cards` / `Zones`, current-at-`now` resolution).
 
 ## The `flags` columns
 `Card` carries two `u32` flag hosts: **`flags_state`** (what is true about the
 card; forward-propagated by `propagate_flag_diff_forward`) and **`flags_bk`**
 (bookkeeping — refcount holds + dirty/preserve markers + tile-card stock + the
 `micro_location` discriminator/stack fields; never bit-diff propagated). **Bit
-positions are pinned by [`content/cards/flags.json`](../../../../content/cards/flags.json)
-— that file is canonical.** Read every value through
+positions are pinned by the `resonantdust_codec::flags` registry — that's
+canonical (the old `flags.json` is retired).** Read every value through
 [`flags.rs`](src/flags.rs) `state_flags()` / `bk_flags()`, never hardcoded shifts.
 
 `flags_bk` refcounts (the holds the coarse apply path bumps): `position_hold_count`,
@@ -144,7 +148,7 @@ positions are pinned by [`content/cards/flags.json`](../../../../content/cards/f
 
 ## Surface bands
 `Card.surface` / `Zone.surface` is the `surface` byte of `macro_zone` (bits
-24-31). Constants in [content/src/packed.rs](../../../../content/src/packed.rs):
+24-31). Constants in [shared/codec/src/packed.rs](../../../../shared/codec/src/packed.rs):
 `1 = INVENTORY_LAYER` (soul bucket), `2 = PLAYER_INVENTORY_LAYER`,
 `63 = MINI_ZONE_LAYER`, `64.. = WORLD_LAYER`. The split at `>= 32` ("carries tile
 data") gates synthetic-hex derivation. `0` is the sentinel "absent."
