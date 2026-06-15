@@ -20,7 +20,7 @@ encodes which one it belongs to (top bit = `card_db`, via
 `card_db_of`) so the gate routes reads/writes with no lookup:
 
 - **cards DB** (`resonantdust-<env>-cards-N`) — owner cards + souls (`cards`,
-  `souls`, `soul_privates`). The hot card/soul state for the players assigned to it.
+  `souls`). The hot card/soul state for the players assigned to it.
 - **region DB** (`resonantdust-<env>-regions-N`) — world terrain + tile-cards
   (`zones`, `regions`, `card_shards`, and tile-cards in the same `cards` table).
 
@@ -58,8 +58,7 @@ and vice-versa** — the GC sweep runs the union of both and no-ops where empty.
 | [src/zones.rs](src/zones.rs) | `zones` public table (history-style). `latest_for(macro_zone)`, `next_zone_id`. Tile slots `[def_id:u12 \| stock0:u2 \| stock1:u2]` in `t0..t15`. Setters `set_tile_at`, `set_tile_stock_at`, and `fold_tiles_at` (batched per-zone fold used by GC demotion, with per-cell forward-prop). |
 | [src/regions.rs](src/regions.rs) | `regions` table + the spawn-gating reducers `ensure_region` (client-driven region declaration) and `request_zone` (region-gated on-demand zone spawn). **`regions` is CURRENT-VALUE** — one mutable row per `macro_region` keyed by `macro_region` (NOT version-history; no `valid_at`). `zone_available` is a plain monotonic bit-accumulator: `set_available_bit` `\|=` on zone create, `clear_available_bit` `&=` on removal; clear `zone_presence` to stop regen. **Worldgen moved to the gate** — it supplies the tile bytes; this module just gates and stores. |
 | [src/card_shards.rs](src/card_shards.rs) | `card_shards` public versioned subscription index — per-`data_shard` refcount of cards in this region shard, so a client subscribing to a region DB learns which cards shards to also subscribe to. Gateway-maintained (`acquire_card_shard` / `release_card_shard`), derived from the validated recipe. |
-| [src/souls.rs](src/souls.rs) | `souls` public follower table (one row per soul card; mirrors position + packs corpus/anima/sollertia/aether counters into `stats`/`fatigued`/`injured`) + public `soul_privates` (`blueprints_0` discovery bitfield, `active_blueprints`). **`on_card_write` is the single sync point** — `cards::write_at` calls it to mirror soul position, apply faculty-card stat deltas, and maintain blueprint state. `apply_stat` is the gate-driven soul-stat delta path. |
-| [src/blueprints.rs](src/blueprints.rs) | `request_blueprint` — soul-scope blueprint placement (discovery bit on `SoulPrivate.blueprints_0`, cap from the soul def, placed card owned by the soul). |
+| [src/souls.rs](src/souls.rs) | `souls` public follower table (one row per soul card; mirrors position + packs corpus/anima/sollertia/aether counters into `stats`/`fatigued`/`injured`). **`on_card_write` is the single sync point** — `cards::write_at` calls it to mirror soul position. `apply_stat` is the gate-driven soul-stat delta path. |
 | [src/place.rs](src/place.rs) | `place_card(client_time_ms, card_id, placement)` — unified place primitive (stack-onto-root in a direction, or loose-place at an address). Re-stamps descendants' `surface`/`macro_zone`; **never touches `owner_id`** (ownership ⊥ position). |
 | [src/movement.rs](src/movement.rs) | `move_soul(client_time_ms, soul_id, path)` — client submits a precomputed path; server validates per-step adjacency/traversability/length and writes future-stamped soul rows. Tile lookups route through the tile-card-priority view. |
 | [src/utilities.rs](src/utilities.rs) | `spawn_soul` (mint a player-soul card + its loadout) and `add_card(client_time_ms, soul_card_id, card_key)` (inventory spawn for the caller's soul). |
@@ -78,7 +77,7 @@ through two coarse reducers, **one per database, each one transaction**:
 - **`apply_action`** (cards DB) — for every bound card: acquire its masked hold
   **count** fields `@now_ms`, then release them + clear `pos_need`/`pos_want` +
   stamp `progress_style` `@completion_ms`; then the card-side effects (destroy /
-  create / unlock-blueprint / soul-stat). Holds arrive as a per-card **bitmask**
+  create / soul-stat). Holds arrive as a per-card **bitmask**
   (bit `i` = `hold_kind` `i`); the reducer still bumps the real refcount fields
   via the `acquire_*`/`release_*` helpers (forward-prop intact). A hold conflict
   returns `Err`, which **rolls the whole transaction back** (per-shard
@@ -172,7 +171,7 @@ server)` within asymmetric grace — back `BACKWARD_GRACE_MS = 10_000`, forward
 and threads `now_ms` everywhere via the `_at` write variants.
 
 - **Grace-applying** (client-invoked): `place_card`, `move_soul`, `add_card`,
-  `request_blueprint`, `ensure_region`, `request_zone`, `spawn_soul`.
+  `ensure_region`, `request_zone`, `spawn_soul`.
 - **Gate-stamped** (the coarse apply path): `apply_action` / `apply_action_tile`
   take explicit `now_ms` + `completion_ms` from the gate (which already resolved
   the action's clock) and trust them — authz is the gate's job.

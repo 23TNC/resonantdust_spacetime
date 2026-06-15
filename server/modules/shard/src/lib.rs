@@ -6,7 +6,6 @@
 // (`cards`/`souls`/holds) and the region surface (`zones`/`regions`/tile-cards)
 // share one canonical `Card` definition and one set of bitemporal write
 // primitives — the former `regions` module's drifted partial copy is gone.
-pub mod blueprints;
 pub mod card_shards;
 pub mod cards;
 pub mod flags;

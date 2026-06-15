@@ -1,7 +1,6 @@
-use spacetimedb::{reducer, ReducerContext, Table};
+use spacetimedb::{reducer, ReducerContext};
 
 use crate::cards;
-use crate::souls::{is_soul_card, soul_privates as _soul_privates_table, SoulPrivate};
 
 /// Generic card-creation primitive — the single explicit way to mint a card
 /// owned by something. The whole entity tree is built by **chaining** it, each
@@ -26,7 +25,7 @@ use crate::souls::{is_soul_card, soul_privates as _soul_privates_table, SoulPriv
 ///   `>= 0xFFF0`), so no `player_owned` flag is set here anymore.
 ///
 /// The card write triggers `souls::on_card_write`, which auto-creates the `Soul`
-/// row for soul cards; this also seeds an empty `SoulPrivate` for them.
+/// row for soul cards.
 /// **Authorization is the gateway's job** (this trusts its args) — a dev/seed +
 /// future-registration primitive, not the gameplay path (`propose_action`).
 #[reducer]
@@ -82,14 +81,6 @@ pub fn create_card(
         /* flags */ 0,
         stock,
     );
-    // Souls carry a private state row (blueprints); plain cards don't.
-    if is_soul_card(packed_definition) {
-        ctx.db.soul_privates().insert(SoulPrivate {
-            card_id,
-            blueprints_0: 0,
-            active_blueprints: 0,
-        });
-    }
     Ok(())
 }
 

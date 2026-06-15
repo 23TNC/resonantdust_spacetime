@@ -1,15 +1,13 @@
 
 use spacetimedb::{table, ReducerContext, Table};
 
-use crate::cards;
 use crate::cards::Card;
-use crate::flags::state_flags;
 use crate::packed::{pack_valid_at, valid_at_time};
 use crate::sequence;
 
 // NOTE: per-soul portrait selection was dropped from the card flag word in the
 // flags/stock schema split (portrait_id no longer fits the propagating `flags`
-// u32). It needs to be relocated to soul data (a SoulPrivate field or derived
+// u32). It needs to be relocated to soul data (a new per-soul field or derived
 // from def_id) before soul portraits render again. TODO(portrait-relocate).
 
 /// Soul row — one per soul card, public so clients can subscribe.
@@ -56,53 +54,6 @@ pub struct Soul {
     /// little-endian. Counters stay 0 until the `-i` faculty cards
     /// exist in content and `stat_slot_for` maps them in.
     pub injured: u32,
-}
-
-/// Per-soul private state — the stuff the owning soul needs but
-/// other players don't (discovered blueprints, etc.). Kept off the
-/// public `Soul` row so other clients mirroring souls visible in
-/// their loaded zone don't pull in this soul's personal progression.
-///
-/// **Subscription pattern.** Public table, but each client only
-/// subscribes to their own active soul's row via
-/// `WHERE card_id = <local soul's card_id>`. Same convention as
-/// [`crate::players::PlayerProfile`] — server can't enforce "no
-/// peeking at others" today, so this is fine for low-sensitivity
-/// progression bits but not for anything truly sensitive.
-///
-/// **Flat row, not history.** Unlike `Soul` / `Card`, this table has
-/// one row per `card_id` and is updated in place. Progression state
-/// isn't time-stamped — there are no "what blueprints did the soul
-/// have discovered at time T" reads downstream — so the `valid_at`
-/// history machinery would be deadweight.
-///
-/// **Initial row.** Created in `players::spawn_soul_for` right after
-/// the soul card itself, alongside its starter inventory. Seeded with
-/// the soul's starter blueprints; further discovery is gameplay-driven.
-#[table(accessor = soul_privates, public)]
-#[derive(Debug, Clone)]
-pub struct SoulPrivate {
-    #[primary_key]
-    pub card_id: u32,
-    /// Bit field of discovered blueprints, ids 1..=64. Bit position
-    /// is `blueprint_id - 1`, matching the 1-indexed id mapping in
-    /// `content/blueprints/id.json` (so blueprint id 1 = bit 0).
-    /// `blueprints_0` covers the first 64 ids; further fields
-    /// (`blueprints_1`, …) will be appended as the catalog grows
-    /// past 64 entries. Default `0` — discovery is gameplay-driven,
-    /// nothing is granted on signup. Flipping a bit on is one-way.
-    pub blueprints_0: u64,
-    /// Count of live blueprint cards owned by this soul ("under
-    /// construction" slots). Maintained by `on_card_write` the
-    /// same way `Soul.stats` is maintained: a blueprint card
-    /// coming alive bumps +1 on the owning soul's
-    /// `active_blueprints`; going dead / changing owner bumps -1.
-    /// `blueprints::request_blueprint` reads this against the
-    /// soul's `builder` aspect value to decide whether to allow a
-    /// new request — no separate slot-release reducer needed,
-    /// because the hook handles release implicitly when the
-    /// blueprint dies. Saturates at `u8::MAX`.
-    pub active_blueprints: u8,
 }
 
 // ---- u32 quad packing -----------------------------------------------
@@ -238,60 +189,6 @@ pub fn is_soul_card(packed_def: u16) -> bool {
     ((packed_def >> 12) & 0xF) as u8 == resonantdust_codec::packed::SOUL_CARD_TYPE
 }
 
-/// Card-type id for `blueprint` cards. Mirrors `cards/types.json`
-/// (same hardcode style as `SOUL_CARD_TYPE` above; type ids in
-/// `types.json` are stable, so embedding them avoids a registry
-/// lookup on every card write).
-const BLUEPRINT_CARD_TYPE: u8 = 1;
-
-fn is_blueprint_card(packed_def: u16) -> bool {
-    ((packed_def >> 12) & 0xF) as u8 == BLUEPRINT_CARD_TYPE
-}
-
-/// What this card row contributes to
-/// `SoulPrivate.active_blueprints` — the soul that owns it (via
-/// the owner chain). Returns `None` for non-blueprint cards, dead
-/// cards, world-owned cards (no soul in the chain), and the
-/// degenerate case where `owner_id == 0`. Mirrors the shape of
-/// [`card_contribution`] for stats.
-fn blueprint_contribution(ctx: &ReducerContext, card: &Card) -> Option<u32> {
-    if !is_blueprint_card(card.packed_definition) {
-        return None;
-    }
-    let s = state_flags();
-    if card.flags & s.dead != 0 {
-        return None;
-    }
-    if card.owner_id == 0 {
-        return None;
-    }
-    cards::owning_soul(ctx, card.owner_id)
-}
-
-/// Apply a signed `±1` delta to `SoulPrivate.active_blueprints`
-/// for `soul_card_id`. Saturating arithmetic on the `u8` field so
-/// a stale-row replay can't underflow / overflow. No-op when the
-/// soul has no `SoulPrivate` row yet (the row is created in
-/// `players::spawn_soul_for` alongside the soul card, so this only
-/// fires for hand-rolled / test-driven card writes without a real
-/// soul behind them).
-///
-/// `SoulPrivate` is a flat-row table (no history), so this is a
-/// delete + insert — same pattern as `PlayerProfile`'s
-/// `lifecycle_count` updates in `players.rs`.
-fn apply_blueprint_delta(ctx: &ReducerContext, soul_card_id: u32, delta: i8) {
-    let Some(mut row) = ctx.db.soul_privates().card_id().find(soul_card_id) else {
-        return;
-    };
-    row.active_blueprints = if delta > 0 {
-        row.active_blueprints.saturating_add(1)
-    } else {
-        row.active_blueprints.saturating_sub(1)
-    };
-    ctx.db.soul_privates().card_id().delete(soul_card_id);
-    ctx.db.soul_privates().insert(row);
-}
-
 // ---- the hook ------------------------------------------------------
 
 /// Called from `cards::write_at` after every card insert. Maintains
@@ -304,41 +201,12 @@ fn apply_blueprint_delta(ctx: &ReducerContext, soul_card_id: u32, delta: i8) {
 ///    `players::spawn_soul_for` doesn't need to manually manage Soul
 ///    rows — they appear as a side effect of writing the soul card.
 ///
-/// 2. **Stat counters.** Computes the contribution of `prev_latest`
-///    (the card row that was active before our write) and `new_card`
-///    (the row we just wrote) toward their owners' Soul stat
-///    counters. The delta — usually `0` (no stat impact), but
-///    sometimes `-1` to one slot or `+1` to another or both —
-///    is applied to the owners' Soul rows.
-///
-/// The hook is no-op for cards that aren't soul cards and don't map
-/// to a tracked stat slot.
+/// The hook is no-op for cards that aren't soul cards.
 pub fn on_card_write(
     ctx: &ReducerContext,
-    prev_latest: Option<&Card>,
     new_card: &Card,
     time_ms: u64,
 ) {
-    // (3) Blueprint-counter diff. A live blueprint card
-    // contributes +1 to its owning soul's
-    // `SoulPrivate.active_blueprints`. Same delta model as the
-    // stat-counter branch below: prev contribution -1, new
-    // contribution +1, both no-op when same soul. Lives at the
-    // top so soul-creation (in branch (1) below) is the only state
-    // mutation other branches still depend on having seen.
-    let prev_bp = prev_latest.and_then(|c| blueprint_contribution(ctx, c));
-    let new_bp = blueprint_contribution(ctx, new_card);
-    match (prev_bp, new_bp) {
-        (Some(p), Some(n)) if p == n => {}
-        (Some(p), Some(n)) => {
-            apply_blueprint_delta(ctx, p, -1);
-            apply_blueprint_delta(ctx, n, 1);
-        }
-        (Some(p), None) => apply_blueprint_delta(ctx, p, -1),
-        (None, Some(n)) => apply_blueprint_delta(ctx, n, 1),
-        (None, None) => {}
-    }
-
     // (1) Identity sync. Only fires when the written card is a soul
     // card. Reads the *prior* soul row (max valid_at_time ≤ time_ms)
     // for the same reason `apply_slot_delta` does — out-of-order
@@ -387,11 +255,11 @@ pub fn on_card_write(
         }
     }
 
-    // (2) Stat-counter diff: REMOVED. Mapping a card's packed_def to a stat
+    // Stat-counter diff: REMOVED. Mapping a card's packed_def to a stat
     // slot needs the content registry, which no longer lives on the server.
     // The gate now owns soul-stats — it pushes `set_soul_stat` deltas when it
     // creates/destroys (or moves) a stat card (plan `01_gate_authority_pivot`,
-    // P3). This hook keeps only the content-free branches (1) + (3).
+    // P3). This hook keeps only the content-free identity-sync branch.
 }
 
 /// Apply a `±1` to one stat slot on the Soul row keyed by

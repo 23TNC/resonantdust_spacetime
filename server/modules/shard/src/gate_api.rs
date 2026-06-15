@@ -6,7 +6,7 @@
 //! chain-stitch reposition primitives (`move_card` loose / `stack_card`
 //! member) the gateway's apply step calls to reproduce `propose_action`.
 
-use spacetimedb::{reducer, ReducerContext, Table};
+use spacetimedb::{reducer, ReducerContext};
 
 use crate::cards;
 use crate::flags::state_flags;
@@ -154,31 +154,10 @@ fn finalize_at(ctx: &ReducerContext, card_id: u32, time_ms: u64) -> Result<(), S
     Ok(())
 }
 
-/// Set a blueprint discovery bit on `target_card_id`'s SoulPrivate (idempotent).
-fn unlock_blueprint_at(ctx: &ReducerContext, target_card_id: u32, blueprint_id: u16) -> Result<(), String> {
-    use crate::souls::soul_privates as _soul_privates_table;
-    if blueprint_id == 0 || blueprint_id > 64 {
-        return Err(format!(
-            "apply_action: blueprint id {blueprint_id} outside blueprints_0 (1..=64)"
-        ));
-    }
-    let bit = 1u64 << (blueprint_id - 1);
-    let Some(mut row) = ctx.db.soul_privates().card_id().find(target_card_id) else {
-        return Err(format!("apply_action: no SoulPrivate row for target {target_card_id}"));
-    };
-    if row.blueprints_0 & bit != 0 {
-        return Ok(());
-    }
-    row.blueprints_0 |= bit;
-    ctx.db.soul_privates().card_id().delete(target_card_id);
-    ctx.db.soul_privates().insert(row);
-    Ok(())
-}
-
 /// Materialize a validated action's **cards-database** writes in one transaction:
 /// every bound card's `now` row (holds acquired) and a single fully-formed
 /// `completion` row (holds released + position bits cleared + progress stamped),
-/// plus completion-time effects (destroy / create / unlock / soul-stat). Holds
+/// plus completion-time effects (destroy / create / soul-stat). Holds
 /// and styles are parallel per-`bound_ids` arrays (`bound_masks[i]` is card `i`'s
 /// hold-field bitmask, `0` for a bound-but-unheld card that only needs
 /// finalizing). Effect arrays are parallel within each effect. A hold conflict
@@ -206,8 +185,6 @@ pub fn apply_action(
     // `tag -> minted id` so a later sibling that nests in it (owner_id == tag)
     // resolves to the real id. Creates arrive parent-before-child.
     create_tags: Vec<u8>,
-    unlock_targets: Vec<u32>,
-    unlock_blueprints: Vec<u16>,
     stat_souls: Vec<u32>,
     stat_fields: Vec<u8>,
     stat_bytes: Vec<u8>,
@@ -290,9 +267,6 @@ pub fn apply_action(
             /* flags */ 0,
             create_stocks.get(i).copied().unwrap_or(0),
         );
-    }
-    for i in 0..unlock_targets.len() {
-        unlock_blueprint_at(ctx, unlock_targets[i], unlock_blueprints[i])?;
     }
     for i in 0..stat_souls.len() {
         crate::souls::apply_stat(

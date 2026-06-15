@@ -556,7 +556,7 @@ fn write_at(ctx: &ReducerContext, mut card: Card, time_ms: u64) -> Card {
     // No per-write delete schedule — reaping is handled by the
     // periodic GC sweep ([`crate::gc`]) which applies retention
     // rules over the whole cards table.
-    crate::souls::on_card_write(ctx, prev_latest.as_ref(), &inserted, time_ms);
+    crate::souls::on_card_write(ctx, &inserted, time_ms);
     if let Some(prev) = prev_latest.as_ref() {
         propagate_flag_diff_forward(ctx, &inserted, prev.flags, time_ms);
     }
