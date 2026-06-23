@@ -185,6 +185,9 @@ pub fn apply_action(
     // `tag -> minted id` so a later sibling that nests in it (owner_id == tag)
     // resolves to the real id. Creates arrive parent-before-child.
     create_tags: Vec<u8>,
+    // Per-created-card exact cell (packed micro_location), or `-1` for "first free
+    // cell". A `create … .location` product pins its cell (a bound card's spot).
+    create_cells: Vec<i64>,
     stat_souls: Vec<u32>,
     stat_fields: Vec<u8>,
     stat_bytes: Vec<u8>,
@@ -200,6 +203,14 @@ pub fn apply_action(
     reroot_macro_zones: Vec<u64>,
     reroot_micro_locations: Vec<u32>,
     reroot_stack_states: Vec<u8>,
+    // `move` effects: relocate an existing card to a zone (surface + macro_zone),
+    // re-owned by `move_owners`, on the first free cell of that zone's disk
+    // (`move_distances`). Sends a consumed blueprint back to the player inventory.
+    move_ids: Vec<u32>,
+    move_surfaces: Vec<u8>,
+    move_macro_zones: Vec<u64>,
+    move_owners: Vec<u32>,
+    move_distances: Vec<u16>,
 ) -> Result<(), String> {
     // 1. CAS pre-check across every bound card — reject before any write (the
     //    rollback-on-Err makes the ordering immaterial, but pre-checking keeps
@@ -255,13 +266,21 @@ pub fn apply_action(
         // in-transaction). Same one-per-tile rule as `create_card`; this path
         // mints loose cards (stacked outputs are placed elsewhere).
         let zone = with_surface(raw_zone, create_surfaces[i]);
-        let (fq, fr) = cards::first_free_cell(ctx, zone, dist, completion_ms);
+        // `create … .location` pins an exact cell (a bound card's world spot);
+        // everything else takes the first free cell of the target zone.
+        let micro = match create_cells.get(i).copied().unwrap_or(-1) {
+            c if c >= 0 => cards::Micro::of(c as u32, 0),
+            _ => {
+                let (fq, fr) = cards::first_free_cell(ctx, zone, dist, completion_ms);
+                cards::Micro::snap(fq, fr)
+            }
+        };
         cards::create_at(
             ctx,
             new_id,
             completion_ms,
             zone,
-            cards::Micro::snap(fq, fr),
+            micro,
             owner,
             create_defs[i],
             /* flags */ 0,
@@ -294,6 +313,22 @@ pub fn apply_action(
         let micro = cards::Micro::of(reroot_micro_locations[i], reroot_stack_states[i] as u32);
         cards::update_with_at(ctx, reroot_ids[i], completion_ms, |c| {
             c.macro_zone = reroot_macro_zones[i];
+            micro.place(c);
+        });
+    }
+    // `move` effects @completion: relocate the card to its destination zone (loose,
+    // first free cell), re-owned. A consumed blueprint goes back to inventory; its
+    // old world cell is freed for the chord soul minted there in the create loop.
+    for i in 0..move_ids.len() {
+        use crate::cards::MicroPlace;
+        let zone = with_surface(move_macro_zones[i], move_surfaces[i]);
+        let dist = move_distances.get(i).copied().unwrap_or(u16::MAX);
+        let (fq, fr) = cards::first_free_cell(ctx, zone, dist, completion_ms);
+        let micro = cards::Micro::snap(fq, fr);
+        let owner = move_owners[i];
+        cards::update_with_at(ctx, move_ids[i], completion_ms, |c| {
+            c.macro_zone = zone;
+            c.owner_id = owner;
             micro.place(c);
         });
     }
