@@ -178,9 +178,9 @@ pub fn apply_action(
     // Per-created-card destination container disk radius (tiles), so placement
     // only picks cells that exist in the region disk. `u16::MAX` = unbounded.
     create_distances: Vec<u16>,
-    // Per-created-card initial stock u32 (gate-computed `@define` defaults with
+    // Per-created-card initial stock u64 (gate-computed `@define` defaults with
     // any same-plan handle stock-writes folded in).
-    create_stocks: Vec<u32>,
+    create_stocks: Vec<u64>,
     // Per-created-card transient tag (0 = none): this card's handle, registered
     // `tag -> minted id` so a later sibling that nests in it (owner_id == tag)
     // resolves to the real id. Creates arrive parent-before-child.
@@ -192,9 +192,9 @@ pub fn apply_action(
     stat_fields: Vec<u8>,
     stat_bytes: Vec<u8>,
     stat_deltas: Vec<i8>,
-    // Per-card `stock` u32 writes (gate-computed absolute values).
+    // Per-card `stock` u64 writes (gate-computed absolute values).
     stock_card_ids: Vec<u32>,
-    stock_values: Vec<u32>,
+    stock_values: Vec<u64>,
     // Stack-splice repositions: members of a destroyed root, re-rooted so none is
     // left pointing at a dead root. Parallel arrays; `stack_state` is the u8
     // `[stack_id:u4|index:u4]` (0 = loose). Applied @completion (coalesces with a

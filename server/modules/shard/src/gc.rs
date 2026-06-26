@@ -304,7 +304,7 @@ fn sweep_tile_card_demotions(ctx: &ReducerContext, now_ms: u64) {
             continue;
         }
         // Demote-guard: a zone tile only persists the bottom u4
-        // (`STOCK_ZONE_SAVE_MASK`). If any of the upper 28 stock bits are set, the
+        // (`STOCK_ZONE_SAVE_MASK`). If any of the upper 60 stock bits are set, the
         // card carries transient state (e.g. in-progress build) the zone can't
         // express — keep the card alive until it returns to 0. Content-free: the
         // shard never needs the def's defaults, just "non-savable bits are clear".

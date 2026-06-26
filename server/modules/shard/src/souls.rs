@@ -216,7 +216,7 @@ pub fn on_card_write(
     // very first write of a given soul card.
     //
     // Future positional changes (later soul rows from movement) are
-    // intentionally untouched here: each move_soul step has its own
+    // intentionally untouched here: each move_card step has its own
     // (surface, macro_zone, ...) snapshot that we mustn't clobber.
     // The "stop on first deliberate change" forward-propagation rule
     // (used by zones) would apply if we ever did want to forward-

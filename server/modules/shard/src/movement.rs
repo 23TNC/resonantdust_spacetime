@@ -1,5 +1,6 @@
-//! `move_soul` — stamp a soul's authoritative world position ONE tile ahead, at
-//! the time it will ARRIVE there.
+//! `move_card` — stamp a navigating card's authoritative world position ONE tile
+//! ahead, at the time it will ARRIVE there. (Generic over any card with a speed
+//! aspect; the wire arg names stay `soul_*` so the by-name arg binding is stable.)
 //!
 //! Single-step, future-stamped. The client requests one tile at a time, passing
 //! the destination cell + the `arrival_ms` it computed from the tile costs and
@@ -69,7 +70,7 @@ fn hex_adjacent(a: (i32, i32), b: (i32, i32)) -> bool {
 /// from_r)`, `dest` is hex-adjacent to it, and the timing is a sane future window.
 #[reducer]
 #[allow(clippy::too_many_arguments)]
-pub fn move_soul(
+pub fn move_card(
     ctx: &ReducerContext,
     client_time_ms: u64,
     caller_player_id: u32,

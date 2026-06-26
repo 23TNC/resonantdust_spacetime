@@ -147,12 +147,12 @@ pub struct Card {
     /// forward. Bit layout: `resonantdust_codec::flags`'s `flags_bk` section
     /// ([`crate::flags::bk_flags`]).
     pub flags_bk: u8,
-    /// Per-card variable data — a full `u32`, packed however the card def wants
-    /// (16 u2s, 4 u8s, a u8 progress counter, …). Only the bottom u4
-    /// (`card_model::STOCK_ZONE_SAVE_MASK`) can be persisted back to a zone tile
-    /// slot; the upper 28 bits are card-only (transient unless the card persists).
+    /// Per-card variable data — a full `u64`, packed however the card def wants
+    /// (32 u2s, 8 u8s, a u8 progress counter + lock aspects, …). Only the bottom
+    /// u4 (`card_model::STOCK_ZONE_SAVE_MASK`) can be persisted back to a zone tile
+    /// slot; the upper 60 bits are card-only (transient unless the card persists).
     /// Initialized from the def's stock default on spawn. Zero by default.
-    pub stock: u32,
+    pub stock: u64,
 }
 
 /// A card's micro placement is the **shared** [`content::card_model::Micro`]
@@ -785,7 +785,7 @@ pub fn create(
     owner_id: u32,
     packed_definition: u16,
     flags: u32,
-    stock: u32,
+    stock: u64,
 ) -> Card {
     let mut card = Card {
         valid_at: 0,
@@ -854,7 +854,7 @@ pub fn create_at(
     owner_id: u32,
     packed_definition: u16,
     flags: u32,
-    stock: u32,
+    stock: u64,
 ) -> Card {
     let mut card = Card {
         valid_at: 0,

@@ -38,9 +38,9 @@ pub fn create_card(
     surface: u8,
     // Gate-supplied packed def (the gate resolves the content name → packed).
     packed_definition: u16,
-    // Gate-supplied initial per-instance stock u32 (the def's `@define` stock
+    // Gate-supplied initial per-instance stock u64 (the def's `@define` stock
     // defaults; the content-agnostic shard can't derive them).
-    stock: u32,
+    stock: u64,
     // Optional placement override (caller decomposes world coords → zone+cell):
     // `macro_zone != 0` ⇒ spawn there at loose cell `(q, r)`; `0` ⇒ default
     // (inventory bucket / the surface's (0,0) cell). World/inventory zones are
