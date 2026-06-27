@@ -231,7 +231,7 @@ pub fn count_player_souls(ctx: &ReducerContext, player_id: u32) -> usize {
         .filter(|c| {
             c.owner_id == player_id
                 && crate::packed::is_player_soul(c.packed_definition)
-                && !is_dead(c.flags)
+                && !is_dead(c.stock)
         })
         .count()
 }
@@ -416,7 +416,7 @@ pub fn first_free_cell(ctx: &ReducerContext, macro_zone: u64, distance: u16, tim
         let Some(card) = prior_at(ctx, row.card_id, time_ms) else {
             continue;
         };
-        if is_dead(card.flags) {
+        if is_dead(card.stock) {
             continue;
         }
         if let Micro::Loose { local_q, local_r, .. } = Micro::of(card.micro_location, card.flags) {
@@ -635,8 +635,8 @@ fn cascade_to_state_3_followers(
         None => false, // first row for this card — no followers can be anchored yet.
     };
     let became_dead = match prev {
-        Some(p) => !is_dead(p.flags) && is_dead(new.flags),
-        None => is_dead(new.flags),
+        Some(p) => !is_dead(p.stock) && is_dead(new.stock),
+        None => is_dead(new.stock),
     };
     if !position_changed && !became_dead {
         return;

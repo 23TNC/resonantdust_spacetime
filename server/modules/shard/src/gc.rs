@@ -49,13 +49,12 @@ use std::collections::HashMap;
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use resonantdust_codec::card_model::{
-    has_active_holds, micro_is_card, state_blocks_demotion, stock, STOCK_ZONE_SAVE_MASK,
+    has_active_holds, is_dead, micro_is_card, state_blocks_demotion, stock, STOCK_ZONE_SAVE_MASK,
 };
 
 use crate::card_shards::card_shards;
 use crate::cards;
 use crate::cards::{cards as _cards_table, owning_player, WORLD_PLAYER_ID};
-use crate::flags::state_flags;
 use crate::packed::{micro_loose_cell, unpack_definition, valid_at_time};
 use crate::regions::regions;
 use crate::souls::souls;
@@ -161,8 +160,9 @@ fn sweep_cards(ctx: &ReducerContext, now_ms: u64) {
             to_delete.push(c.valid_at);
             continue;
         }
-        // Latest row for this card_id.
-        if c.flags & state_flags().dead == 0 {
+        // Latest row for this card_id. `dead` now lives in the stock global-aspect
+        // region (op-log materialized), not the flag bit.
+        if !is_dead(c.stock) {
             // Alive — retain.
             continue;
         }
