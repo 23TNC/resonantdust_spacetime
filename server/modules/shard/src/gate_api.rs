@@ -10,8 +10,10 @@ use spacetimedb::{reducer, ReducerContext};
 
 use crate::cards;
 use crate::flags::state_flags;
+use crate::oplog;
 use crate::packed::{is_tag, with_surface};
 use crate::pending_actions;
+use resonantdust_codec::aspects::StockAspect;
 
 /// Hold-family selector shared with the gateway. Keep in sync with the
 /// gateway's apply step.
@@ -242,6 +244,12 @@ pub fn apply_action(
         let at = destroy_times.get(i).copied().unwrap_or(completion_ms);
         cards::update_with_at(ctx, id, at, |c| c.flags |= dead)
             .ok_or_else(|| format!("apply_action: destroy card {id} not found"))?;
+        // Op-log path, running in parallel with the flag above (transitional):
+        // record the `dead` inc and materialize the stock `Dead` count, so the
+        // op-log fold + materialization exercise live data now. The flag stays
+        // the read authority until readers migrate to `aspects::stock_is_dead`
+        // (op-log Phase 6b); for `dead` (monotonic) the two never disagree.
+        oplog::apply_delta(ctx, id, StockAspect::Dead, at, true);
     }
     // Maps a created card's transient tag to its minted id, so a sibling that
     // nests in it (owner_id carrying the tag) resolves to the real owner. Built
