@@ -171,6 +171,10 @@ pub fn apply_action(
     bound_ids: Vec<u32>,
     bound_masks: Vec<u8>,
     destroy_ids: Vec<u32>,
+    // Per-effect fire time (ms): each effect future-stamps independently — an
+    // acquire at t=0 (now_ms) and its release at t=window land on separate rows,
+    // instead of every effect collapsing onto `completion_ms`.
+    destroy_times: Vec<u64>,
     create_defs: Vec<u16>,
     create_surfaces: Vec<u8>,
     create_macro_zones: Vec<u64>,
@@ -188,6 +192,8 @@ pub fn apply_action(
     // Per-created-card exact cell (packed micro_location), or `-1` for "first free
     // cell". A `create … .location` product pins its cell (a bound card's spot).
     create_cells: Vec<i64>,
+    // Per-created-card fire time (ms).
+    create_times: Vec<u64>,
     stat_souls: Vec<u32>,
     stat_fields: Vec<u8>,
     stat_bytes: Vec<u8>,
@@ -195,6 +201,9 @@ pub fn apply_action(
     // Per-card `stock` u64 writes (gate-computed absolute values).
     stock_card_ids: Vec<u32>,
     stock_values: Vec<u64>,
+    // Per-stock-write fire time (ms) — a hold acquire (claim+1 @t=0) and its
+    // release (claim-1 @t=window) are two SetCardStock rows at distinct times.
+    stock_times: Vec<u64>,
     // Stack-splice repositions: members of a destroyed root, re-rooted so none is
     // left pointing at a dead root. Parallel arrays; `stack_state` is the u8
     // `[stack_id:u4|index:u4]` (0 = loose). Applied @completion (coalesces with a
@@ -226,10 +235,12 @@ pub fn apply_action(
         apply_hold_mask(ctx, id, mask, completion_ms, false)?;
         finalize_at(ctx, id, completion_ms)?;
     }
-    // 3. Completion-time effects.
+    // 3. Time-stamped effects — each future-stamped at its own fire time (the
+    //    gate computes `now + at*1000`); `completion_ms` is the fallback.
     let dead = state_flags().dead;
-    for &id in &destroy_ids {
-        cards::update_with_at(ctx, id, completion_ms, |c| c.flags |= dead)
+    for (i, &id) in destroy_ids.iter().enumerate() {
+        let at = destroy_times.get(i).copied().unwrap_or(completion_ms);
+        cards::update_with_at(ctx, id, at, |c| c.flags |= dead)
             .ok_or_else(|| format!("apply_action: destroy card {id} not found"))?;
     }
     // Maps a created card's transient tag to its minted id, so a sibling that
@@ -238,6 +249,7 @@ pub fn apply_action(
     // tag is always registered before the child that uses it.
     let mut tag_to_id: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
     for i in 0..create_defs.len() {
+        let at = create_times.get(i).copied().unwrap_or(completion_ms);
         let new_id = cards::next_card_id(ctx);
         if let Some(&tag) = create_tags.get(i) {
             if tag != 0 {
@@ -271,14 +283,14 @@ pub fn apply_action(
         let micro = match create_cells.get(i).copied().unwrap_or(-1) {
             c if c >= 0 => cards::Micro::of(c as u32, 0),
             _ => {
-                let (fq, fr) = cards::first_free_cell(ctx, zone, dist, completion_ms);
+                let (fq, fr) = cards::first_free_cell(ctx, zone, dist, at);
                 cards::Micro::snap(fq, fr)
             }
         };
         cards::create_at(
             ctx,
             new_id,
-            completion_ms,
+            at,
             zone,
             micro,
             owner,
@@ -302,7 +314,8 @@ pub fn apply_action(
     for i in 0..stock_card_ids.len() {
         let id = stock_card_ids[i];
         let value = stock_values[i];
-        cards::update_with_at(ctx, id, completion_ms, |c| c.stock = value)
+        let at = stock_times.get(i).copied().unwrap_or(completion_ms);
+        cards::update_with_at(ctx, id, at, |c| c.stock = value)
             .ok_or_else(|| format!("apply_action: stock card {id} not found"))?;
     }
     // Stack-splice repositions @completion (after destroys, so the orphaned
