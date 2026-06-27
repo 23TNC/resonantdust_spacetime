@@ -319,12 +319,21 @@ pub fn apply_action(
     }
     // Per-card stock writes (absolute, gate-computed). Future-stamped @completion
     // so the new stock lands on the client's timeline like every other effect.
+    // The gate computes only the PER-DEF region (the bottom of the u64); the
+    // op-log owns the global-aspect region (top, bits 42-63: holds / dead / reap)
+    // and materializes it independently. So a stock write must PRESERVE the
+    // global region — an absolute `c.stock = value` would clobber an op-log
+    // `dead`/hold materialized at the same time (the candidate-card case the
+    // magnetic spike caught: a per-def stock write wiping the materialized Dead).
+    let global = resonantdust_codec::aspects::global_region_mask();
     for i in 0..stock_card_ids.len() {
         let id = stock_card_ids[i];
         let value = stock_values[i];
         let at = stock_times.get(i).copied().unwrap_or(completion_ms);
-        cards::update_with_at(ctx, id, at, |c| c.stock = value)
-            .ok_or_else(|| format!("apply_action: stock card {id} not found"))?;
+        cards::update_with_at(ctx, id, at, |c| {
+            c.stock = (value & !global) | (c.stock & global);
+        })
+        .ok_or_else(|| format!("apply_action: stock card {id} not found"))?;
     }
     // Stack-splice repositions @completion (after destroys, so the orphaned
     // members re-root as the destroyed root's row goes dead in the same commit).
