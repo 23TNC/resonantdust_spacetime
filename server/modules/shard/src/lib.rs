@@ -12,6 +12,7 @@ pub mod flags;
 pub mod gate_api;
 pub mod gc;
 pub mod movement;
+pub mod oplog;
 pub mod packed;
 pub mod pending_actions;
 pub mod place;
