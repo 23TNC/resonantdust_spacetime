@@ -94,10 +94,8 @@ pub fn move_card(
             "movement: soul card {soul_id} is owned by player {soul_player} (not {caller_player_id})"
         ));
     }
-    if cards::slot_claim_count(soul.flags) > 0
-        || cards::slot_borrow_count(soul.flags) > 0
-        || cards::position_hold_count(soul.flags) > 0
-    {
+    // Holds now live in the stock global region (op-log materialized), not flags.
+    if resonantdust_codec::aspects::has_active_holds(soul.stock) {
         return Err(format!("movement: soul card {soul_id} is held by an in-flight action"));
     }
     // Anti-spoof: the gate computed travel from THIS `soul_def`; it must be real

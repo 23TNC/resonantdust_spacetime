@@ -49,11 +49,10 @@ use std::collections::HashMap;
 use spacetimedb::{reducer, table, ReducerContext, ScheduleAt, Table, TimeDuration};
 
 use resonantdust_codec::card_model::{
-    has_active_holds, is_dead, micro_is_card, state_blocks_demotion, stock, STOCK_ZONE_SAVE_MASK,
+    is_dead, micro_is_card, state_blocks_demotion, stock, STOCK_ZONE_SAVE_MASK,
 };
 
 use crate::card_shards::card_shards;
-use crate::cards;
 use crate::cards::{cards as _cards_table, owning_player, WORLD_PLAYER_ID};
 use crate::packed::{micro_loose_cell, unpack_definition, valid_at_time};
 use crate::regions::regions;
@@ -202,7 +201,7 @@ fn dead_row_reapable(ctx: &ReducerContext, card: &crate::cards::Card, now_ms: u6
     // state. The holding recipe's completion writes a future row that
     // decrements `slot_hold_count`; that newer row supersedes this one
     // as "latest" and the non-latest sweep reaps this row next cadence.
-    if cards::slot_claim_count(card.flags) > 0 {
+    if resonantdust_codec::aspects::count(card.stock, resonantdust_codec::aspects::StockAspect::Claim) > 0 {
         return false;
     }
 
@@ -304,7 +303,7 @@ fn sweep_tile_card_demotions(ctx: &ReducerContext, now_ms: u64) {
         if micro_is_card(c.flags) {
             continue; // stacked under a card — in use, root not local.
         }
-        if state_blocks_demotion(c.flags) || has_active_holds(c.flags) {
+        if state_blocks_demotion(c.flags) || resonantdust_codec::aspects::has_active_holds(c.stock) {
             continue;
         }
         // Demote-guard: a zone tile only persists the bottom u4
