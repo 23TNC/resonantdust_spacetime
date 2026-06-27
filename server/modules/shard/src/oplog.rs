@@ -189,6 +189,61 @@ pub fn apply_op(
     materialize_aspect(ctx, card_id, aspect, time_ms);
 }
 
+/// Collapse SETTLED ops (`time_ms <= watermark`) per `(card, aspect)` into a
+/// single `Set` checkpoint at the watermark, so a live fold never replays
+/// unbounded history. The watermark is `now - max_late_arrival`: nothing older
+/// can be reordered against (the server rejects submissions further behind), so
+/// the settled prefix is final and folds to a constant.
+///
+/// Because the op-log is ST-only (no client subscription), this is purely
+/// internal — no fan-out, no in-place-upsert dance. A `(card, aspect)` whose
+/// settled value folds to 0 (e.g. a hold fully acquired+released) gets its rows
+/// deleted with NO checkpoint — released holds leave nothing behind.
+pub fn compact(ctx: &ReducerContext, watermark: u64) {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<(u32, u8), Vec<OpLog>> = BTreeMap::new();
+    for row in ctx.db.op_log().iter() {
+        groups.entry((row.card_id, row.aspect_id)).or_default().push(row);
+    }
+    for ((card_id, aspect_id), mut rows) in groups {
+        let settled: Vec<u64> = rows
+            .iter()
+            .filter(|r| r.time_ms <= watermark)
+            .map(|r| r.id)
+            .collect();
+        if settled.is_empty() {
+            continue; // whole tail is live — nothing to collapse.
+        }
+        // Already one settled `Set` checkpoint → nothing to do (don't churn it).
+        if settled.len() == 1 {
+            if let Some(r) = rows.iter().find(|r| r.id == settled[0]) {
+                if AspectOp::from_code(r.op) == Some(AspectOp::Set) {
+                    continue;
+                }
+            }
+        }
+        rows.sort_by_key(|r| r.id);
+        let ops: Vec<Op> = rows
+            .iter()
+            .filter_map(|r| AspectOp::from_code(r.op).map(|op| Op { time: r.time_ms, op, modifier: r.modifier }))
+            .collect();
+        let value = fold(&ops, watermark); // settled value as-of the watermark
+        for id in settled {
+            ctx.db.op_log().id().delete(id);
+        }
+        if value != 0 {
+            ctx.db.op_log().insert(OpLog {
+                id: 0,
+                card_id,
+                aspect_id,
+                time_ms: watermark,
+                op: AspectOp::Set.code(),
+                modifier: value,
+            });
+        }
+    }
+}
+
 /// `apply_op` for the commutative `±1` refcount path (holds / `dead` / `reap`).
 pub fn apply_delta(
     ctx: &ReducerContext,

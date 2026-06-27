@@ -123,6 +123,10 @@ pub fn gc_sweep(ctx: &ReducerContext, _row: GcSchedule) -> Result<(), String> {
     // `sweep_tile_cards` is subsumed.
     sweep_cards(ctx, now_ms);
     sweep_souls(ctx);
+    // Op-log compaction: collapse settled aspect ops (older than the late-arrival
+    // horizon, so no reorder can reach them) into one Set checkpoint per
+    // (card, aspect); released holds leave nothing. Keeps the fold bounded.
+    crate::oplog::compact(ctx, now_ms.saturating_sub(crate::cards::BACKWARD_GRACE_MS));
     // Region-DB tables. Prior-version reaps; no-op where empty (a card DB).
     // `regions` is current-value (one row per macro_region) — nothing to reap.
     sweep_zones(ctx);
