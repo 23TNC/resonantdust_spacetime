@@ -15,6 +15,19 @@ use crate::packed::{is_tag, with_surface};
 use crate::pending_actions;
 use resonantdust_codec::aspects::StockAspect;
 
+/// One op-log delta the gate hands [`apply_action`], packed into a struct so the
+/// reducer stays under the arg-count ceiling (~32). `aspect_id` =
+/// [`StockAspect::id`], `op` = [`resonantdust_codec::oplog::AspectOp::code`],
+/// `time_ms` the absolute future-stamp the gate computed.
+#[derive(spacetimedb::SpacetimeType)]
+pub struct LogOpArg {
+    pub card_id: u32,
+    pub aspect_id: u8,
+    pub op: u8,
+    pub modifier: i64,
+    pub time_ms: u64,
+}
+
 /// Hold-family selector shared with the gateway. Keep in sync with the
 /// gateway's apply step.
 mod hold_kind {
@@ -222,6 +235,11 @@ pub fn apply_action(
     move_macro_zones: Vec<u64>,
     move_owners: Vec<u32>,
     move_distances: Vec<u16>,
+    // Op-log deltas for GLOBAL aspects (holds / dead / reap): append the op +
+    // materialize the stock global region (bits 42-63). One packed struct per op
+    // (a flat Vec<LogOpArg>) rather than 5 parallel arrays — the reducer arg-count
+    // ceiling (~32) doesn't leave room for five more scalars.
+    logops: Vec<LogOpArg>,
 ) -> Result<(), String> {
     // 1. CAS pre-check across every bound card — reject before any write (the
     //    rollback-on-Err makes the ordering immaterial, but pre-checking keeps
@@ -239,17 +257,25 @@ pub fn apply_action(
     }
     // 3. Time-stamped effects — each future-stamped at its own fire time (the
     //    gate computes `now + at*1000`); `completion_ms` is the fallback.
+    // Op-log deltas for GLOBAL aspects (holds / dead / reap): append each op +
+    // materialize its stock global-region field. `dead` now flows through here
+    // (LogOp), superseding the old `data.dead` → Destroy → flag path.
+    for lo in &logops {
+        let Some(aspect) = StockAspect::from_id(lo.aspect_id) else {
+            continue;
+        };
+        let Some(op) = resonantdust_codec::oplog::AspectOp::from_code(lo.op) else {
+            continue;
+        };
+        oplog::apply_op(ctx, lo.card_id, aspect, lo.time_ms, op, lo.modifier);
+    }
+    // Destroy is no longer emitted by translate (dead → LogOp above); the loop is
+    // retained inert (destroy_ids empty) until the Destroy effect is fully retired.
     let dead = state_flags().dead;
     for (i, &id) in destroy_ids.iter().enumerate() {
         let at = destroy_times.get(i).copied().unwrap_or(completion_ms);
         cards::update_with_at(ctx, id, at, |c| c.flags |= dead)
             .ok_or_else(|| format!("apply_action: destroy card {id} not found"))?;
-        // Op-log path, running in parallel with the flag above (transitional):
-        // record the `dead` inc and materialize the stock `Dead` count, so the
-        // op-log fold + materialization exercise live data now. The flag stays
-        // the read authority until readers migrate to `aspects::stock_is_dead`
-        // (op-log Phase 6b); for `dead` (monotonic) the two never disagree.
-        oplog::apply_delta(ctx, id, StockAspect::Dead, at, true);
     }
     // Maps a created card's transient tag to its minted id, so a sibling that
     // nests in it (owner_id carrying the tag) resolves to the real owner. Built
