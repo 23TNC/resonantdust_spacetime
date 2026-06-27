@@ -3,9 +3,7 @@ use spacetimedb::{table, ReducerContext, Table};
 use crate::flags::bk_flags;
 use crate::packed::{pack_valid_at, valid_at_time, STACK_STATE_DEFERRED};
 use crate::sequence;
-use resonantdust_codec::card_model::{
-    decrement_hold, hold_count, increment_hold, is_dead, placement_mask, state_mask, HoldField,
-};
+use resonantdust_codec::card_model::{is_dead, placement_mask, state_mask};
 
 /// Reserved sentinel player_id meaning "the world" (no real player
 /// owns this). Server players `0..=1023` are reserved for pseudo-
@@ -20,93 +18,10 @@ pub const WORLD_PLAYER_ID: u32 = 0;
 /// → soul → player) so 32 is comfortable slack.
 const OWNER_WALK_DEPTH_CAP: u32 = 32;
 
-// ── refcount holds ───────────────────────────────────────────────────────
-//
-// All six count fields (touch / slot_claim / slot_borrow / position_hold /
-// drop_hold / server) live in the propagating `flags` word; the bit math is
-// owned by `resonantdust_codec::card_model`. These thin readers plus the generic
-// acquire / release / propagate machinery wrap that arithmetic with the
-// cards-table mutation and forward-prop walk.
-
-/// Read the `slot_claim` (exclusive) hold count from a `flags` word.
-pub fn slot_claim_count(flags: u32) -> u8 {
-    hold_count(flags, HoldField::SlotClaim)
-}
-/// Read the `slot_borrow` (shared) hold count from a `flags` word.
-pub fn slot_borrow_count(flags: u32) -> u8 {
-    hold_count(flags, HoldField::SlotBorrow)
-}
-/// Read the `position_hold` count from a `flags` word.
-pub fn position_hold_count(flags: u32) -> u8 {
-    hold_count(flags, HoldField::PositionHold)
-}
-/// Read the `touch` count from a `flags` word.
-pub fn touch_count(flags: u32) -> u8 {
-    hold_count(flags, HoldField::Touch)
-}
-/// Read the `server` count from a `flags` word.
-pub fn server_count(flags: u32) -> u8 {
-    hold_count(flags, HoldField::Server)
-}
-/// Read the `drop_hold` (stacking-block) count from a `flags` word.
-pub fn drop_hold_count(flags: u32) -> u8 {
-    resonantdust_codec::card_model::drop_hold_count(flags)
-}
-
-/// Acquire one reference of `field` on a card at `time_ms` — bumps the count on
-/// the row current at that time AND forward-propagates +1 onto every
-/// future-stamped row (so a future release row, with the count baked in,
-/// correctly reflects "but someone else is still holding" once this lands).
-pub fn acquire_hold(ctx: &ReducerContext, card_id: u32, time_ms: u64, field: HoldField) {
-    update_with_at(ctx, card_id, time_ms, |c| {
-        c.flags = increment_hold(c.flags, field);
-    });
-    propagate_hold_forward(ctx, card_id, time_ms, field, true);
-}
-
-/// Release one reference of `field` on a card at `time_ms` — decrements at
-/// `time_ms` and on every future-stamped row of the same card.
-pub fn release_hold(ctx: &ReducerContext, card_id: u32, time_ms: u64, field: HoldField) {
-    update_with_at(ctx, card_id, time_ms, |c| {
-        c.flags = decrement_hold(c.flags, field);
-    });
-    propagate_hold_forward(ctx, card_id, time_ms, field, false);
-}
-
-/// Apply ±1 to `field` on every row of this card with `valid_at_time > time_ms`.
-/// Bypasses `write_at` (direct `delete` / `insert`) so we don't re-fire the
-/// `souls::on_card_write` / lifecycle hooks while rewriting rows we already
-/// wrote. The `valid_at` PK is preserved across each delete/insert pair.
-fn propagate_hold_forward(
-    ctx: &ReducerContext,
-    card_id: u32,
-    time_ms: u64,
-    field: HoldField,
-    increment: bool,
-) {
-    let future: Vec<u64> = ctx
-        .db
-        .cards()
-        .card_id()
-        .filter(card_id)
-        .filter(|c| valid_at_time(c.valid_at) > time_ms)
-        .map(|c| c.valid_at)
-        .collect();
-    for v in future {
-        let Some(row) = ctx.db.cards().valid_at().find(v) else {
-            continue;
-        };
-        let new_flags = if increment {
-            increment_hold(row.flags, field)
-        } else {
-            decrement_hold(row.flags, field)
-        };
-        ctx.db.cards().valid_at().delete(v);
-        let mut updated = row;
-        updated.flags = new_flags;
-        ctx.db.cards().insert(updated);
-    }
-}
+// Card-hold refcount machinery (acquire/release/propagate over the `flags` word)
+// removed — holds now flow through the op-log (`oplog::apply_op`) into the stock
+// global region. The TILE-hold path (`acquire_tile_hold`) is separate and still
+// flag-based.
 
 #[table(accessor = cards, public)]
 pub struct Card {

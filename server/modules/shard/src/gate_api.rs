@@ -28,8 +28,9 @@ pub struct LogOpArg {
     pub time_ms: u64,
 }
 
-/// Hold-family selector shared with the gateway. Keep in sync with the
-/// gateway's apply step.
+/// Hold-family selector for the TILE-hold path (`apply_action_tile`, region DB).
+/// Card holds now flow through the op-log (`LogOp`); this remains only for the
+/// separate tile-hold mechanism (`acquire_tile_hold`).
 mod hold_kind {
     pub const TOUCH: u8 = 0;
     pub const SLOT_HOLD: u8 = 1;
@@ -38,6 +39,14 @@ mod hold_kind {
     pub const DROP_HOLD: u8 = 4;
     pub const SERVER: u8 = 5;
 }
+
+/// Tile-hold kinds the `apply_action_tile` bitmask addresses.
+const HOLD_MASK_KINDS: [u8; 4] = [
+    hold_kind::TOUCH,
+    hold_kind::SLOT_HOLD,
+    hold_kind::SLOT_SHARE,
+    hold_kind::POSITION_HOLD,
+];
 
 /// Claim the in-flight slot for a `(recipe, root, bindings)` tuple. Rejects if
 /// the same tuple is already in flight — the DB-side dedup the gateway relies
@@ -71,33 +80,6 @@ pub fn release_pending(
     Ok(())
 }
 
-/// Dispatch acquire (`acquire=true`) or release of hold `kind` on `card_id` at
-/// `time_ms` to the matching refcount helper. Shared by the lease reducer and
-/// the standalone acquire/release reducers.
-fn dispatch_hold(
-    ctx: &ReducerContext,
-    card_id: u32,
-    time_ms: u64,
-    kind: u8,
-    acquire: bool,
-) -> Result<(), String> {
-    let field = match kind {
-        hold_kind::TOUCH => HoldField::Touch,
-        hold_kind::SLOT_HOLD => HoldField::SlotClaim,
-        hold_kind::SLOT_SHARE => HoldField::SlotBorrow,
-        hold_kind::POSITION_HOLD => HoldField::PositionHold,
-        hold_kind::DROP_HOLD => HoldField::DropHold,
-        hold_kind::SERVER => HoldField::Server,
-        other => return Err(format!("hold: unknown kind {other}")),
-    };
-    if acquire {
-        cards::acquire_hold(ctx, card_id, time_ms, field);
-    } else {
-        cards::release_hold(ctx, card_id, time_ms, field);
-    }
-    Ok(())
-}
-
 // ── coarse whole-action apply (one commit per shard) ─────────────────────────
 //
 // `apply_action` (cards data) and `apply_action_tile` (region data) each
@@ -109,52 +91,6 @@ fn dispatch_hold(
 // same `acquire_*`/`release_*`/`set_tile_stock` helpers, just inside one tx, so
 // forward-propagation and overlap handling are unchanged. Any conflict returns
 // `Err`, which rolls the whole transaction back (all-or-nothing within a shard).
-
-/// Hold-field kinds addressable by the per-card bitmask (bit `i` = `hold_kind`
-/// `i`). The gateway derives the mask from the recipe verb (use/claim/share/
-/// borrow → these fields); `touch` rides along for any held card.
-const HOLD_MASK_KINDS: [u8; 4] = [
-    hold_kind::TOUCH,
-    hold_kind::SLOT_HOLD,
-    hold_kind::SLOT_SHARE,
-    hold_kind::POSITION_HOLD,
-];
-
-/// CAS guard: reject if an exclusive (`slot_hold`) acquire in `mask` collides
-/// with any live hold, or a shared (`slot_share`) acquire with a live exclusive.
-/// Mirrors the old `acquire_lease` check, evaluated against the row current at
-/// `now_ms` before any write.
-fn check_hold_available(ctx: &ReducerContext, card_id: u32, mask: u8, now_ms: u64) -> Result<(), String> {
-    let flags = cards::prior_at(ctx, card_id, now_ms).map(|c| c.flags).unwrap_or(0);
-    let exclusive = cards::slot_claim_count(flags);
-    let shared = cards::slot_borrow_count(flags);
-    if mask & (1 << hold_kind::SLOT_HOLD) != 0 && (exclusive > 0 || shared > 0) {
-        return Err(format!(
-            "apply_action: card {card_id} unavailable (exclusive={exclusive}, shared={shared})"
-        ));
-    }
-    if mask & (1 << hold_kind::SLOT_SHARE) != 0 && exclusive > 0 {
-        return Err(format!("apply_action: card {card_id} exclusively held"));
-    }
-    Ok(())
-}
-
-/// Acquire (`acquire=true`) or release every hold field set in `mask` at
-/// `time_ms`, via the same refcount helpers the per-kind reducers used.
-fn apply_hold_mask(
-    ctx: &ReducerContext,
-    card_id: u32,
-    mask: u8,
-    time_ms: u64,
-    acquire: bool,
-) -> Result<(), String> {
-    for kind in HOLD_MASK_KINDS {
-        if mask & (1 << kind) != 0 {
-            dispatch_hold(ctx, card_id, time_ms, kind, acquire)?;
-        }
-    }
-    Ok(())
-}
 
 /// Finalize a bound card at completion: clear `pos_need`/`pos_want`. Composes
 /// onto the same `completion_ms` row the releases just wrote (last-write-at-this-
@@ -181,15 +117,8 @@ fn finalize_at(ctx: &ReducerContext, card_id: u32, time_ms: u64) -> Result<(), S
 #[allow(clippy::too_many_arguments)]
 pub fn apply_action(
     ctx: &ReducerContext,
-    now_ms: u64,
     completion_ms: u64,
     bound_ids: Vec<u32>,
-    bound_masks: Vec<u8>,
-    destroy_ids: Vec<u32>,
-    // Per-effect fire time (ms): each effect future-stamps independently — an
-    // acquire at t=0 (now_ms) and its release at t=window land on separate rows,
-    // instead of every effect collapsing onto `completion_ms`.
-    destroy_times: Vec<u64>,
     create_defs: Vec<u16>,
     create_surfaces: Vec<u8>,
     create_macro_zones: Vec<u64>,
@@ -241,25 +170,14 @@ pub fn apply_action(
     // ceiling (~32) doesn't leave room for five more scalars.
     logops: Vec<LogOpArg>,
 ) -> Result<(), String> {
-    // 1. CAS pre-check across every bound card — reject before any write (the
-    //    rollback-on-Err makes the ordering immaterial, but pre-checking keeps
-    //    the failure clean and matches the old fail-fast semantics).
-    for (i, &id) in bound_ids.iter().enumerate() {
-        check_hold_available(ctx, id, bound_masks.get(i).copied().unwrap_or(0), now_ms)?;
-    }
-    // 2. Per bound card: acquire @now, release + finalize @completion. The two
-    //    rows survive; in-transaction rewrites coalesce (no extra commits).
-    for (i, &id) in bound_ids.iter().enumerate() {
-        let mask = bound_masks.get(i).copied().unwrap_or(0);
-        apply_hold_mask(ctx, id, mask, now_ms, true)?;
-        apply_hold_mask(ctx, id, mask, completion_ms, false)?;
+    // 1. Per bound card: finalize @completion (clear pos_need/pos_want). Holds are
+    //    no longer applied here — they flow through the op-log (LogOp) below.
+    for &id in bound_ids.iter() {
         finalize_at(ctx, id, completion_ms)?;
     }
-    // 3. Time-stamped effects — each future-stamped at its own fire time (the
-    //    gate computes `now + at*1000`); `completion_ms` is the fallback.
-    // Op-log deltas for GLOBAL aspects (holds / dead / reap): append each op +
-    // materialize its stock global-region field. `dead` now flows through here
-    // (LogOp), superseding the old `data.dead` → Destroy → flag path.
+    // 2. Time-stamped effects. Op-log deltas for GLOBAL aspects (holds / dead /
+    //    reap): append each op + materialize its stock global-region field. `dead`
+    //    flows through here too (superseding the old data.dead → Destroy → flag).
     for lo in &logops {
         let Some(aspect) = StockAspect::from_id(lo.aspect_id) else {
             continue;
@@ -268,14 +186,6 @@ pub fn apply_action(
             continue;
         };
         oplog::apply_op(ctx, lo.card_id, aspect, lo.time_ms, op, lo.modifier);
-    }
-    // Destroy is no longer emitted by translate (dead → LogOp above); the loop is
-    // retained inert (destroy_ids empty) until the Destroy effect is fully retired.
-    let dead = state_flags().dead;
-    for (i, &id) in destroy_ids.iter().enumerate() {
-        let at = destroy_times.get(i).copied().unwrap_or(completion_ms);
-        cards::update_with_at(ctx, id, at, |c| c.flags |= dead)
-            .ok_or_else(|| format!("apply_action: destroy card {id} not found"))?;
     }
     // Maps a created card's transient tag to its minted id, so a sibling that
     // nests in it (owner_id carrying the tag) resolves to the real owner. Built
