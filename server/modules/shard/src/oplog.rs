@@ -16,6 +16,8 @@
 
 use spacetimedb::{table, ReducerContext, Table};
 
+use crate::cards::cards as _cards_table;
+use crate::packed::valid_at_time;
 use resonantdust_codec::aspects::StockAspect;
 use resonantdust_codec::oplog::{fold, fold_clamped, AspectOp, Op};
 
@@ -119,4 +121,82 @@ pub fn field_value_as_of(
 ) -> u8 {
     let max = aspect.field().max() as u8;
     fold_clamped(&ops_for(ctx, card_id, aspect), at, max)
+}
+
+/// Re-materialize `aspect` onto `card_id` from `from_time` forward: fold the log
+/// and write the folded value into the `stock` aspect-field of the row current at
+/// `from_time` (producing a new row at that stamp) and of every future-stamped
+/// row. This is the op-log's replacement for `cards::propagate_hold_forward` —
+/// same forward walk + bypass discipline, but the value comes from the general
+/// fold (so it's correct for value-dependent ops, not just commutative ±1).
+///
+/// The future-row rewrites bypass `cards::write_at` (direct delete/insert,
+/// preserving the `valid_at` PK) so we don't re-fire the souls / flag-diff /
+/// cascade hooks while restamping rows we already wrote — exactly as
+/// `propagate_hold_forward` does. The row current at `from_time` DOES go through
+/// `write_at`, so its dirty markers + soul stat diff update normally.
+pub fn materialize_aspect(
+    ctx: &ReducerContext,
+    card_id: u32,
+    aspect: StockAspect,
+    from_time: u64,
+) {
+    let field = aspect.field();
+
+    // Row current at `from_time` → a new row carrying the folded value. No-op if
+    // the card has no row at/before `from_time` yet (nothing to materialize onto).
+    let v = field_value_as_of(ctx, card_id, aspect, from_time);
+    crate::cards::update_with_at(ctx, card_id, from_time, |c| {
+        c.stock = field.set(c.stock, v);
+    });
+
+    // Future-stamped rows: re-fold each at its own time and rewrite its field.
+    let future: Vec<u64> = ctx
+        .db
+        .cards()
+        .card_id()
+        .filter(card_id)
+        .filter(|c| valid_at_time(c.valid_at) > from_time)
+        .map(|c| c.valid_at)
+        .collect();
+    for vat in future {
+        let Some(mut row) = ctx.db.cards().valid_at().find(vat) else {
+            continue;
+        };
+        let fv = field_value_as_of(ctx, card_id, aspect, valid_at_time(vat));
+        let new_stock = field.set(row.stock, fv);
+        if new_stock == row.stock {
+            continue; // unchanged — don't churn the row (or its PK).
+        }
+        ctx.db.cards().valid_at().delete(vat);
+        row.stock = new_stock;
+        ctx.db.cards().insert(row);
+    }
+}
+
+/// Record an op AND materialize it onto the card rows in one step — the normal
+/// entry point. Append first (so the fold sees it), then re-materialize from the
+/// op's `time_ms` forward.
+pub fn apply_op(
+    ctx: &ReducerContext,
+    card_id: u32,
+    aspect: StockAspect,
+    time_ms: u64,
+    op: AspectOp,
+    modifier: i64,
+) {
+    append(ctx, card_id, aspect, time_ms, op, modifier);
+    materialize_aspect(ctx, card_id, aspect, time_ms);
+}
+
+/// `apply_op` for the commutative `±1` refcount path (holds / `dead` / `reap`).
+pub fn apply_delta(
+    ctx: &ReducerContext,
+    card_id: u32,
+    aspect: StockAspect,
+    time_ms: u64,
+    increment: bool,
+) {
+    let op = if increment { AspectOp::Inc } else { AspectOp::Dec };
+    apply_op(ctx, card_id, aspect, time_ms, op, 1);
 }
