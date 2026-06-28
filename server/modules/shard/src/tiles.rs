@@ -18,9 +18,7 @@
 //!
 //! [`ShardIdentity`]: crate::cards::ShardIdentity
 
-use resonantdust_codec::card_model::{
-    decrement_hold, hold_count, increment_hold, stock, write_stock, HoldField,
-};
+use resonantdust_codec::card_model::{stock, write_stock};
 use spacetimedb::ReducerContext;
 
 use crate::cards::cards;
@@ -117,49 +115,6 @@ pub fn set_tile_stock(
 ) -> Option<Card> {
     update_with_at(ctx, card_id, time_ms, |c| {
         c.stock = write_stock(c.stock, slot, value);
-    })
-}
-
-/// Acquire one reference of hold `field` on the tile-card at hex `(q, r)`,
-/// **promoting it first** (idempotent `find_or_create`). For an exclusive
-/// `SlotHold` this is the concurrent-cut guard: reducers are DB-serialized, so a
-/// second action's acquire reads this one's committed hold and is rejected here.
-pub fn acquire_tile_hold(
-    ctx: &ReducerContext,
-    surface: u8,
-    macro_zone: u64,
-    q: u8,
-    r: u8,
-    field: HoldField,
-    time_ms: u64,
-) -> Result<Card, String> {
-    let tile = find_or_create_tile_card(ctx, surface, macro_zone, q, r, time_ms)?;
-    if field == HoldField::SlotClaim && hold_count(tile.flags, HoldField::SlotClaim) > 0 {
-        return Err(format!(
-            "acquire_tile_hold: tile ({q},{r}) of zone {macro_zone} is already exclusively held"
-        ));
-    }
-    update_with_at(ctx, tile.card_id, time_ms, |c| {
-        c.flags = increment_hold(c.flags, field);
-    })
-    .ok_or_else(|| format!("acquire_tile_hold: tile-card {} vanished", tile.card_id))
-}
-
-/// Release one reference of hold `field` on the tile-card at hex `(q, r)`, if one
-/// exists (no-op otherwise). Once a tile-card is hold-free and clean, the GC
-/// demotion sweep folds it back into the zone.
-pub fn release_tile_hold(
-    ctx: &ReducerContext,
-    surface: u8,
-    macro_zone: u64,
-    q: u8,
-    r: u8,
-    field: HoldField,
-    time_ms: u64,
-) -> Option<Card> {
-    let tile = find_tile_card_at(ctx, surface, macro_zone, q, r, time_ms)?;
-    update_with_at(ctx, tile.card_id, time_ms, |c| {
-        c.flags = decrement_hold(c.flags, field);
     })
 }
 

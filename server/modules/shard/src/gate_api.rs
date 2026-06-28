@@ -28,26 +28,6 @@ pub struct LogOpArg {
     pub time_ms: u64,
 }
 
-/// Hold-family selector for the TILE-hold path (`apply_action_tile`, region DB).
-/// Card holds now flow through the op-log (`LogOp`); this remains only for the
-/// separate tile-hold mechanism (`acquire_tile_hold`).
-mod hold_kind {
-    pub const TOUCH: u8 = 0;
-    pub const SLOT_HOLD: u8 = 1;
-    pub const SLOT_SHARE: u8 = 2;
-    pub const POSITION_HOLD: u8 = 3;
-    pub const DROP_HOLD: u8 = 4;
-    pub const SERVER: u8 = 5;
-}
-
-/// Tile-hold kinds the `apply_action_tile` bitmask addresses.
-const HOLD_MASK_KINDS: [u8; 4] = [
-    hold_kind::TOUCH,
-    hold_kind::SLOT_HOLD,
-    hold_kind::SLOT_SHARE,
-    hold_kind::POSITION_HOLD,
-];
-
 /// Claim the in-flight slot for a `(recipe, root, bindings)` tuple. Rejects if
 /// the same tuple is already in flight — the DB-side dedup the gateway relies
 /// on. `completion_ms` is when the action's effects are stamped.
@@ -317,22 +297,39 @@ pub fn apply_action_tile(
     macro_zone: u64,
     q: u8,
     r: u8,
-    hold_mask: u8,
+    // The tile's op-log holds (claim/touch), applied on the promoted tile-card.
+    // `card_id` in each is unused — the tile-card is resolved from the coords.
+    logops: Vec<LogOpArg>,
     stock_slots: Vec<u8>,
     stock_ops: Vec<u8>,
     stock_deltas: Vec<u8>,
 ) -> Result<(), String> {
-    // Acquire each masked hold @now — promotes the tile-card and (for slot_hold)
-    // runs the exclusive CAS.
-    for kind in HOLD_MASK_KINDS {
-        if hold_mask & (1 << kind) != 0 {
-            crate::tiles::acquire_tile_hold(ctx, surface, macro_zone, q, r, hold_field(kind)?, now_ms)?;
+    // Promote the tile-card @now so the holds land on it (and a concurrent cut
+    // finds the same card).
+    if !logops.is_empty() {
+        let tile = crate::tiles::find_or_create_tile_card(ctx, surface, macro_zone, q, r, now_ms)?;
+        // CAS: an exclusive `claim` acquire collides with a live claim → reject
+        // (the concurrent-cut guard, on the tile-card's materialized stock).
+        let claim = StockAspect::Claim;
+        for lo in &logops {
+            if lo.aspect_id == claim.id()
+                && resonantdust_codec::oplog::AspectOp::from_code(lo.op) == Some(resonantdust_codec::oplog::AspectOp::Inc)
+                && lo.modifier > 0
+                && resonantdust_codec::aspects::count(tile.stock, claim) > 0
+            {
+                return Err(format!(
+                    "apply_action_tile: tile ({q},{r}) of zone {macro_zone} already exclusively held"
+                ));
+            }
         }
-    }
-    // Release @completion.
-    for kind in HOLD_MASK_KINDS {
-        if hold_mask & (1 << kind) != 0 {
-            crate::tiles::release_tile_hold(ctx, surface, macro_zone, q, r, hold_field(kind)?, completion_ms);
+        for lo in &logops {
+            let Some(aspect) = StockAspect::from_id(lo.aspect_id) else {
+                continue;
+            };
+            let Some(op) = resonantdust_codec::oplog::AspectOp::from_code(lo.op) else {
+                continue;
+            };
+            oplog::apply_op(ctx, tile.card_id, aspect, lo.time_ms, op, lo.modifier);
         }
     }
     // Stock effects @completion — read-modify-write per slot so the completion
@@ -371,24 +368,12 @@ pub fn set_shard_identity(ctx: &ReducerContext, card_db: u8, shard: u16) -> Resu
 // canonical `Card` table via `crate::tiles`, so tile-cards get the full
 // bitemporal write semantics (forward-prop included) the owner-card path uses.
 
-use resonantdust_codec::card_model::{stock, HoldField};
+use resonantdust_codec::card_model::stock;
 
 /// Tile-stock op codes shared with the gateway's apply step.
 mod stock_op {
     pub const SUB: u8 = 0;
     pub const ADD: u8 = 1;
     pub const SET: u8 = 2;
-}
-
-/// Hold-kind selector → [`HoldField`]. Matches `hold_kind` above and the
-/// gateway (`0=touch, 1=slot_hold, 2=slot_share, 3=position_hold`).
-fn hold_field(kind: u8) -> Result<HoldField, String> {
-    Ok(match kind {
-        0 => HoldField::Touch,
-        1 => HoldField::SlotClaim,
-        2 => HoldField::SlotBorrow,
-        3 => HoldField::PositionHold,
-        other => return Err(format!("tile hold: unknown kind {other}")),
-    })
 }
 
