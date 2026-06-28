@@ -189,6 +189,18 @@ pub fn apply_op(
     materialize_aspect(ctx, card_id, aspect, time_ms);
 }
 
+/// Delete EVERY op-log row for `card_id` — called when the card is reaped, so a
+/// later card reusing the id (`next_card_id` resets to `FIRST_CARD_ID` once all
+/// cards are gone) doesn't inherit stale ops (e.g. a `Set(Dead=1)` checkpoint
+/// that would fold a fresh card to dead). Without this, a reaped dead card leaves
+/// a permanent dead checkpoint at its id.
+pub fn clear(ctx: &ReducerContext, card_id: u32) {
+    let ids: Vec<u64> = ctx.db.op_log().card_id().filter(card_id).map(|r| r.id).collect();
+    for id in ids {
+        ctx.db.op_log().id().delete(id);
+    }
+}
+
 /// Collapse SETTLED ops (`time_ms <= watermark`) per `(card, aspect)` into a
 /// single `Set` checkpoint at the watermark, so a live fold never replays
 /// unbounded history. The watermark is `now - max_late_arrival`: nothing older

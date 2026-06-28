@@ -155,6 +155,9 @@ fn sweep_cards(ctx: &ReducerContext, now_ms: u64) {
     }
 
     let mut to_delete: Vec<u64> = Vec::new();
+    // Cards whose LATEST-dead row is reaped — fully gone, so clear their op-log
+    // (else a reused id inherits a stale dead/hold checkpoint).
+    let mut reaped: Vec<u32> = Vec::new();
     for c in ctx.db.cards().iter() {
         let is_latest = latest_by_id.get(&c.card_id) == Some(&c.valid_at);
         if !is_latest {
@@ -171,10 +174,14 @@ fn sweep_cards(ctx: &ReducerContext, now_ms: u64) {
         }
         if dead_row_reapable(ctx, &c, now_ms) {
             to_delete.push(c.valid_at);
+            reaped.push(c.card_id);
         }
     }
     for v in to_delete {
         ctx.db.cards().valid_at().delete(v);
+    }
+    for card_id in reaped {
+        crate::oplog::clear(ctx, card_id);
     }
 }
 
