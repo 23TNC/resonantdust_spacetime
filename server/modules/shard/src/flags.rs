@@ -20,7 +20,7 @@ use resonantdust_codec::flags::flag_bit;
 
 /// Single-bit state masks within the propagating `flags` word.
 pub struct StateFlags {
-    pub dead: u32,
+    // `dead` retired — it's an op-log stock aspect now (`aspects::stock_is_dead`).
     /// Server *requires* the row's position exactly (mirror splice
     /// winners-take-the-slot). Blocks demotion.
     pub pos_need: u32,
@@ -50,7 +50,6 @@ pub const SERVER_COUNT_CAP: u32 = 3;
 pub fn state_flags() -> &'static StateFlags {
     static CACHE: OnceLock<StateFlags> = OnceLock::new();
     CACHE.get_or_init(|| StateFlags {
-        dead: bit_mask("flags", "dead"),
         pos_need: bit_mask("flags", "pos_need"),
         pos_want: bit_mask("flags", "pos_want"),
         surface_locked: bit_mask("flags", "surface_locked"),

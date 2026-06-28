@@ -303,7 +303,10 @@ fn sweep_tile_card_demotions(ctx: &ReducerContext, now_ms: u64) {
         if micro_is_card(c.flags) {
             continue; // stacked under a card — in use, root not local.
         }
-        if state_blocks_demotion(c.flags) || resonantdust_codec::aspects::has_active_holds(c.stock) {
+        if state_blocks_demotion(c.flags)
+            || is_dead(c.stock)
+            || resonantdust_codec::aspects::has_active_holds(c.stock)
+        {
             continue;
         }
         // Demote-guard: a zone tile only persists the bottom u4
