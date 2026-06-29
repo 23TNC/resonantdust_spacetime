@@ -319,9 +319,6 @@ fn hex_dist(aq: i32, ar: i32, bq: i32, br: i32) -> i32 {
 }
 
 pub fn first_free_cell(ctx: &ReducerContext, macro_zone: u64, distance: u16, time_ms: u64) -> (u8, u8) {
-    use crate::packed::{world_tile, ZONE_SIZE};
-    let (zq, zr) = crate::packed::unpack_macro_zone(macro_zone);
-    let d = distance as i32;
     let mut occupied = std::collections::BTreeSet::new();
     let mut seen = std::collections::BTreeSet::new();
     for row in ctx.db.cards().macro_zone().filter(macro_zone) {
@@ -338,19 +335,38 @@ pub fn first_free_cell(ctx: &ReducerContext, macro_zone: u64, distance: u16, tim
             occupied.insert((local_q, local_r));
         }
     }
-    for r in 0..ZONE_SIZE {
-        for q in 0..ZONE_SIZE {
-            // Skip cells outside the region's disk — those tiles don't exist
-            // (the gate never spawns them). `distance = u16::MAX` ⇒ unbounded.
-            if hex_dist(world_tile(zq, q as u8), world_tile(zr, r as u8), 0, 0) > d {
-                continue;
-            }
-            if !occupied.contains(&(q as u8, r as u8)) {
-                return (q as u8, r as u8);
-            }
+    // Walk the disk CENTRE-OUT (world `(0,0)` first) and take the first free cell —
+    // so an inventory fills from its centre, not a raster corner.
+    for (q, r) in crate::packed::zone_disk_cells(macro_zone, distance) {
+        if !occupied.contains(&(q, r)) {
+            return (q, r);
         }
     }
     (0, 0)
+}
+
+/// Whether a live LOOSE card already occupies cell `(q, r)` of `macro_zone` at
+/// `time_ms` — the create loop's "is my intent cell taken?" check (exact spawn if
+/// free, else first-free). Same scan as [`first_free_cell`].
+pub fn cell_occupied(ctx: &ReducerContext, macro_zone: u64, q: u8, r: u8, time_ms: u64) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    for row in ctx.db.cards().macro_zone().filter(macro_zone) {
+        if !seen.insert(row.card_id) {
+            continue;
+        }
+        let Some(card) = prior_at(ctx, row.card_id, time_ms) else {
+            continue;
+        };
+        if is_dead(card.stock) {
+            continue;
+        }
+        if let Micro::Loose { local_q, local_r, .. } = Micro::of(card.micro_location, card.flags) {
+            if local_q == q && local_r == r {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Delete every row for `card_id` whose `valid_at_time` matches

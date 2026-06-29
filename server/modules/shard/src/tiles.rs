@@ -26,9 +26,9 @@ use crate::cards::{create_at, next_card_id, prior_at, update_with_at, Card, Micr
 use crate::packed::{pack_definition, unpack_definition, unpack_zone_definition, with_surface};
 use crate::zones;
 
-/// `card_type` of the tile-as-card family (zone-tile cards). Mirrors the
-/// constant the gateway/content use to recognise tiles.
-pub const TILE_CARD_TYPE: u8 = 7;
+/// `card_type` of the tile-as-card family (zone-tile cards). Re-exported from the
+/// codec so the shard, gate, and client share one definition.
+pub use crate::packed::TILE_CARD_TYPE;
 
 /// Find the loose tile-card at hex `(q, r)` of `(surface, macro_zone)`, if one
 /// has been promoted. A tile-card is a `TILE_CARD_TYPE` card placed loose
@@ -128,17 +128,18 @@ pub fn tile_full_view(
     r: u8,
     time_ms: u64,
 ) -> Option<(u16, u8, u8)> {
-    if let Some(card) = find_tile_card_at(ctx, surface, macro_zone, q, r, time_ms) {
-        return Some((
-            card.packed_definition,
-            stock(card.stock, 0),
-            stock(card.stock, 1),
-        ));
-    }
-    let zone = zones::latest_for(ctx, with_surface(macro_zone, surface))?;
-    let (def_id, stock0, stock1) = zone.tile_at(r, q)?;
-    if def_id == 0 {
-        return None;
-    }
-    Some((pack_definition(unpack_zone_definition(zone.packed_definition), def_id), stock0, stock1))
+    let tile_card = find_tile_card_at(ctx, surface, macro_zone, q, r, time_ms)
+        .map(|c| (c.packed_definition, stock(c.stock, 0), stock(c.stock, 1)));
+    // No zone (only a tile-card can answer) → return the card view directly;
+    // otherwise the shared card-priority rule folds it over the zone slot.
+    let Some(zone) = zones::latest_for(ctx, with_surface(macro_zone, surface)) else {
+        return tile_card;
+    };
+    crate::packed::synthetic_tile(
+        tile_card,
+        &zone.tiles(),
+        unpack_zone_definition(zone.packed_definition),
+        q,
+        r,
+    )
 }

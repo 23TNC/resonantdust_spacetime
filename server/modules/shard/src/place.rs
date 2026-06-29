@@ -120,6 +120,11 @@ pub fn move_cards(
         cards::update_with_at(ctx, card_ids[i], now_ms, |c| {
             c.macro_zone = macro_zones[i];
             micro.place(c);
+            // A player move OVERRIDES any server position authority: clear
+            // `pos_need`/`pos_want` so a prior recipe relocation's `pos_need` doesn't
+            // get cloned onto this row and snap the card back (see gate_api `^place`).
+            let s = crate::flags::state_flags();
+            c.flags &= !(s.pos_need | s.pos_want);
         })
         .ok_or_else(|| format!("move_cards: card {} not found at {now_ms}", card_ids[i]))?;
     }
@@ -151,9 +156,9 @@ fn to_stack_placement(p: Placement) -> Result<stack::Placement, String> {
 }
 
 /// [`StackStore`] over the live db — the IO half the shared model abstracts over.
-struct Db<'a>(&'a ReducerContext);
+pub(crate) struct Db<'a>(pub &'a ReducerContext);
 
-fn to_view(c: cards::Card) -> CardView {
+pub(crate) fn to_view(c: cards::Card) -> CardView {
     CardView {
         card_id: c.card_id,
         owner_id: c.owner_id,
@@ -191,6 +196,28 @@ impl StackStore for Db<'_> {
                 continue;
             }
             out.push(to_view(latest));
+        }
+        out
+    }
+
+    /// Every live card currently in `macro_zone` — the occupants the placement
+    /// sweep ([`resonantdust_state::stack::resolve_placement`]) reads. Mirrors
+    /// [`cards::first_free_cell`]'s scan over the `macro_zone` btree index.
+    fn cards_in_zone(&self, macro_zone: u64, now_ms: u64) -> Vec<CardView> {
+        use std::collections::BTreeSet;
+        let ctx = self.0;
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        let mut out: Vec<CardView> = Vec::new();
+        for row in ctx.db.cards().macro_zone().filter(macro_zone) {
+            if !seen.insert(row.card_id) {
+                continue;
+            }
+            let Some(latest) = cards::prior_at(ctx, row.card_id, now_ms) else {
+                continue;
+            };
+            if latest.macro_zone == macro_zone {
+                out.push(to_view(latest));
+            }
         }
         out
     }

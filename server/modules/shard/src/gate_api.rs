@@ -113,9 +113,13 @@ pub fn apply_action(
     // `tag -> minted id` so a later sibling that nests in it (owner_id == tag)
     // resolves to the real id. Creates arrive parent-before-child.
     create_tags: Vec<u8>,
-    // Per-created-card exact cell (packed micro_location), or `-1` for "first free
-    // cell". A `create … .location` product pins its cell (a bound card's spot).
+    // Per-created-card preferred cell (packed micro_location), or `-1` for "first
+    // free cell". Landed exactly if free (a product on a bound card's just-vacated
+    // spot — the chord_soul on the blueprint's cell), else first-free.
     create_cells: Vec<i64>,
+    // Per-created-card target stack id (placement INTENT, 0=loose/1=hex/2=top/
+    // 3=bottom). Today every product is loose; create-onto-a-stack isn't used yet.
+    create_stacks: Vec<u8>,
     // Per-created-card fire time (ms).
     create_times: Vec<u64>,
     stat_souls: Vec<u32>,
@@ -136,14 +140,17 @@ pub fn apply_action(
     reroot_macro_zones: Vec<u64>,
     reroot_micro_locations: Vec<u32>,
     reroot_stack_states: Vec<u8>,
-    // `move` effects: relocate an existing card to a zone (surface + macro_zone),
-    // re-owned by `move_owners`, on the first free cell of that zone's disk
-    // (`move_distances`). Sends a consumed blueprint back to the player inventory.
+    // `^place` effects: relocate an existing card to a zone (surface + macro_zone),
+    // re-owned by `move_owners`, with a placement INTENT `(move_micros cell,
+    // move_stacks id)` resolved via the shared sweep. Sends a consumed blueprint
+    // back to the player inventory.
     move_ids: Vec<u32>,
     move_surfaces: Vec<u8>,
     move_macro_zones: Vec<u64>,
     move_owners: Vec<u32>,
     move_distances: Vec<u16>,
+    move_micros: Vec<u32>,
+    move_stacks: Vec<u8>,
     // Op-log deltas for GLOBAL aspects (holds / dead / reap): append the op +
     // materialize the stock global region (bits 42-63). One packed struct per op
     // (a flat Vec<LogOpArg>) rather than 5 parallel arrays — the reducer arg-count
@@ -167,6 +174,63 @@ pub fn apply_action(
         };
         oplog::apply_op(ctx, lo.card_id, aspect, lo.time_ms, op, lo.modifier);
     }
+    // `^place` relocations run BEFORE creates: a card vacating a cell (a consumed
+    // blueprint returning to inventory) frees it so a product `^create`d at that
+    // exact cell this same action lands there. Each relocation resolves its cell +
+    // stack via the shared placement sweep (occupancy-aware), then re-owns the card.
+    for i in 0..move_ids.len() {
+        use crate::cards::MicroPlace;
+        let zone = with_surface(move_macro_zones[i], move_surfaces[i]);
+        let dist = move_distances.get(i).copied().unwrap_or(u16::MAX);
+        let (cq, cr, _, _) = resonantdust_codec::packed::unpack_micro_loose(move_micros[i]);
+        // Pass the card's own owner as the caller so the shared placement's
+        // owner-guard is a tautology (gate-authority: the gate already validated).
+        let caller = cards::owning_player(ctx, move_ids[i]).unwrap_or(cards::WORLD_PLAYER_ID);
+        let resolved = resonantdust_state::stack::resolve_placement(
+            &crate::place::Db(ctx),
+            move_ids[i],
+            zone,
+            cq,
+            cr,
+            move_stacks[i],
+            caller,
+            dist,
+            completion_ms,
+            &|_| resonantdust_codec::stacking::DEFAULT_BITS,
+        );
+        match resolved {
+            Some(plan) => {
+                for w in plan.writes {
+                    cards::update_with_at(ctx, w.card_id, completion_ms, |c| {
+                        c.macro_zone = w.macro_zone;
+                        w.micro.place(c);
+                    });
+                }
+            }
+            None => {
+                // Zone full / no open slot — fall back to the first free loose cell.
+                let (fq, fr) = cards::first_free_cell(ctx, zone, dist, completion_ms);
+                let micro = cards::Micro::snap(fq, fr);
+                cards::update_with_at(ctx, move_ids[i], completion_ms, |c| {
+                    c.macro_zone = zone;
+                    micro.place(c);
+                });
+            }
+        }
+        // Re-own to the destination zone's owner (placement never touches owner),
+        // and mark the row `pos_need`: a `^place` is a deterministic, pre-calculated
+        // recipe relocation, so the client MUST adopt this exact position — it
+        // overrides any optimistic local move of the card (a blueprint dragged off
+        // mid-assembly still returns to inventory). Cleared when the player next
+        // moves it (`move_cards`). Runs after `finalize_at` cleared the bit, so it
+        // sticks.
+        let owner = move_owners[i];
+        cards::update_with_at(ctx, move_ids[i], completion_ms, |c| {
+            c.owner_id = owner;
+            c.flags |= state_flags().pos_need;
+        });
+    }
+
     // Maps a created card's transient tag to its minted id, so a sibling that
     // nests in it (owner_id carrying the tag) resolves to the real owner. Built
     // as the loop runs; creates arrive parent-before-child, so a referenced
@@ -202,10 +266,36 @@ pub fn apply_action(
         // in-transaction). Same one-per-tile rule as `create_card`; this path
         // mints loose cards (stacked outputs are placed elsewhere).
         let zone = with_surface(raw_zone, create_surfaces[i]);
-        // `create … .location` pins an exact cell (a bound card's world spot);
-        // everything else takes the first free cell of the target zone.
-        let micro = match create_cells.get(i).copied().unwrap_or(-1) {
-            c if c >= 0 => cards::Micro::of(c as u32, 0),
+        // Placement intent: the `create_cells` micro names a preferred cell. Land
+        // there if it's free (a product spawned on a bound card's just-vacated world
+        // spot — the chord_soul on the blueprint's cell, freed by the move loop
+        // above); otherwise take the first free cell. `create_stacks` is the target
+        // stack id — every current product is loose (0); create-onto-a-stack is not
+        // yet used, so a non-zero intent still lands loose here.
+        let _stack = create_stacks.get(i).copied().unwrap_or(0);
+        // A tag owner is a card minted in THIS batch — its inventory is freshly
+        // empty and UNBOUNDED (`dist == u16::MAX`), so a preferred cell is never
+        // meaningful: the author's placeholder `0` micro names cell (0,0), which an
+        // unbounded disk would wrongly honour as in-disk (it's the off-centre
+        // corner, world (-3,-3)) and strand the first product off the visible
+        // inventory. Force the centre-out first-free walk for these.
+        let prefer_cell = if is_tag(raw_owner) { -1 } else { create_cells.get(i).copied().unwrap_or(-1) };
+        let micro = match prefer_cell {
+            c if c >= 0 => {
+                let (cq, cr, _, _) = resonantdust_codec::packed::unpack_micro_loose(c as u32);
+                // Honour the exact cell only if it's a real in-disk cell that's free
+                // (a product on a bound card's own world cell — the chord_soul). An
+                // off-disk preference (an inventory's corner (0,0)) or an occupied
+                // cell falls to the centre-out first-free walk.
+                if resonantdust_codec::packed::cell_in_disk(zone, cq, cr, dist)
+                    && !cards::cell_occupied(ctx, zone, cq, cr, at)
+                {
+                    cards::Micro::of(c as u32, 0)
+                } else {
+                    let (fq, fr) = cards::first_free_cell(ctx, zone, dist, at);
+                    cards::Micro::snap(fq, fr)
+                }
+            }
             _ => {
                 let (fq, fr) = cards::first_free_cell(ctx, zone, dist, at);
                 cards::Micro::snap(fq, fr)
@@ -219,7 +309,10 @@ pub fn apply_action(
             micro,
             owner,
             create_defs[i],
-            /* flags */ 0,
+            // `pos_want`: a spawn's position is ADVISORY — the future board state is
+            // unknown, so the card may bump/stack/pick another cell against live
+            // state. (A bound card's `^place` is `pos_need`; a `^create` is not.)
+            /* flags */ state_flags().pos_want,
             create_stocks.get(i).copied().unwrap_or(0),
         );
     }
@@ -262,22 +355,8 @@ pub fn apply_action(
             micro.place(c);
         });
     }
-    // `move` effects @completion: relocate the card to its destination zone (loose,
-    // first free cell), re-owned. A consumed blueprint goes back to inventory; its
-    // old world cell is freed for the chord soul minted there in the create loop.
-    for i in 0..move_ids.len() {
-        use crate::cards::MicroPlace;
-        let zone = with_surface(move_macro_zones[i], move_surfaces[i]);
-        let dist = move_distances.get(i).copied().unwrap_or(u16::MAX);
-        let (fq, fr) = cards::first_free_cell(ctx, zone, dist, completion_ms);
-        let micro = cards::Micro::snap(fq, fr);
-        let owner = move_owners[i];
-        cards::update_with_at(ctx, move_ids[i], completion_ms, |c| {
-            c.macro_zone = zone;
-            c.owner_id = owner;
-            micro.place(c);
-        });
-    }
+    // (`^place` relocations ran BEFORE the create loop — see the move loop near the
+    // top — so a vacated cell is free for a same-action `^create` onto it.)
     Ok(())
 }
 
